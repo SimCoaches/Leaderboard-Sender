@@ -39,4 +39,4 @@ To rebuild the executable:
 python -m PyInstaller --name=LapTimeSender --onefile --noconsole --hidden-import PyQt6.QtCore --hidden-import PyQt6.QtGui --hidden-import PyQt6.QtWidgets --hidden-import requests lap_time_sender.py
 ```
 
-The executable will be created in the `dist` directory 
+The executable will be created in the `dist` directory "# Leaderboard-Sender" 
