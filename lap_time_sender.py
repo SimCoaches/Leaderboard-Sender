@@ -21,6 +21,7 @@ from PyQt6.QtMultimediaWidgets import QVideoWidget
 import qrcode
 from io import BytesIO
 import os
+from sender_discovery import LeaderboardConnection, BackgroundDiscovery
 
 def format_time_ms(milliseconds):
     """Format milliseconds into a readable time string (mm:ss.xxx)"""
@@ -1360,7 +1361,20 @@ class LapTimeSenderWindow(QMainWindow):
         ui_bridge.driver_registered.connect(self.update_driver_name)
         self.web_thread = threading.Thread(target=run_flask, daemon=True)
         self.web_thread.start()
-        
+
+        # Initialize leaderboard auto-discovery
+        self.leaderboard_connection = LeaderboardConnection()
+        self.leaderboard_connection.set_manual_backup(self.current_server_url)
+
+        # Set up callbacks for UI updates (must use Qt signals for thread safety)
+        self.leaderboard_connection.on_connected = self._on_discovery_connected
+        self.leaderboard_connection.on_disconnected = self._on_discovery_disconnected
+        self.leaderboard_connection.on_searching = self._on_discovery_searching
+
+        # Start background discovery thread
+        self.discovery_thread = BackgroundDiscovery(self.leaderboard_connection)
+        self.discovery_thread.start()
+
         # Start retry timer
         self.start_retry_timer()
         
@@ -1628,14 +1642,49 @@ class LapTimeSenderWindow(QMainWindow):
             }
         """)
         server_section_layout.addWidget(server_header)
-        
-        # Server URL input
+
+        # Connection status display (auto-discovery status)
+        connection_status_widget = QWidget()
+        connection_status_layout = QHBoxLayout(connection_status_widget)
+        connection_status_layout.setContentsMargins(0, 0, 0, 0)
+        connection_status_layout.setSpacing(8)
+
+        status_label = QLabel("Status:")
+        status_label.setStyleSheet("""
+            QLabel {
+                font-weight: 600;
+                font-size: 13px;
+                color: #bfdbfe;
+                font-family: 'Segoe UI', 'Arial', sans-serif;
+            }
+        """)
+        status_label.setFixedWidth(80)
+        connection_status_layout.addWidget(status_label)
+
+        self.connection_status_label = QLabel("Searching for leaderboard...")
+        self.connection_status_label.setStyleSheet("""
+            QLabel {
+                color: #94a3b8;
+                font-size: 13px;
+                padding: 6px 12px;
+                background-color: #1e293b;
+                border-radius: 6px;
+                border: 1px solid #334155;
+                font-family: 'Consolas', 'Monaco', monospace;
+            }
+        """)
+        self.connection_status_label.setToolTip("Shows auto-discovery connection status")
+        connection_status_layout.addWidget(self.connection_status_label, 1)
+
+        server_section_layout.addWidget(connection_status_widget)
+
+        # Server URL input (manual backup)
         server_url_widget = QWidget()
         server_url_layout = QHBoxLayout(server_url_widget)
         server_url_layout.setContentsMargins(0, 0, 0, 0)
         server_url_layout.setSpacing(8)
         
-        url_label = QLabel("Server URL:")
+        url_label = QLabel("Manual URL:")
         url_label.setStyleSheet("""
             QLabel {
                 font-weight: 600;
@@ -1645,12 +1694,13 @@ class LapTimeSenderWindow(QMainWindow):
             }
         """)
         url_label.setFixedWidth(80)
-        url_label.setToolTip("Address of the leaderboard server where lap times will be sent")
+        url_label.setToolTip("Manual backup URL - used if auto-discovery fails")
         server_url_layout.addWidget(url_label)
-        
+
         self.server_url = QLineEdit(self.current_server_url)
+        self.server_url.setPlaceholderText("Auto-discovered (or enter manual backup)")
         self.server_url.textChanged.connect(self.on_server_url_changed)
-        self.server_url.setToolTip("Enter the full URL (e.g., http://192.168.1.100:5000)")
+        self.server_url.setToolTip("Manual backup URL - auto-discovery will find the server automatically")
         self.server_url.setStyleSheet("""
             QLineEdit {
                 background-color: #0f172a;
@@ -1661,12 +1711,12 @@ class LapTimeSenderWindow(QMainWindow):
         """)
         server_url_layout.addWidget(self.server_url)
         
-        test_connection_btn = QPushButton("Test Connection")
-        test_connection_btn.setFixedWidth(120)
-        test_connection_btn.setStyleSheet("""
+        manual_connect_btn = QPushButton("Manual Connect")
+        manual_connect_btn.setFixedWidth(120)
+        manual_connect_btn.setStyleSheet("""
             QPushButton {
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, 
-                    stop:0 #10b981, stop:1 #059669);
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #f59e0b, stop:1 #d97706);
                 color: white;
                 border: none;
                 padding: 8px 12px;
@@ -1676,14 +1726,14 @@ class LapTimeSenderWindow(QMainWindow):
                 font-family: 'Segoe UI', 'Arial', sans-serif;
             }
             QPushButton:hover {
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, 
-                    stop:0 #059669, stop:1 #047857);
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #d97706, stop:1 #b45309);
             }
         """)
-        test_connection_btn.setObjectName("test-connection")
-        test_connection_btn.clicked.connect(self.test_and_save_connection)
-        test_connection_btn.setToolTip("Test if the server is reachable and save URL if successful")
-        server_url_layout.addWidget(test_connection_btn)
+        manual_connect_btn.setObjectName("manual-connect")
+        manual_connect_btn.clicked.connect(self.on_manual_connect)
+        manual_connect_btn.setToolTip("Manually connect using the URL above (bypasses auto-discovery)")
+        server_url_layout.addWidget(manual_connect_btn)
         
         server_section_layout.addWidget(server_url_widget)
         # Add the server configuration section to the main card
@@ -2648,39 +2698,39 @@ class LapTimeSenderWindow(QMainWindow):
         self.retry_timer.start()
 
     def retry_failed_laps(self):
-        """Attempt to resend any failed lap times"""
+        """Attempt to resend any failed lap times using auto-discovery connection"""
         if self.failed_lap_times:
             print(f"\nAttempting to resend {len(self.failed_lap_times)} failed lap times...")
-            
+
             # Try to send each failed lap time
             successful_sends = []
             for lap_data in self.failed_lap_times:
-                try:
-                    headers = {'Content-Type': 'application/json'}
-                    response = requests.post(
-                        self.server_url.text().strip(),
-                        json=lap_data,
-                        headers=headers,
-                        timeout=5
-                    )
-                    
-                    if response.status_code == 200:
-                        successful_sends.append(lap_data)
-                        print(f"Successfully resent lap time: {lap_data['lap_time']:.3f}s")
-                except:
+                # Use LeaderboardConnection which has auto-reconnect built in
+                success, _ = self.leaderboard_connection.send_lap_time(
+                    simulator_id=lap_data.get("simulator_id", 1),
+                    driver_name=lap_data.get("driver_name", ""),
+                    lap_time=lap_data.get("lap_time", 0),
+                    email=lap_data.get("email", ""),
+                    formatted_time=lap_data.get("formatted_time")
+                )
+
+                if success:
+                    successful_sends.append(lap_data)
+                    print(f"Successfully resent lap time: {lap_data['lap_time']:.3f}s")
+                else:
                     print(f"Failed to resend lap time: {lap_data['lap_time']:.3f}s")
-            
+
             # Remove successfully sent lap times from the queue
             for lap_data in successful_sends:
                 self.failed_lap_times.remove(lap_data)
-            
-            # Update status if any laps were resent
+
+            # Update status if any laps were resent (thread-safe UI update)
             if successful_sends:
-                self.show_success(f"✅ Successfully resent {len(successful_sends)} lap time(s)!")
-            
+                QTimer.singleShot(0, lambda: self.show_success(f"Successfully resent {len(successful_sends)} lap time(s)!"))
+
             if self.failed_lap_times:
-                self.status_label.setText(f"⚠️ {len(self.failed_lap_times)} lap time(s) pending resend...")
-        
+                QTimer.singleShot(0, lambda: self.status_label.setText(f"{len(self.failed_lap_times)} lap time(s) pending resend..."))
+
         # Restart the timer
         self.start_retry_timer()
 
@@ -2732,62 +2782,48 @@ class LapTimeSenderWindow(QMainWindow):
                 data["email"] = self.last_driver_email  # Changed from "driver_email" to "email"
                 print(f"Including driver email: {self.last_driver_email}")
                 
-            # Get the server URL from the saved value, not from the UI
-            server_url = self.current_server_url
-            
-            # Fallback to UI value if current_server_url isn't set
-            if not server_url:
-                server_url = self.server_url.text().strip()
-                print("Using URL from UI as no saved URL exists yet")
-            
             print(f"\nSending data to server: {data}")
-            print(f"Server URL: {server_url}")
-            
+
             # Update status to show we're sending
-            self.status_label.setText("📤 Sending lap time to server...")
-            self.status_label.setStyleSheet("color: #0066cc; background-color: #f0f0f0; padding: 10px; border-radius: 5px; font-size: 12px;")
-            
-            # Send to server with detailed error handling
-            try:
-                headers = {'Content-Type': 'application/json'}
-                response = requests.post(
-                    server_url, 
-                    json=data,
-                    headers=headers,
-                    timeout=5  # Add timeout
-                )
-                print(f"Response status: {response.status_code}")
-                print(f"Response headers: {response.headers}")
-                
-                if response.status_code == 200:
-                    self.show_success(f"✅ Lap time {lap_time:.3f}s sent successfully!")
-                else:
-                    # Add to retry queue on server error
-                    if data not in self.failed_lap_times:
-                        self.failed_lap_times.append(data)
-                    try:
-                        error_details = response.json()
-                        error_msg = error_details.get('message', str(response.content))
-                        self.show_error(f"❌ Server error {response.status_code}: {error_msg}")
-                    except:
-                        self.show_error(f"❌ Server error {response.status_code}: {response.content}")
-                    print(f"Server response content: {response.content}")
-            except requests.exceptions.Timeout:
-                # Add to retry queue on timeout
+            self.status_label.setText("Sending lap time...")
+            self.status_label.setStyleSheet("""
+                QLabel {
+                    color: #3b82f6;
+                    font-size: 16px;
+                    font-weight: 700;
+                    padding: 8px 16px;
+                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                        stop:0 #1e3a8a, stop:1 #1e40af);
+                    border-radius: 8px;
+                    border: 2px solid #3b82f6;
+                    font-family: 'Consolas', 'Monaco', monospace;
+                }
+            """)
+
+            # Get email if available
+            email = ""
+            if hasattr(self, 'last_driver_email') and self.last_driver_email:
+                email = self.last_driver_email
+
+            # Send using auto-discovery connection (has built-in 3x retry with auto-reconnect)
+            success, error_msg = self.leaderboard_connection.send_lap_time(
+                simulator_id=data["simulator_id"],
+                driver_name=data["driver_name"],
+                lap_time=data["lap_time"],
+                email=email,
+                formatted_time=formatted_time
+            )
+
+            if success:
+                self.show_success(f"Lap time {lap_time:.3f}s sent successfully!")
+                # Update current_server_url from the connection
+                if self.leaderboard_connection.get_current_url():
+                    self.current_server_url = self.leaderboard_connection.get_current_url()
+            else:
+                # Add to retry queue on failure
                 if data not in self.failed_lap_times:
                     self.failed_lap_times.append(data)
-                self.show_error(f"⚠️ Request timed out. Will retry automatically. {len(self.failed_lap_times)} lap(s) pending.")
-            except requests.exceptions.ConnectionError:
-                # Add to retry queue on connection error
-                if data not in self.failed_lap_times:
-                    self.failed_lap_times.append(data)
-                self.show_error(f"❌ Connection failed. Will retry automatically. {len(self.failed_lap_times)} lap(s) pending.")
-            except Exception as e:
-                # Add to retry queue on any other error
-                if data not in self.failed_lap_times:
-                    self.failed_lap_times.append(data)
-                self.show_error(f"❌ Error sending lap time: {str(e)}")
-                print(f"Error details: {str(e)}")
+                self.show_error(f"Failed to send lap time: {error_msg}. Will retry automatically. {len(self.failed_lap_times)} lap(s) pending.")
         except Exception as e:
             self.show_error(f"❌ Error preparing data: {str(e)}")
             
@@ -2925,6 +2961,9 @@ class LapTimeSenderWindow(QMainWindow):
             self.current_monitor.stop()
         if self.retry_timer:
             self.retry_timer.cancel()
+        # Stop the background discovery thread
+        if hasattr(self, 'discovery_thread') and self.discovery_thread:
+            self.discovery_thread.stop()
         event.accept()
 
     def show_web_interface_message(self):
@@ -3444,6 +3483,148 @@ class LapTimeSenderWindow(QMainWindow):
                 background-color: rgb(29, 78, 216);
             }
         """)
+
+    def _on_discovery_connected(self, url):
+        """Callback when auto-discovery finds the leaderboard server."""
+        # Update the connection status label (thread-safe via Qt signal)
+        QTimer.singleShot(0, lambda: self._update_connection_status_ui("connected", url))
+
+    def _on_discovery_disconnected(self):
+        """Callback when connection to leaderboard server is lost."""
+        QTimer.singleShot(0, lambda: self._update_connection_status_ui("disconnected", None))
+
+    def _on_discovery_searching(self):
+        """Callback when searching for leaderboard server."""
+        QTimer.singleShot(0, lambda: self._update_connection_status_ui("searching", None))
+
+    def _update_connection_status_ui(self, status, url):
+        """Update the connection status UI (must be called from main thread)."""
+        if status == "connected":
+            self.connection_status_label.setText(f"Connected: {url}")
+            self.connection_status_label.setStyleSheet("""
+                QLabel {
+                    color: #10b981;
+                    font-size: 13px;
+                    padding: 6px 12px;
+                    background-color: #064e3b;
+                    border-radius: 6px;
+                    border: 1px solid #10b981;
+                    font-family: 'Consolas', 'Monaco', monospace;
+                }
+            """)
+            # Update the current server URL
+            self.current_server_url = url
+            self.server_url.setText(url)
+        elif status == "disconnected":
+            self.connection_status_label.setText("Disconnected - searching...")
+            self.connection_status_label.setStyleSheet("""
+                QLabel {
+                    color: #f59e0b;
+                    font-size: 13px;
+                    padding: 6px 12px;
+                    background-color: #78350f;
+                    border-radius: 6px;
+                    border: 1px solid #f59e0b;
+                    font-family: 'Consolas', 'Monaco', monospace;
+                }
+            """)
+        else:  # searching
+            self.connection_status_label.setText("Searching for leaderboard...")
+            self.connection_status_label.setStyleSheet("""
+                QLabel {
+                    color: #94a3b8;
+                    font-size: 13px;
+                    padding: 6px 12px;
+                    background-color: #1e293b;
+                    border-radius: 6px;
+                    border: 1px solid #334155;
+                    font-family: 'Consolas', 'Monaco', monospace;
+                }
+            """)
+
+    def on_manual_connect(self):
+        """Handle manual connection button click."""
+        url = self.server_url.text().strip()
+        if not url:
+            self.show_error("Please enter a server URL")
+            return
+
+        # Ensure URL has http:// prefix
+        if not url.startswith(('http://', 'https://')):
+            url = f"http://{url}"
+            self.server_url.setText(url)
+
+        # Update the manual backup URL in the connection manager
+        self.leaderboard_connection.set_manual_backup(url)
+        self.current_server_url = url
+
+        # Update UI to show connecting
+        manual_btn = self.findChild(QPushButton, "manual-connect")
+        if manual_btn:
+            manual_btn.setText("Connecting...")
+            manual_btn.setEnabled(False)
+            QApplication.processEvents()
+
+        # Test the connection
+        if self.leaderboard_connection.test_connection():
+            self._update_connection_status_ui("connected", url)
+            if manual_btn:
+                manual_btn.setText("Connected!")
+                manual_btn.setStyleSheet("""
+                    QPushButton#manual-connect {
+                        background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                            stop:0 #10b981, stop:1 #059669);
+                        color: white;
+                        border: none;
+                        padding: 8px 12px;
+                        border-radius: 8px;
+                        font-weight: 600;
+                        font-size: 12px;
+                    }
+                """)
+        else:
+            self._update_connection_status_ui("disconnected", None)
+            if manual_btn:
+                manual_btn.setText("Failed!")
+                manual_btn.setStyleSheet("""
+                    QPushButton#manual-connect {
+                        background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                            stop:0 #ef4444, stop:1 #dc2626);
+                        color: white;
+                        border: none;
+                        padding: 8px 12px;
+                        border-radius: 8px;
+                        font-weight: 600;
+                        font-size: 12px;
+                    }
+                """)
+
+        # Reset button after 2 seconds
+        QTimer.singleShot(2000, self._reset_manual_connect_button)
+
+    def _reset_manual_connect_button(self):
+        """Reset manual connect button to default state."""
+        manual_btn = self.findChild(QPushButton, "manual-connect")
+        if manual_btn:
+            manual_btn.setText("Manual Connect")
+            manual_btn.setEnabled(True)
+            manual_btn.setStyleSheet("""
+                QPushButton#manual-connect {
+                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                        stop:0 #f59e0b, stop:1 #d97706);
+                    color: white;
+                    border: none;
+                    padding: 8px 12px;
+                    border-radius: 8px;
+                    font-weight: 600;
+                    font-size: 12px;
+                    font-family: 'Segoe UI', 'Arial', sans-serif;
+                }
+                QPushButton#manual-connect:hover {
+                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                        stop:0 #d97706, stop:1 #b45309);
+                }
+            """)
 
     def generate_qr_code(self, url):
         """Generate QR code for the web interface URL"""
