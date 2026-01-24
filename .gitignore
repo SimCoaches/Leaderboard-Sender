@@ -1,0 +1,30 @@
+# Build artifacts
+build/
+dist/
+dist_new/
+dist_updated/
+__pycache__/
+*.pyc
+*.pyo
+
+# Installer output
+installer/*.exe
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Temp
+*.tmp
+*.bak
+
+# Large binaries
+*.zip
+vc_redist.x64.exe
