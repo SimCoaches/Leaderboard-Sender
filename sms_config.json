@@ -1,0 +1,12 @@
+{
+  "enabled": true,
+  "provider": "textbelt",
+  "textbelt_key": "b5b19223c8c10266632c068d23d0c1578de15ca4wcn5DfwySNbEiJtJYqbRMNohl",
+  "textbelt_sender": "SimRacing",
+  "twilio_account_sid": "",
+  "twilio_auth_token": "",
+  "twilio_from_number": "",
+  "message_template": "Hi {name}! It's your turn to race at {simulator}. Head over now!",
+  "headsup_message_template": "Hey {name}! It's almost your turn to race! Head back to the simulators now - you're up in about {wait} minutes!",
+  "confirmation_message_template": "Hi {name}! You're #{position} in the sim racing queue. Estimated wait: {wait}. We'll text you when it's almost your turn!"
+}

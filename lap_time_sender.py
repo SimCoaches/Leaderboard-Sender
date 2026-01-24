@@ -226,6 +226,318 @@ def remove_known_simulator(ip):
     simulators = [s for s in simulators if s.get('ip') != ip]
     return save_known_simulators(simulators)
 
+# ============================================
+# SMS NOTIFICATION FUNCTIONS
+# ============================================
+
+SMS_CONFIG_FILE = "sms_config.json"
+sms_config = {
+    "enabled": False,
+    "provider": "textbelt",
+    "textbelt_key": "",
+    "textbelt_sender": "",
+    "twilio_account_sid": "",
+    "twilio_auth_token": "",
+    "twilio_from_number": "",
+    "message_template": "Hi {name}! It's your turn to race at {simulator}. Head over now!"
+}
+
+def get_sms_config_path():
+    """Get the path to the SMS config file."""
+    if getattr(sys, 'frozen', False):
+        base_path = Path(sys.executable).parent
+    else:
+        base_path = Path(__file__).parent
+    return base_path / SMS_CONFIG_FILE
+
+def load_sms_config():
+    """Load SMS configuration from file"""
+    global sms_config
+    config_path = get_sms_config_path()
+    print(f"[SMS] === Loading SMS Configuration ===")
+    print(f"[SMS] Config path: {config_path}")
+
+    if config_path.exists():
+        try:
+            with open(config_path, 'r') as f:
+                loaded = json.load(f)
+                sms_config.update(loaded)
+                print(f"[SMS] Loaded config: provider={loaded.get('provider')}, enabled={loaded.get('enabled')}")
+
+                # Check if properly configured
+                if sms_config.get("provider") == "textbelt" and sms_config.get("textbelt_key"):
+                    sms_config["enabled"] = True
+                    key = sms_config.get("textbelt_key", "")
+                    print(f"[SMS] Textbelt notifications ENABLED")
+                    print(f"[SMS] API Key: {key[:8]}...{key[-4:] if len(key) > 12 else ''}")
+                elif sms_config.get("provider") == "twilio" and sms_config.get("twilio_account_sid"):
+                    sms_config["enabled"] = True
+                    print("[SMS] Twilio notifications ENABLED")
+                else:
+                    sms_config["enabled"] = False
+                    print("[SMS] SMS DISABLED - missing credentials")
+                    print(f"[SMS]   provider={sms_config.get('provider')}")
+                    print(f"[SMS]   textbelt_key present: {bool(sms_config.get('textbelt_key'))}")
+        except Exception as e:
+            print(f"[SMS] ERROR loading config: {e}")
+            import traceback
+            traceback.print_exc()
+    else:
+        # Create default config file
+        save_sms_config()
+        print(f"[SMS] Created new config file: {config_path}")
+        print("[SMS] Edit this file with your Textbelt API key to enable SMS")
+
+def save_sms_config():
+    """Save SMS configuration to file"""
+    try:
+        config_path = get_sms_config_path()
+        with open(config_path, 'w') as f:
+            json.dump(sms_config, f, indent=2)
+    except Exception as e:
+        print(f"[SMS] Error saving config: {e}")
+
+def send_sms_notification(phone_number, driver_name, simulator_name="your simulator"):
+    """Send SMS notification via configured provider"""
+    global sms_config
+
+    print(f"[SMS] === SMS Notification Request ===")
+    print(f"[SMS] To: {phone_number}, Driver: {driver_name}, Simulator: {simulator_name}")
+    print(f"[SMS] Config enabled: {sms_config.get('enabled')}, Provider: {sms_config.get('provider')}")
+
+    if not sms_config.get("enabled"):
+        print(f"[SMS] SKIPPED: SMS is disabled in config")
+        return False
+
+    if not phone_number or len(phone_number) < 10:
+        print(f"[SMS] SKIPPED: Invalid phone number '{phone_number}' (too short)")
+        return False
+
+    # Clean up phone number
+    clean_phone = ''.join(filter(str.isdigit, phone_number))
+    if len(clean_phone) == 10:
+        clean_phone = "1" + clean_phone  # Add US country code
+    print(f"[SMS] Cleaned phone: {clean_phone}")
+
+    # Format message
+    message = sms_config.get("message_template", "It's your turn to race!").format(
+        name=driver_name,
+        simulator=simulator_name
+    )
+    print(f"[SMS] Message: {message}")
+
+    provider = sms_config.get("provider", "textbelt")
+    print(f"[SMS] Sending via {provider}...")
+
+    if provider == "textbelt":
+        return send_sms_textbelt(clean_phone, message)
+    elif provider == "twilio":
+        return send_sms_twilio(clean_phone, message)
+    else:
+        print(f"[SMS] ERROR: Unknown provider '{provider}'")
+        return False
+
+def send_sms_textbelt(phone_number, message):
+    """Send SMS via Textbelt API"""
+    try:
+        api_key = sms_config.get("textbelt_key", "")
+        print(f"[SMS] Textbelt API key: {api_key[:8]}...{api_key[-4:] if len(api_key) > 12 else '(short)'}")
+
+        data = {
+            "phone": phone_number,
+            "message": message,
+            "key": api_key
+        }
+
+        # Add sender name for regulatory compliance
+        sender = sms_config.get("textbelt_sender", "")
+        if sender:
+            data["sender"] = sender
+            print(f"[SMS] Sender name: {sender}")
+
+        print(f"[SMS] Posting to textbelt.com/text...")
+        response = requests.post(
+            "https://textbelt.com/text",
+            data=data,
+            timeout=10
+        )
+
+        print(f"[SMS] Response status: {response.status_code}")
+        result = response.json()
+        print(f"[SMS] Response body: {result}")
+
+        if result.get("success"):
+            print(f"[SMS] SUCCESS! Sent to {phone_number}")
+            print(f"[SMS] Quota remaining: {result.get('quotaRemaining', 'unknown')}")
+            return True
+        else:
+            print(f"[SMS] FAILED: {result.get('error', 'Unknown error')}")
+            return False
+
+    except Exception as e:
+        print(f"[SMS] Textbelt ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+def send_sms_twilio(phone_number, message):
+    """Send SMS via Twilio API"""
+    try:
+        # Ensure phone has + prefix for Twilio
+        if not phone_number.startswith("+"):
+            phone_number = "+" + phone_number
+
+        account_sid = sms_config["twilio_account_sid"]
+        auth_token = sms_config["twilio_auth_token"]
+        from_number = sms_config["twilio_from_number"]
+
+        url = f"https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Messages.json"
+
+        response = requests.post(
+            url,
+            auth=(account_sid, auth_token),
+            data={
+                "To": phone_number,
+                "From": from_number,
+                "Body": message
+            },
+            timeout=10
+        )
+
+        if response.status_code in [200, 201]:
+            print(f"[SMS] Twilio sent to {phone_number}: {message}")
+            return True
+        else:
+            print(f"[SMS] Twilio failed: {response.status_code} - {response.text}")
+            return False
+
+    except Exception as e:
+        print(f"[SMS] Twilio error: {e}")
+        return False
+
+# ============================================
+# PROACTIVE SMS NOTIFICATION SYSTEM
+# Sends "heads up" SMS when estimated wait < 10 minutes
+# ============================================
+
+notified_queue_ids = set()  # Track who's been texted
+
+def send_headsup_notification(phone_number, name, wait_minutes):
+    """Send proactive heads-up SMS when guest's turn is approaching"""
+    if not sms_config.get("enabled"):
+        print(f"[SMS] Heads-up SMS disabled - SMS not enabled")
+        return False
+
+    # Get template or use default
+    template = sms_config.get("headsup_message_template",
+        "Hey {name}! It's almost your turn to race! Head back to the simulators now - you're up in about {wait} minutes!")
+
+    # Format message
+    message = template.format(name=name, wait=int(wait_minutes))
+
+    # Clean phone number
+    import re
+    clean_phone = re.sub(r'[^\d+]', '', phone_number)
+    if not clean_phone.startswith('+') and not clean_phone.startswith('1'):
+        clean_phone = '+1' + clean_phone
+    elif clean_phone.startswith('1') and len(clean_phone) == 11:
+        clean_phone = '+' + clean_phone
+
+    print(f"[SMS] Sending heads-up to {name}: {message}")
+
+    provider = sms_config.get("provider", "textbelt")
+    if provider == "textbelt":
+        return send_sms_textbelt(clean_phone, message)
+    elif provider == "twilio":
+        return send_sms_twilio(clean_phone, message)
+
+    return False
+
+def queue_notification_checker():
+    """Background thread that checks queue and sends proactive SMS"""
+    global notified_queue_ids
+    import time as time_module
+
+    print("[SMS] Queue notification checker started")
+
+    while True:
+        time_module.sleep(30)  # Check every 30 seconds
+
+        if not sms_config.get("enabled"):
+            continue
+
+        try:
+            # Get receiver URL
+            receiver_url = None
+            if main_window and hasattr(main_window, 'current_server_url'):
+                url = main_window.current_server_url
+                if url:
+                    receiver_url = url.split(',')[0].strip()
+
+            if not receiver_url:
+                continue
+
+            # Fetch queue from receiver
+            import requests
+            response = requests.get(f"{receiver_url}/api/queue", timeout=5)
+            if not response.ok:
+                continue
+
+            queue_data = response.json()
+            if not queue_data.get('success'):
+                continue
+
+            queue = queue_data.get('queue', [])
+            if not queue:
+                notified_queue_ids.clear()
+                continue
+
+            # Get stats for average session time
+            try:
+                stats_response = requests.get(f"{receiver_url}/api/queue/stats", timeout=5)
+                stats = stats_response.json() if stats_response.ok else {}
+                avg_session_minutes = stats.get('avg_session_minutes', 8)
+            except:
+                avg_session_minutes = 8
+
+            # Count available simulators (rough estimate based on discovered sims)
+            num_sims = max(1, len(getattr(main_window, 'discovered_simulators', [])) or 1)
+
+            for guest in queue:
+                guest_id = guest.get('id')
+                phone = guest.get('phone')
+                name = guest.get('name', 'Guest')
+                position = guest.get('position', 1)
+
+                # Skip if no phone or already notified
+                if not phone or guest_id in notified_queue_ids:
+                    continue
+
+                # Calculate estimated wait (position / num_sims) * avg_session_time
+                estimated_wait = (position / num_sims) * avg_session_minutes
+
+                if estimated_wait < 10:  # Under 10 minutes threshold
+                    success = send_headsup_notification(phone, name, estimated_wait)
+                    if success:
+                        notified_queue_ids.add(guest_id)
+                        print(f"[SMS] Sent heads-up to {name} (wait: {estimated_wait:.0f} min)")
+                    else:
+                        print(f"[SMS] Failed to send heads-up to {name}")
+
+            # Clean up: remove IDs no longer in queue
+            current_ids = {g.get('id') for g in queue}
+            notified_queue_ids.intersection_update(current_ids)
+
+        except Exception as e:
+            print(f"[SMS] Queue check error: {e}")
+
+def start_queue_notification_thread():
+    """Start the background queue notification checker"""
+    import threading
+    thread = threading.Thread(target=queue_notification_checker, daemon=True)
+    thread.start()
+    return thread
+
 # Create Flask app with no output
 app = Flask(__name__)
 app.logger.disabled = True
@@ -486,1357 +798,607 @@ HTML_CONTENT = r"""
 </html>
 """
 
-# Full admin HTML page - includes manual entry, simulator tabs, all features
+# Full admin HTML page - Restaurant-style host stand UI
 ADMIN_HTML_CONTENT = r"""
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Lap Time Sender - Driver Setup</title>
+    <title>Sim Racing - Host Stand</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="black">
     <style>
-        /* Reset all margins and padding */
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-        
-        /* Force html and body to full height - allow scroll for queue panel */
+        * { margin: 0; padding: 0; box-sizing: border-box; }
         html, body {
             width: 100%;
             min-height: 100vh;
             overflow-x: hidden;
-            overflow-y: auto;
             background-color: #1e1e1e;
         }
-
-        /* Set body as a flex container with background */
         body {
             font-family: 'Segoe UI', Arial, sans-serif;
             display: flex;
             flex-direction: column;
-            align-items: center;
-            padding-top: 5vh;
-            padding-bottom: 20px;
-            background-repeat: no-repeat;
-            background-position: center;
-            background-size: cover;
-            background-attachment: fixed;
-            min-height: 100%;
-        }
-        
-        /* Container for the form */
-        .container {
-            width: 90%;
-            max-width: 500px;
-            background-color: #252526;
-            padding: 25px;
-            border-radius: 8px;
-            box-shadow: 0 4px 12px rgba(0,0,0,0.4);
-            border: 1px solid #3e3e42;
-            z-index: 10;
-            margin-bottom: 20px;
-        }
-        
-        h1 {
-            color: #cccccc;
-            margin-bottom: 20px;
-            text-align: center;
-        }
-        
-        .input-group {
-            margin-bottom: 20px;
-        }
-        
-        label {
-            display: block;
-            margin-bottom: 5px;
-            color: #9d9d9d;
-            font-weight: bold;
-        }
-        
-        input[type="text"], input[type="email"] {
-            width: 100%;
-            padding: 10px;
-            font-size: 16px;
-            border: 1px solid #3e3e42;
-            border-radius: 4px;
-            box-sizing: border-box;
-            background-color: #2d2d30;
-            color: #cccccc;
-        }
-        
-        input[type="text"]:focus, input[type="email"]:focus {
-            border-color: #007acc;
-            outline: none;
-            background-color: #1e1e1e;
-        }
-        
-        button {
-            background-color: #007acc;
-            color: white;
-            padding: 12px 20px;
-            border: none;
-            border-radius: 4px;
-            cursor: pointer;
-            font-size: 16px;
-            width: 100%;
-            font-weight: bold;
-        }
-        
-        button:hover {
-            background-color: #0098ff;
-        }
-        
-        .status {
-            margin-top: 20px;
-            padding: 10px;
-            border-radius: 4px;
-            text-align: center;
-        }
-        
-        .success {
-            background-color: rgba(78, 201, 176, 0.2);
-            color: #4ec9b0;
-            border: 1px solid #4ec9b0;
-        }
-        
-        .error {
-            background-color: rgba(244, 135, 113, 0.2);
-            color: #f48771;
-            border: 1px solid #f48771;
-        }
-        
-        .timer-alert {
-            animation: flash 1s infinite;
-        }
-        
-        @keyframes flash {
-            0%, 100% { background-color: #252526; }
-            50% { background-color: rgba(244, 135, 113, 0.4); }
+            padding: 15px;
+            padding-bottom: 100px;
         }
 
-        /* Timer/Lap Status Display - Prominent styling */
-        #timerStatus {
-            font-size: 28px;
-            font-weight: bold;
-            padding: 18px 24px;
-            margin: 20px 0;
-            border-radius: 12px;
-            text-align: center;
-            box-shadow: 0 4px 12px rgba(0,0,0,0.4);
-            transition: all 0.3s ease;
-        }
-        
-        #timerStatus .timer-icon {
-            font-size: 32px;
-            margin-right: 8px;
-        }
-        
-        #timerStatus .timer-text {
-            display: block;
-            font-size: 36px;
-            margin: 8px 0;
-            letter-spacing: 2px;
-        }
-        
-        #timerStatus .timer-label {
-            display: block;
-            font-size: 14px;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-            opacity: 0.9;
-        }
-        
-        /* Progress bar for laps */
-        .progress-bar-container {
-            width: 100%;
-            height: 12px;
-            background-color: #3e3e42;
-            border-radius: 6px;
-            margin-top: 12px;
-            overflow: hidden;
-        }
-        
-        .progress-bar-fill {
-            height: 100%;
-            background-color: #007acc;
-            border-radius: 6px;
-            transition: width 0.5s ease;
-        }
-        
-        /* Timer active state - muted teal */
-        #timerStatus.timer-active {
-            background-color: #2d2d30;
-            color: #4ec9b0;
-            border: 2px solid #4ec9b0;
-        }
-        
-        /* Timer warning state - muted orange */
-        #timerStatus.timer-warning {
-            background-color: #2d2d30;
-            color: #ce9178;
-            border: 2px solid #ce9178;
-            animation: pulse 1.5s infinite;
-        }
-        
-        /* Timer expired state - muted red */
-        #timerStatus.timer-expired {
-            background-color: #2d2d30;
-            color: #f48771;
-            border: 2px solid #f48771;
-            animation: timerFlash 0.8s infinite;
-        }
-        
-        /* Laps active state - accent blue */
-        #timerStatus.laps-active {
-            background-color: #2d2d30;
-            color: #007acc;
-            border: 2px solid #007acc;
-        }
-        
-        /* Out lap state - muted purple */
-        #timerStatus.laps-outlap {
-            background-color: #2d2d30;
-            color: #9d9d9d;
-            border: 2px solid #454545;
-        }
-        
-        @keyframes pulse {
-            0%, 100% { transform: scale(1); box-shadow: 0 4px 12px rgba(0,0,0,0.4); }
-            50% { transform: scale(1.02); box-shadow: 0 6px 16px rgba(206,145,120,0.3); }
-        }
-        
-        @keyframes timerFlash {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.7; }
-        }
-        
-        /* Responsive sizing for mobile */
-        @media (max-width: 480px) {
-            #timerStatus {
-                font-size: 22px;
-                padding: 14px 18px;
-            }
-            #timerStatus .timer-text {
-                font-size: 28px;
-            }
-        }
-
-        @keyframes highlight-field {
-            0%, 100% { background-color: transparent; }
-            50% { background-color: rgba(0, 122, 204, 0.2); }
-        }
-        
-        /* iPad-specific styles - more aggressive with exact sizing */
-        @media only screen and (min-device-width: 768px) and (max-device-width: 1024px),
-               only screen and (min-device-width: 834px) and (max-device-width: 1194px),
-               only screen and (min-device-width: 1024px) and (max-device-width: 1366px) {
-            body {
-                padding-top: 15vh; /* Move content down further to show logo */
-            }
-        }
-        
-        .current-driver {
-            background-color: #2d2d30;
-            border-left: 4px solid #007acc;
-            padding: 10px 15px;
-            margin-bottom: 20px;
-            border-radius: 4px;
+        /* Stats Bar */
+        .stats-bar {
             display: flex;
-            justify-content: space-between;
-            align-items: center;
+            justify-content: center;
+            gap: 15px;
+            padding: 12px 15px;
+            background: #252526;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
         }
-        
-        .current-driver p {
-            margin: 0;
-            font-weight: bold;
-            color: #cccccc;
-        }
-        
-        .current-driver span {
-            color: #007acc;
-            font-weight: bold;
-        }
-        
-        .current-driver-title {
-            font-size: 0.85em;
-            color: #9d9d9d;
-            margin-bottom: 3px;
-        }
-        
-        /* Logo styling */
-        .logo-container {
-            text-align: center;
-            margin-top: 20px;
-            padding-top: 15px;
-            border-top: 1px solid #3e3e42;
-            background-color: transparent;
-        }
-        
-        .logo-container img {
-            max-width: 100%;
-            height: auto;
-            max-height: 120px;
-            width: auto;
-            margin: 10px 0;
-            background-color: transparent;
-            box-shadow: none;
-            border: none;
-        }
-        
-        /* Simulator Tabs Styles */
-        .simulator-tabs {
-            position: fixed;
-            top: 0;
-            left: 0;
-            right: 0;
-            background-color: #252526;
-            padding: 8px 10px;
+        .stat-item {
             display: flex;
             align-items: center;
             gap: 8px;
-            z-index: 1000;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.4);
-            border-bottom: 1px solid #3e3e42;
-            overflow-x: auto;
-            -webkit-overflow-scrolling: touch;
-        }
-        
-        .tabs-container {
-            display: flex;
-            gap: 6px;
-            flex: 1;
-            overflow-x: auto;
-            padding: 2px 0;
-        }
-        
-        .sim-tab {
-            padding: 10px 16px;
+            padding: 8px 16px;
+            background: #2d2d30;
             border-radius: 6px;
-            font-size: 14px;
-            font-weight: 600;
-            cursor: pointer;
-            white-space: nowrap;
-            transition: all 0.2s ease;
-            border: 1px solid transparent;
-            min-width: 80px;
-            text-align: center;
-            /* Prevent text selection on long-press */
-            -webkit-user-select: none;
-            -moz-user-select: none;
-            -ms-user-select: none;
-            user-select: none;
-            -webkit-touch-callout: none;
-            -webkit-tap-highlight-color: transparent;
-            touch-action: manipulation;
-        }
-        
-        .sim-tab * {
-            -webkit-user-select: none;
-            -moz-user-select: none;
-            -ms-user-select: none;
-            user-select: none;
-            -webkit-touch-callout: none;
-            pointer-events: none;
-        }
-        
-        .sim-tab.no-driver {
-            background-color: #2d2d30;
-            color: #9d9d9d;
-            border-color: #3e3e42;
-        }
-        
-        .sim-tab.has-driver {
-            background-color: #2d2d30;
-            color: #4ec9b0;
-            border-color: #4ec9b0;
-        }
-        
-        .sim-tab.current {
-            background-color: #37373d;
-            color: #ffffff;
-            border-color: #007acc;
-            box-shadow: 0 0 8px rgba(0, 122, 204, 0.4);
-        }
-        
-        .sim-tab.unreachable {
-            background-color: #2d2d30;
-            color: #f48771;
-            border-color: rgba(244, 135, 113, 0.5);
-            opacity: 0.7;
-        }
-        
-        .sim-tab:hover:not(.current) {
-            background-color: #37373d;
-            box-shadow: 0 4px 12px rgba(0,0,0,0.3);
-        }
-        
-        .sim-tab .driver-name {
-            font-size: 11px;
-            font-weight: normal;
-            opacity: 0.9;
-            display: block;
-            margin-top: 2px;
-            max-width: 80px;
-            overflow: hidden;
-            text-overflow: ellipsis;
-        }
-        
-        .sim-tab .status-dot {
-            display: inline-block;
-            width: 8px;
-            height: 8px;
-            border-radius: 50%;
-            margin-right: 4px;
-            vertical-align: middle;
-        }
-        
-        .sim-tab .status-dot.online {
-            background: #4ec9b0;
-            box-shadow: 0 0 4px #4ec9b0;
-        }
-        
-        .sim-tab .status-dot.offline {
-            background: #f48771;
-            box-shadow: 0 0 4px #f48771;
-        }
-        
-        .sim-tab .session-info {
-            font-size: 10px;
-            font-weight: normal;
-            opacity: 0.8;
-            display: block;
-            margin-top: 1px;
-            color: #9d9d9d;
-        }
-        
-        .sim-tab.time-expired {
-            background-color: rgba(239, 68, 68, 0.3) !important;
-            border-color: #ef4444 !important;
-            animation: pulse-red 1.5s ease-in-out infinite;
-        }
-        
-        .sim-tab.time-expired .driver-name {
-            color: #ef4444;
-        }
-        
-        @keyframes pulse-red {
-            0%, 100% { box-shadow: 0 0 5px rgba(239, 68, 68, 0.4); }
-            50% { box-shadow: 0 0 15px rgba(239, 68, 68, 0.8); }
-        }
-        
-        /* Context Menu for Long-Press */
-        .context-menu-overlay {
-            display: none;
-            position: fixed;
-            top: 0;
-            left: 0;
-            right: 0;
-            bottom: 0;
-            background: rgba(0, 0, 0, 0.6);
-            z-index: 3000;
-            align-items: center;
-            justify-content: center;
-        }
-        
-        .context-menu-overlay.active {
-            display: flex;
-        }
-        
-        .context-menu {
-            background-color: #2d2d30;
-            border-radius: 8px;
-            border: 1px solid #3e3e42;
-            padding: 8px 0;
-            min-width: 200px;
-            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
-        }
-        
-        .context-menu-header {
-            padding: 12px 16px;
-            border-bottom: 1px solid #3e3e42;
-            color: #cccccc;
-            font-weight: 600;
-            font-size: 14px;
-        }
-        
-        .context-menu-item {
-            padding: 12px 16px;
-            color: #cccccc;
-            cursor: pointer;
-            display: flex;
-            align-items: center;
-            gap: 10px;
-            font-size: 14px;
-        }
-        
-        .context-menu-item:hover {
-            background-color: #37373d;
-        }
-        
-        .context-menu-item.delete {
-            color: #f48771;
-        }
-        
-        .context-menu-item.delete:hover {
-            background-color: rgba(244, 135, 113, 0.15);
-        }
-        
-        /* Edit Simulator Modal */
-        .edit-sim-modal {
-            background-color: #252526;
-            border-radius: 8px;
-            border: 1px solid #3e3e42;
-            padding: 24px;
-            width: 90%;
-            max-width: 350px;
-        }
-        
-        .edit-sim-modal h3 {
-            margin: 0 0 20px 0;
-            color: #cccccc;
-            font-size: 16px;
-        }
-        
-        .edit-sim-modal input {
-            width: 100%;
-            padding: 10px 12px;
-            border: 1px solid #3e3e42;
-            border-radius: 6px;
-            background-color: #1e1e1e;
             color: #cccccc;
             font-size: 14px;
-            margin-bottom: 12px;
-            box-sizing: border-box;
         }
-        
-        .edit-sim-modal input:focus {
-            border-color: #007acc;
-            outline: none;
-        }
-        
-        .edit-sim-modal .btn-row {
-            display: flex;
-            gap: 10px;
-            margin-top: 16px;
-        }
-        
-        .edit-sim-modal button {
-            flex: 1;
-            padding: 10px;
-            border: none;
-            border-radius: 6px;
-            cursor: pointer;
-            font-size: 14px;
-            font-weight: 500;
-        }
-        
-        .edit-sim-modal .save-btn {
-            background-color: #007acc;
-            color: white;
-        }
-        
-        .edit-sim-modal .cancel-btn {
-            background-color: #3e3e42;
-            color: #cccccc;
-        }
-        
-        .settings-btn {
-            width: 40px;
-            height: 40px;
-            min-width: 40px;
-            border-radius: 50%;
-            background-color: #2d2d30;
-            color: #cccccc;
-            border: 1px solid #3e3e42;
-            font-size: 20px;
-            cursor: pointer;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            transition: all 0.2s ease;
-        }
-        
-        .settings-btn:hover {
-            background-color: #37373d;
-            border-color: #007acc;
+        .stat-item .stat-value {
+            font-weight: bold;
+            font-size: 18px;
             color: #007acc;
         }
-        
-        /* Settings Modal */
-        .modal-overlay {
-            display: none;
-            position: fixed;
-            top: 0;
-            left: 0;
-            right: 0;
-            bottom: 0;
-            background: rgba(0, 0, 0, 0.8);
-            z-index: 2000;
-            align-items: center;
-            justify-content: center;
-        }
-        
-        .modal-overlay.active {
-            display: flex;
-        }
-        
-        .modal {
-            background-color: #252526;
-            border-radius: 8px;
-            border: 1px solid #3e3e42;
-            padding: 24px;
-            width: 90%;
-            max-width: 400px;
-            max-height: 80vh;
-            overflow-y: auto;
-        }
-        
-        .modal h3 {
-            margin: 0 0 20px 0;
-            color: #cccccc;
-            font-size: 18px;
-        }
-        
-        .modal-close {
-            position: absolute;
-            top: 10px;
-            right: 15px;
-            font-size: 24px;
-            cursor: pointer;
-            color: #9d9d9d;
-        }
-        
-        .manual-sim-list {
+        .stat-item.warning .stat-value { color: #ce9178; }
+        .stat-item.success .stat-value { color: #4ec9b0; }
+
+        /* Simulator Cards Grid */
+        .sims-section {
             margin-bottom: 20px;
         }
-        
-        .manual-sim-item {
+        .sims-section h2 {
+            color: #9d9d9d;
+            font-size: 14px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 12px;
             display: flex;
             align-items: center;
-            justify-content: space-between;
-            padding: 10px;
-            background-color: #2d2d30;
-            border: 1px solid #3e3e42;
-            border-radius: 6px;
-            margin-bottom: 8px;
-            color: #cccccc;
-        }
-        
-        .manual-sim-item .remove-btn {
-            background-color: #f48771;
-            color: #1e1e1e;
-            border: none;
-            border-radius: 4px;
-            padding: 4px 10px;
-            cursor: pointer;
-            font-size: 12px;
-        }
-        
-        .add-sim-form {
-            display: flex;
-            flex-direction: column;
             gap: 10px;
         }
-        
-        .add-sim-form input {
-            padding: 10px;
-            border: 1px solid #3e3e42;
-            border-radius: 6px;
-            font-size: 14px;
-            background-color: #2d2d30;
-            color: #cccccc;
+        .sims-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+            gap: 12px;
         }
-        
-        .add-sim-form button {
-            background-color: #007acc;
-            color: white;
-            border: none;
-            padding: 12px;
-            border-radius: 6px;
-            font-weight: 600;
-            cursor: pointer;
-        }
-        
-        .add-sim-form button:hover {
-            background-color: #0098ff;
-        }
-        
-        .discovery-status {
-            text-align: center;
-            padding: 10px;
-            color: #9d9d9d;
-            font-size: 13px;
-        }
-        
-        /* Manual Lap Time Entry Modal */
-        .manual-lap-modal {
-            display: none;
-            position: fixed;
-            top: 0;
-            left: 0;
-            right: 0;
-            bottom: 0;
-            background: rgba(0, 0, 0, 0.85);
-            z-index: 3000;
-            align-items: center;
-            justify-content: center;
-        }
-        
-        .manual-lap-modal.active {
+        .sim-card {
+            background: #252526;
+            border: 2px solid #3e3e42;
+            border-radius: 12px;
+            padding: 16px;
             display: flex;
-        }
-        
-        .manual-lap-content {
-            background-color: #252526;
-            border: 1px solid #3e3e42;
-            border-radius: 8px;
-            padding: 30px;
-            width: 90%;
-            max-width: 500px;
-            max-height: 80vh;
-            overflow-y: auto;
-            position: relative;
-        }
-        
-        .manual-lap-content h2 {
-            color: #cccccc;
-            margin-bottom: 10px;
-            text-align: center;
-            font-size: 22px;
-        }
-        
-        .manual-lap-content .close-btn {
-            position: absolute;
-            top: 15px;
-            right: 20px;
-            font-size: 28px;
+            flex-direction: column;
+            min-height: 140px;
+            transition: all 0.2s ease;
             cursor: pointer;
-            color: #9d9d9d;
-            background: none;
-            border: none;
-            padding: 0;
-            width: auto;
         }
-        
-        .manual-lap-content .close-btn:hover {
-            color: #cccccc;
+        .sim-card:hover { transform: translateY(-2px); box-shadow: 0 4px 12px rgba(0,0,0,0.3); }
+
+        /* Sim card states */
+        .sim-card.available { border-color: #4ec9b0; }
+        .sim-card.occupied { border-color: #007acc; }
+        .sim-card.expiring { border-color: #ce9178; animation: pulse-border 1.5s infinite; }
+        .sim-card.expired { border-color: #f48771; animation: pulse-border-red 1s infinite; }
+        .sim-card.offline { border-color: #f48771; opacity: 0.6; }
+
+        @keyframes pulse-border {
+            0%, 100% { box-shadow: 0 0 0 0 rgba(206, 145, 120, 0.4); }
+            50% { box-shadow: 0 0 0 4px rgba(206, 145, 120, 0.2); }
         }
-        
-        .manual-entry-button {
-            position: fixed;
-            bottom: 20px;
-            right: 20px;
-            background-color: #007acc;
-            color: white;
-            border: none;
-            border-radius: 50%;
-            width: 60px;
-            height: 60px;
-            font-size: 24px;
-            cursor: pointer;
-            box-shadow: 0 4px 12px rgba(0,0,0,0.4);
-            z-index: 1500;
-            transition: all 0.3s ease;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-        }
-        
-        .manual-entry-button:hover {
-            background-color: #0098ff;
-            box-shadow: 0 6px 16px rgba(0,122,204,0.4);
-        }
-        
-        .manual-entry-button:active {
-            transform: scale(0.95);
-        }
-        
-        /* Adjust body padding when tabs are present */
-        body.has-tabs {
-            padding-top: calc(5vh + 60px);
-        }
-        
-        @media only screen and (min-device-width: 768px) and (max-device-width: 1024px),
-               only screen and (min-device-width: 834px) and (max-device-width: 1194px),
-               only screen and (min-device-width: 1024px) and (max-device-width: 1366px) {
-            body.has-tabs {
-                padding-top: calc(15vh + 60px);
-            }
+        @keyframes pulse-border-red {
+            0%, 100% { box-shadow: 0 0 0 0 rgba(244, 135, 113, 0.5); }
+            50% { box-shadow: 0 0 0 6px rgba(244, 135, 113, 0.3); }
         }
 
-        /* Queue Panel Styles */
-        .queue-panel {
-            width: 90%; max-width: 500px;
-            background-color: #252526; padding: 20px;
-            border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.4);
-            border: 1px solid #3e3e42;
-            margin-top: 20px;
+        .sim-card-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            margin-bottom: 8px;
         }
-        .queue-panel h2 {
-            color: #cccccc; font-size: 18px; margin-bottom: 15px;
-            display: flex; align-items: center; gap: 8px;
+        .sim-card-name {
+            font-weight: 600;
+            font-size: 16px;
+            color: #ffffff;
         }
-        .queue-panel .queue-stats {
-            display: flex; gap: 15px; margin-bottom: 15px;
-            font-size: 13px; color: #9d9d9d;
+        .sim-card-status {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: #4ec9b0;
         }
-        .queue-panel .queue-stats span {
-            background: #2d2d30; padding: 6px 10px; border-radius: 4px;
+        .sim-card-status.offline { background: #f48771; }
+
+        .sim-card-driver {
+            font-size: 18px;
+            font-weight: bold;
+            color: #cccccc;
+            margin-bottom: 4px;
+            flex: 1;
         }
+        .sim-card-driver.available-text {
+            color: #4ec9b0;
+            font-size: 16px;
+        }
+
+        .sim-card-timer {
+            font-size: 24px;
+            font-weight: bold;
+            color: #007acc;
+            margin-bottom: 8px;
+            font-family: 'Consolas', monospace;
+        }
+        .sim-card.expiring .sim-card-timer { color: #ce9178; }
+        .sim-card.expired .sim-card-timer { color: #f48771; }
+
+        .sim-card-laps {
+            font-size: 14px;
+            color: #9d9d9d;
+            margin-bottom: 8px;
+        }
+
+        .sim-card-action {
+            margin-top: auto;
+            padding: 12px;
+            border: none;
+            border-radius: 8px;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            min-height: 44px;
+        }
+        .sim-card-action.seat-next {
+            background: #4ec9b0;
+            color: #1e1e1e;
+        }
+        .sim-card-action.seat-next:hover { background: #5fd9c0; }
+        .sim-card-action.seat-next:disabled {
+            background: #3e3e42;
+            color: #6e6e6e;
+            cursor: not-allowed;
+        }
+        .sim-card-action.end-session {
+            background: #f48771;
+            color: #1e1e1e;
+        }
+        .sim-card-action.end-session:hover { background: #ff9785; }
+
+        /* Queue Section */
+        .queue-section {
+            background: #252526;
+            border-radius: 12px;
+            padding: 16px;
+            margin-bottom: 20px;
+        }
+        .queue-section h2 {
+            color: #cccccc;
+            font-size: 16px;
+            margin-bottom: 12px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
         .queue-list {
-            max-height: 300px; overflow-y: auto;
+            max-height: 300px;
+            overflow-y: auto;
         }
         .queue-item {
-            display: flex; align-items: center; justify-content: space-between;
-            padding: 12px; background-color: #2d2d30;
-            border: 1px solid #3e3e42; border-radius: 6px;
-            margin-bottom: 8px; color: #cccccc;
-        }
-        .queue-item.assigned {
-            border-color: #4ec9b0; background-color: rgba(78, 201, 176, 0.1);
+            display: flex;
+            align-items: center;
+            padding: 12px;
+            background: #2d2d30;
+            border-radius: 8px;
+            margin-bottom: 8px;
+            gap: 12px;
         }
         .queue-item .position {
-            font-size: 20px; font-weight: bold; color: #007acc;
-            min-width: 30px; text-align: center;
+            font-size: 20px;
+            font-weight: bold;
+            color: #007acc;
+            min-width: 36px;
+            text-align: center;
         }
         .queue-item .guest-info {
-            flex: 1; margin-left: 12px;
+            flex: 1;
         }
         .queue-item .guest-name {
-            font-weight: 600; font-size: 15px;
+            font-weight: 600;
+            font-size: 15px;
+            color: #ffffff;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .queue-item .notified-badge {
+            font-size: 14px;
+            color: #4ec9b0;
+            title: 'SMS sent';
         }
         .queue-item .guest-wait {
-            font-size: 12px; color: #9d9d9d; margin-top: 2px;
+            font-size: 12px;
+            color: #9d9d9d;
+            margin-top: 2px;
         }
-        .queue-item .actions {
-            display: flex; gap: 6px; align-items: center;
-        }
-        .queue-item select {
-            padding: 6px 8px; font-size: 12px;
-            background: #1e1e1e; color: #cccccc;
-            border: 1px solid #3e3e42; border-radius: 4px;
-        }
-        .queue-item .assign-btn {
-            padding: 6px 12px; font-size: 12px;
-            background: #007acc; color: white;
-            border: none; border-radius: 4px; cursor: pointer;
-        }
-        .queue-item .assign-btn:hover { background: #0098ff; }
         .queue-item .remove-btn {
-            padding: 6px 10px; font-size: 12px;
-            background: transparent; color: #f48771;
-            border: 1px solid #f48771; border-radius: 4px; cursor: pointer;
+            width: 36px;
+            height: 36px;
+            border-radius: 50%;
+            border: 1px solid #f48771;
+            background: transparent;
+            color: #f48771;
+            font-size: 16px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
         }
         .queue-item .remove-btn:hover {
             background: rgba(244, 135, 113, 0.15);
         }
         .queue-empty {
-            text-align: center; color: #6e6e6e;
-            padding: 30px; font-style: italic;
+            text-align: center;
+            color: #6e6e6e;
+            padding: 40px 20px;
+            font-style: italic;
         }
 
-        /* Session Control Buttons in Sim Tabs */
-        .session-controls {
-            display: flex; gap: 8px; margin-top: 10px;
-            padding: 10px; background: #2d2d30;
-            border-radius: 6px; border: 1px solid #3e3e42;
+        /* Bottom Action Bar */
+        .action-bar {
+            position: fixed;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            background: #252526;
+            border-top: 1px solid #3e3e42;
+            padding: 12px 15px;
+            display: flex;
+            gap: 10px;
+            z-index: 100;
         }
-        .session-controls button {
-            flex: 1; padding: 10px 12px; font-size: 13px;
-            border: none; border-radius: 4px; cursor: pointer;
+        .action-bar button {
+            flex: 1;
+            padding: 14px;
+            border: none;
+            border-radius: 8px;
+            font-size: 14px;
             font-weight: 600;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            min-height: 48px;
         }
-        .session-controls .start-btn {
-            background: #4ec9b0; color: #1e1e1e;
+        .action-bar .register-btn {
+            background: #007acc;
+            color: white;
         }
-        .session-controls .start-btn:hover { background: #5fd9c0; }
-        .session-controls .start-btn:disabled {
-            background: #3e3e42; color: #6e6e6e; cursor: not-allowed;
+        .action-bar .register-btn:hover { background: #0098ff; }
+        .action-bar .manual-btn {
+            background: #3e3e42;
+            color: #cccccc;
         }
-        .session-controls .end-btn {
-            background: #f48771; color: #1e1e1e;
+        .action-bar .manual-btn:hover { background: #454545; }
+        .action-bar .settings-btn {
+            background: #3e3e42;
+            color: #cccccc;
+            flex: 0 0 48px;
         }
-        .session-controls .end-btn:hover { background: #ff9785; }
-        .session-controls .end-btn:disabled {
-            background: #3e3e42; color: #6e6e6e; cursor: not-allowed;
+
+        /* Modal Styles */
+        .modal-overlay {
+            display: none;
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(0, 0, 0, 0.85);
+            z-index: 2000;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        .modal-overlay.active { display: flex; }
+        .modal {
+            background: #252526;
+            border-radius: 12px;
+            border: 1px solid #3e3e42;
+            width: 100%;
+            max-width: 400px;
+            max-height: 90vh;
+            overflow-y: auto;
+        }
+        .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 16px 20px;
+            border-bottom: 1px solid #3e3e42;
+        }
+        .modal-header h3 {
+            color: #ffffff;
+            font-size: 18px;
+            margin: 0;
+        }
+        .modal-close {
+            background: none;
+            border: none;
+            color: #9d9d9d;
+            font-size: 24px;
+            cursor: pointer;
+            padding: 0;
+            width: 32px;
+            height: 32px;
+        }
+        .modal-close:hover { color: #ffffff; }
+        .modal-body {
+            padding: 20px;
+        }
+        .input-group {
+            margin-bottom: 16px;
+        }
+        .input-group label {
+            display: block;
+            margin-bottom: 6px;
+            color: #9d9d9d;
+            font-size: 14px;
+            font-weight: 500;
+        }
+        .input-group input {
+            width: 100%;
+            padding: 12px;
+            font-size: 16px;
+            border: 1px solid #3e3e42;
+            border-radius: 8px;
+            background: #2d2d30;
+            color: #ffffff;
+        }
+        .input-group input:focus {
+            border-color: #007acc;
+            outline: none;
+        }
+        .input-group small {
+            display: block;
+            margin-top: 4px;
+            color: #6e6e6e;
+            font-size: 12px;
+        }
+        .modal-body button.primary {
+            width: 100%;
+            padding: 14px;
+            background: #007acc;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            margin-top: 10px;
+        }
+        .modal-body button.primary:hover { background: #0098ff; }
+
+        .status {
+            margin-top: 16px;
+            padding: 12px;
+            border-radius: 8px;
+            text-align: center;
+            display: none;
+        }
+        .status.success {
+            display: block;
+            background: rgba(78, 201, 176, 0.2);
+            color: #4ec9b0;
+            border: 1px solid #4ec9b0;
+        }
+        .status.error {
+            display: block;
+            background: rgba(244, 135, 113, 0.2);
+            color: #f48771;
+            border: 1px solid #f48771;
+        }
+
+        /* Settings Modal specific */
+        .sim-config-list {
+            margin-bottom: 16px;
+        }
+        .sim-config-item {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 10px 12px;
+            background: #2d2d30;
+            border-radius: 6px;
+            margin-bottom: 8px;
+        }
+        .sim-config-item .info {
+            color: #cccccc;
+        }
+        .sim-config-item .info small {
+            display: block;
+            color: #6e6e6e;
+            font-size: 11px;
+        }
+        .sim-config-item .remove-btn {
+            background: #f48771;
+            color: #1e1e1e;
+            border: none;
+            border-radius: 4px;
+            padding: 4px 10px;
+            font-size: 12px;
+            cursor: pointer;
+        }
+        .add-sim-form input {
+            width: 100%;
+            padding: 10px;
+            margin-bottom: 8px;
+            border: 1px solid #3e3e42;
+            border-radius: 6px;
+            background: #2d2d30;
+            color: #cccccc;
+            font-size: 14px;
+        }
+
+        /* Responsive */
+        @media (max-width: 400px) {
+            .stats-bar { flex-direction: column; align-items: stretch; }
+            .stat-item { justify-content: space-between; }
+            .sims-grid { grid-template-columns: 1fr; }
         }
     </style>
 </head>
-<body class="has-tabs">
-    <!-- Simulator Tabs Bar -->
-    <div class="simulator-tabs" id="simulatorTabs">
-        <div class="tabs-container" id="tabsContainer">
-            <!-- Tabs populated dynamically -->
+<body>
+    <!-- Stats Bar -->
+    <div class="stats-bar">
+        <div class="stat-item">
+            <span id="waitingCount" class="stat-value">0</span>
+            <span>waiting</span>
         </div>
-        <button class="settings-btn" onclick="openSettingsModal()">+</button>
-    </div>
-    
-    <!-- Settings Modal for Manual Simulator Configuration -->
-    <div class="modal-overlay" id="settingsModal">
-        <div class="modal">
-            <h3>⚙️ Simulator Configuration</h3>
-            <div class="discovery-status" id="discoveryStatus">
-                Searching for simulators...
-            </div>
-            <div class="manual-sim-list" id="manualSimList">
-                <!-- Manual entries appear here -->
-            </div>
-            <div class="add-sim-form">
-                <input type="text" id="manualSimIp" placeholder="IP Address (e.g., 192.168.1.10)">
-                <input type="text" id="manualSimName" placeholder="Name (e.g., Sim 3)">
-                <button onclick="addManualSimulator()">➕ Add Simulator</button>
-                <button onclick="closeSettingsModal()" style="background-color: #3e3e42; margin-top: 5px;">Close</button>
-            </div>
+        <div class="stat-item success">
+            <span id="availableCount" class="stat-value">0</span>
+            <span>available</span>
         </div>
-    </div>
-    
-    <!-- Context Menu for Long-Press on Simulator Tabs -->
-    <div class="context-menu-overlay" id="contextMenuOverlay" onclick="closeContextMenu()">
-        <div class="context-menu" onclick="event.stopPropagation()">
-            <div class="context-menu-header" id="contextMenuHeader">Sim 1</div>
-            <div class="context-menu-item" id="contextEndSession" onclick="endSessionOnContextSim()" style="display: none;">
-                ⏹️ End Session
-            </div>
-            <div class="context-menu-item" onclick="editSimulator()">
-                ✏️ Edit
-            </div>
-            <div class="context-menu-item delete" onclick="deleteSimulator()">
-                🗑️ Delete
-            </div>
-            <div class="context-menu-item" onclick="closeContextMenu()">
-                ✖️ Cancel
-            </div>
-        </div>
-    </div>
-    
-    <!-- Edit Simulator Modal -->
-    <div class="context-menu-overlay" id="editSimModal">
-        <div class="edit-sim-modal" onclick="event.stopPropagation()">
-            <h3>✏️ Edit Simulator</h3>
-            <input type="text" id="editSimIp" placeholder="IP Address">
-            <input type="text" id="editSimName" placeholder="Name">
-            <div class="btn-row">
-                <button class="cancel-btn" onclick="closeEditModal()">Cancel</button>
-                <button class="save-btn" onclick="saveSimulatorEdit()">Save</button>
-            </div>
+        <div class="stat-item">
+            <span>Avg:</span>
+            <span id="avgWaitTime" class="stat-value">--</span>
         </div>
     </div>
 
-    <div class="container" id="container">
-        <h1>🏁 Driver Registration</h1>
-        <p style="text-align: center; color: #9d9d9d; margin-bottom: 20px; font-style: italic;">
-            Set your driver name for lap time tracking
-        </p>
-        
-        <div class="current-driver" id="currentDriverBox" style="display:none;">
-            <div>
-                <p class="current-driver-title">🏆 Active Driver:</p>
-                <p><span id="currentDriverName">None</span></p>
-            </div>
-            <div style="font-size: 0.8em; color: #9d9d9d;">
-                Ready for racing!
-            </div>
-        </div>
-        
-        <div class="input-group">
-            <label for="driverName">👤 Driver Name:</label>
-            <input type="text" id="driverName" placeholder="Enter your name (e.g., John Smith)" required>
-            <small style="color: #6e6e6e; font-style: italic;">This will appear on the leaderboard</small>
-        </div>
-        <div class="input-group" id="emailGroup" style="display: none;">
-            <label for="driverEmail">📧 Email Address: <span style="color: #f48771;">*</span></label>
-            <input type="email" id="driverEmail" placeholder="Enter email address (required)" required>
-            <small style="color: #6e6e6e; font-style: italic;">Required for driver communication and results</small>
-        </div>
-        <button onclick="updateDriver()">🏁 Register as Active Driver</button>
-        <div id="status" class="status" style="display: none;"></div>
-        <div id="timerStatus" style="display: none; margin-top: 15px;"></div>
-        
-        <!-- Logo at the bottom of the form -->
-        <div class="logo-container">
-            <img src="/logo" alt="Company Logo" id="companyLogo">
+    <!-- Simulators Grid -->
+    <div class="sims-section">
+        <h2>Simulators <button onclick="openSettingsModal()" style="background: none; border: none; color: #6e6e6e; cursor: pointer; font-size: 16px;">+</button></h2>
+        <div class="sims-grid" id="simsGrid">
+            <!-- Simulator cards populated dynamically -->
         </div>
     </div>
 
-    <!-- Queue Management Panel -->
-    <div class="queue-panel" id="queuePanel">
-        <h2>📋 Guest Queue</h2>
-        <div class="queue-stats">
-            <span id="queueCount">0 waiting</span>
-            <span id="avgWaitTime">Avg: --</span>
-        </div>
+    <!-- Queue Section -->
+    <div class="queue-section">
+        <h2>Queue</h2>
         <div class="queue-list" id="queueList">
             <div class="queue-empty">Queue is empty</div>
         </div>
-
-        <!-- Session Controls for Current Simulator -->
-        <div class="session-controls" id="sessionControls" style="margin-top: 15px;">
-            <button class="start-btn" id="startSessionBtn" onclick="startSessionForAssigned()" disabled>
-                ▶️ Start Session
-            </button>
-            <button class="end-btn" id="endSessionBtn" onclick="forceEndSession()" disabled>
-                ⏹️ End Session
-            </button>
-        </div>
-        <div id="sessionStatus" style="text-align: center; margin-top: 10px; font-size: 12px; color: #9d9d9d;"></div>
     </div>
 
-    <!-- Floating button to open manual lap entry (discrete, bottom right) -->
-    <button class="manual-entry-button" onclick="openManualLapModal()" title="Manual Lap Time Entry">
-        ⏱️
-    </button>
-    
-    <!-- Manual Lap Time Entry Modal -->
-    <div class="manual-lap-modal" id="manualLapModal">
-        <div class="manual-lap-content">
-            <button class="close-btn" onclick="closeManualLapModal()">&times;</button>
-            <h2>⏱️ Manual Lap Time Entry</h2>
-            <p style="text-align: center; color: #9d9d9d; margin-bottom: 25px; font-size: 14px; font-style: italic;">
-                Manually submit a lap time (for offline or manual timing)
-            </p>
-            
-            <div class="input-group">
-                <label for="manualDriverName">👤 Driver Name:</label>
-                <input type="text" id="manualDriverName" placeholder="Enter driver name">
-                <small style="color: #6e6e6e; font-style: italic;">Name that will appear on the leaderboard</small>
+    <!-- Bottom Action Bar -->
+    <div class="action-bar">
+        <button class="register-btn" onclick="openRegisterModal()">+ Register Driver</button>
+        <button class="manual-btn" onclick="openManualLapModal()">Manual Lap</button>
+        <button class="settings-btn" onclick="openSettingsModal()">+</button>
+    </div>
+
+    <!-- Register Driver Modal -->
+    <div class="modal-overlay" id="registerModal">
+        <div class="modal">
+            <div class="modal-header">
+                <h3>Register Driver</h3>
+                <button class="modal-close" onclick="closeRegisterModal()">&times;</button>
             </div>
-            
-            <div class="input-group">
-                <label for="manualLapTime">⏱️ Lap Time:</label>
-                <input type="text" id="manualLapTime" placeholder="e.g., 1:23.456 or 83.456">
-                <small style="color: #6e6e6e; font-style: italic;">Format: mm:ss.xxx or total seconds</small>
+            <div class="modal-body">
+                <div class="input-group">
+                    <label for="driverName">Driver Name</label>
+                    <input type="text" id="driverName" placeholder="Enter driver name">
+                    <small>This will appear on the leaderboard</small>
+                </div>
+                <div class="input-group" id="emailGroup" style="display: none;">
+                    <label for="driverEmail">Email Address</label>
+                    <input type="email" id="driverEmail" placeholder="Enter email address">
+                </div>
+                <button class="primary" onclick="updateDriver()">Register</button>
+                <div id="registerStatus" class="status"></div>
             </div>
-            
-            <button onclick="submitManualLapTime()" style="background-color: #007acc;">📤 Send Manual Lap Time</button>
-            <div id="manualStatus" class="status" style="display: none;"></div>
         </div>
     </div>
-    
+
+    <!-- Manual Lap Entry Modal -->
+    <div class="modal-overlay" id="manualLapModal">
+        <div class="modal">
+            <div class="modal-header">
+                <h3>Manual Lap Time</h3>
+                <button class="modal-close" onclick="closeManualLapModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="input-group">
+                    <label for="manualDriverName">Driver Name</label>
+                    <input type="text" id="manualDriverName" placeholder="Enter driver name">
+                </div>
+                <div class="input-group">
+                    <label for="manualLapTime">Lap Time</label>
+                    <input type="text" id="manualLapTime" placeholder="e.g., 1:23.456 or 83.456">
+                    <small>Format: mm:ss.xxx or total seconds</small>
+                </div>
+                <button class="primary" onclick="submitManualLapTime()">Submit Lap</button>
+                <div id="manualStatus" class="status"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Settings Modal -->
+    <div class="modal-overlay" id="settingsModal">
+        <div class="modal">
+            <div class="modal-header">
+                <h3>Simulator Settings</h3>
+                <button class="modal-close" onclick="closeSettingsModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p style="color: #9d9d9d; font-size: 13px; margin-bottom: 12px;" id="discoveryStatus">Searching for simulators...</p>
+                <div class="sim-config-list" id="manualSimList">
+                    <!-- Manual entries appear here -->
+                </div>
+                <div class="add-sim-form">
+                    <input type="text" id="manualSimIp" placeholder="IP Address (e.g., 192.168.1.10)">
+                    <input type="text" id="manualSimName" placeholder="Name (e.g., Sim 3)">
+                    <button class="primary" onclick="addManualSimulator()">Add Simulator</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Edit Simulator Modal -->
+    <div class="modal-overlay" id="editSimModal">
+        <div class="modal">
+            <div class="modal-header">
+                <h3>Edit Simulator</h3>
+                <button class="modal-close" onclick="closeEditModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="input-group">
+                    <label>IP Address</label>
+                    <input type="text" id="editSimIp" placeholder="IP Address">
+                </div>
+                <div class="input-group">
+                    <label>Name</label>
+                    <input type="text" id="editSimName" placeholder="Simulator Name">
+                </div>
+                <button class="primary" onclick="saveSimulatorEdit()">Save</button>
+            </div>
+        </div>
+    </div>
+
     <script>
-        // Log screen dimensions for debugging
-        console.log(`Screen dimensions: ${window.innerWidth}x${window.innerHeight}`);
-        console.log(`Screen ratio: ${window.innerWidth/window.innerHeight}`);
-        console.log(`Device pixel ratio: ${window.devicePixelRatio}`);
-        
-        // Variable to track if this is the initial page load
-        let isInitialLoad = true;
-        
         // ============================================
-        // MULTI-SIMULATOR TABS FUNCTIONALITY
+        // HOST STAND ADMIN - Simulator Cards UI
         // ============================================
-        
+
         const STORAGE_KEY = 'lapTimeSender_manualSimulators';
         let discoveredSimulators = [];
         let currentSimulatorIp = null;
-        let receiverUrl = null;
         let queueData = { queue: [], active_sessions: {} };
-        let assignedQueueId = null;  // Track which queue entry is assigned to this sim
+        let editingSimulator = null;
 
         // ============================================
-        // QUEUE MANAGEMENT FUNCTIONALITY
+        // SIMULATOR CARDS
         // ============================================
 
-        async function getReceiverUrl() {
-            if (receiverUrl) return receiverUrl;
-            try {
-                const resp = await fetch('/api/get_receiver_url');
-                const data = await resp.json();
-                if (data.success && data.receiver_url) {
-                    receiverUrl = data.receiver_url;
-                    return receiverUrl;
-                }
-            } catch (e) {
-                console.error('Error getting receiver URL:', e);
-            }
-            return null;
-        }
-
-        async function refreshQueue() {
-            const url = await getReceiverUrl();
-            if (!url) {
-                document.getElementById('queueList').innerHTML = '<div class="queue-empty">Cannot connect to queue server</div>';
-                return;
-            }
-
-            try {
-                const response = await fetch(url + '/api/queue');
-                const data = await response.json();
-                if (data.success) {
-                    queueData = data;
-                    renderQueue(data.queue);
-                    updateQueueStats(data);
-                    updateSessionControls();
-                }
-            } catch (e) {
-                console.error('Error fetching queue:', e);
-            }
-        }
-
-        function renderQueue(queue) {
-            const list = document.getElementById('queueList');
-            if (!queue || queue.length === 0) {
-                list.innerHTML = '<div class="queue-empty">Queue is empty</div>';
-                return;
-            }
-
-            // Build simulator options for assign dropdown
-            let simOptions = '<option value="">Assign to...</option>';
-            discoveredSimulators.forEach(sim => {
-                const hasDriver = sim.current_driver && sim.current_driver.trim();
-                const label = sim.simulator_name || `Sim ${sim.simulator_id}`;
-                const status = hasDriver ? ` (${sim.current_driver})` : ' (Available)';
-                simOptions += `<option value="${sim.ip}">${label}${status}</option>`;
-            });
-
-            list.innerHTML = queue.map((entry, idx) => {
-                const isAssigned = entry.assigned_to;
-                const assignedClass = isAssigned ? 'assigned' : '';
-                const assignedText = isAssigned ? `Assigned to ${entry.assigned_to}` : entry.wait_display;
-
-                return `
-                    <div class="queue-item ${assignedClass}" data-id="${entry.id}">
-                        <div class="position">#${entry.position}</div>
-                        <div class="guest-info">
-                            <div class="guest-name">${escapeHtml(entry.name)}</div>
-                            <div class="guest-wait">${assignedText}</div>
-                        </div>
-                        <div class="actions">
-                            ${!isAssigned ? `
-                                <select onchange="assignToSimulator('${entry.id}', this.value)">
-                                    ${simOptions}
-                                </select>
-                            ` : `
-                                <button class="assign-btn" onclick="startRemoteSession('${entry.id}', '${escapeHtml(entry.name)}', '${entry.assigned_to}')">
-                                    Start
-                                </button>
-                            `}
-                            <button class="remove-btn" onclick="removeFromQueue('${entry.id}')">✕</button>
-                        </div>
-                    </div>
-                `;
-            }).join('');
-        }
-
-        function updateQueueStats(data) {
-            document.getElementById('queueCount').textContent = `${data.total_in_queue || 0} waiting`;
-
-            // Get average wait time from stats endpoint
-            getReceiverUrl().then(url => {
-                if (!url) return;
-                fetch(url + '/api/queue/stats')
-                    .then(r => r.json())
-                    .then(stats => {
-                        if (stats.avg_session_time_display) {
-                            document.getElementById('avgWaitTime').textContent = `Avg session: ${stats.avg_session_time_display}`;
-                        } else {
-                            document.getElementById('avgWaitTime').textContent = 'Avg: calculating...';
-                        }
-                    })
-                    .catch(() => {});
-            });
-        }
-
-        function updateSessionControls() {
-            const startBtn = document.getElementById('startSessionBtn');
-            const endBtn = document.getElementById('endSessionBtn');
-            const statusEl = document.getElementById('sessionStatus');
-
-            // Check if current simulator has an assigned guest
-            const myIp = currentSimulatorIp;
-            const assignedEntry = queueData.queue?.find(e => e.assigned_to === myIp);
-            const activeSession = queueData.active_sessions?.[myIp];
-
-            // Also check if current simulator has an active driver (from discovered simulators)
-            const currentSim = discoveredSimulators.find(s => s.ip === myIp || s.is_current);
-            const hasActiveDriver = currentSim && currentSim.current_driver && currentSim.current_driver.trim() !== '';
-
-            if (activeSession || hasActiveDriver) {
-                // Session active - enable end button
-                startBtn.disabled = true;
-                endBtn.disabled = false;
-                const driverName = activeSession?.driver_name || currentSim?.current_driver || 'Unknown';
-                statusEl.textContent = `Session active: ${driverName}`;
-            } else if (assignedEntry) {
-                // Guest assigned but session not started
-                startBtn.disabled = false;
-                endBtn.disabled = true;
-                assignedQueueId = assignedEntry.id;
-                statusEl.textContent = `Ready to start: ${assignedEntry.name}`;
-            } else {
-                // No assignment, no session
-                startBtn.disabled = true;
-                endBtn.disabled = true;
-                assignedQueueId = null;
-                statusEl.textContent = 'Assign a guest to start';
-            }
-        }
-
-        async function assignToSimulator(queueId, simulatorIp) {
-            if (!simulatorIp) return;
-
-            const url = await getReceiverUrl();
-            if (!url) return;
-
-            // Find simulator name for SMS
-            const sim = discoveredSimulators.find(s => s.ip === simulatorIp);
-            const simulatorName = sim ? (sim.simulator_name || `Sim ${sim.simulator_id}`) : simulatorIp;
-
-            try {
-                const response = await fetch(url + '/api/queue/assign', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        queue_id: queueId,
-                        simulator_ip: simulatorIp,
-                        simulator_name: simulatorName
-                    })
-                });
-                const data = await response.json();
-                if (data.success) {
-                    if (data.sms_sent) {
-                        console.log('SMS notification sent to driver');
-                    }
-                    refreshQueue();
-                }
-            } catch (e) {
-                console.error('Error assigning to simulator:', e);
-            }
-        }
-
-        async function removeFromQueue(queueId) {
-            const url = await getReceiverUrl();
-            if (!url) return;
-
-            try {
-                await fetch(url + '/api/queue/remove', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ id: queueId })
-                });
-                refreshQueue();
-            } catch (e) {
-                console.error('Error removing from queue:', e);
-            }
-        }
-
-        async function startRemoteSession(queueId, driverName, simulatorIp) {
-            try {
-                const response = await fetch(`http://${simulatorIp}:5001/api/session/start_remote`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ driver_name: driverName, queue_id: queueId })
-                });
-                const data = await response.json();
-                if (data.success) {
-                    // Remove from queue after session starts
-                    await removeFromQueue(queueId);
-                    refreshQueue();
-                } else {
-                    alert('Failed to start session: ' + (data.error || 'Unknown error'));
-                }
-            } catch (e) {
-                console.error('Error starting remote session:', e);
-                alert('Failed to connect to simulator');
-            }
-        }
-
-        async function startSessionForAssigned() {
-            if (!assignedQueueId) return;
-
-            const entry = queueData.queue?.find(e => e.id === assignedQueueId);
-            if (!entry) return;
-
-            // Start session on current simulator
-            try {
-                const response = await fetch('/api/session/start_remote', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ driver_name: entry.name, queue_id: entry.id })
-                });
-                const data = await response.json();
-                if (data.success) {
-                    await removeFromQueue(entry.id);
-                    refreshQueue();
-                }
-            } catch (e) {
-                console.error('Error starting session:', e);
-            }
-        }
-
-        async function forceEndSession() {
-            try {
-                // End session on the current simulator (the one we're viewing)
-                // Since pages navigate to different sim IPs, this always targets the correct sim
-                const response = await fetch('/api/session/force_end', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' }
-                });
-                const data = await response.json();
-                if (data.success) {
-                    // Refresh simulator info to update UI
-                    await refreshSimulatorTabs();
-                    refreshQueue();
-                }
-            } catch (e) {
-                console.error('Error ending session:', e);
-                alert('Failed to end session: ' + e.message);
-            }
-        }
-
-        // End session on a specific simulator (by IP)
-        async function forceEndSessionOnSim(simulatorIp) {
-            try {
-                const response = await fetch(`http://${simulatorIp}:5001/api/session/force_end`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' }
-                });
-                const data = await response.json();
-                if (data.success) {
-                    await refreshSimulatorTabs();
-                    refreshQueue();
-                }
-                return data.success;
-            } catch (e) {
-                console.error('Error ending session on ' + simulatorIp + ':', e);
-                return false;
-            }
-        }
-
-        function escapeHtml(text) {
-            const div = document.createElement('div');
-            div.textContent = text || '';
-            return div.innerHTML;
-        }
-
-        // Start queue polling
-        refreshQueue();
-        setInterval(refreshQueue, 5000);
-
-        // Get manual simulators from localStorage
-        function getManualSimulators() {
-            try {
-                const stored = localStorage.getItem(STORAGE_KEY);
-                return stored ? JSON.parse(stored) : [];
-            } catch (e) {
-                console.error('Error reading manual simulators:', e);
-                return [];
-            }
-        }
-        
-        // Save manual simulators to localStorage
-        function saveManualSimulators(simulators) {
-            try {
-                localStorage.setItem(STORAGE_KEY, JSON.stringify(simulators));
-            } catch (e) {
-                console.error('Error saving manual simulators:', e);
-            }
-        }
-        
-        // Discover simulators on the network
         async function discoverSimulators() {
             try {
                 const response = await fetch('/api/discover_simulators');
@@ -1849,16 +1411,13 @@ ADMIN_HTML_CONTENT = r"""
                 return [];
             }
         }
-        
-        // Refresh simulator info for a specific IP (with short timeout for live updates)
+
         async function refreshSimulatorInfo(ip, port = 5001) {
             const controller = new AbortController();
             const timeoutId = setTimeout(() => controller.abort(), 1500);
-            
             try {
                 const response = await fetch(`http://${ip}:${port}/api/simulator_info`, {
-                    mode: 'cors',
-                    signal: controller.signal
+                    mode: 'cors', signal: controller.signal
                 });
                 clearTimeout(timeoutId);
                 if (response.ok) {
@@ -1868,20 +1427,15 @@ ADMIN_HTML_CONTENT = r"""
                     data.reachable = true;
                     return data;
                 }
-            } catch (e) {
-                clearTimeout(timeoutId);
-            }
+            } catch (e) { clearTimeout(timeoutId); }
             return null;
         }
-        
-        // Fast refresh of tab data without full network discovery
-        async function refreshTabsLive() {
+
+        async function refreshSimulators() {
             if (discoveredSimulators.length === 0) return;
-            
-            // Fetch fresh data from all known simulators in parallel
+
             const refreshPromises = discoveredSimulators.map(async (sim) => {
                 if (sim.is_current) {
-                    // For current sim, fetch fresh local data
                     try {
                         const response = await fetch('/api/simulator_info');
                         if (response.ok) {
@@ -1891,36 +1445,28 @@ ADMIN_HTML_CONTENT = r"""
                     } catch (e) {}
                     return sim;
                 } else {
-                    // For remote sims, fetch their info
                     const freshData = await refreshSimulatorInfo(sim.ip, sim.port || 5001);
                     if (freshData) {
                         return { ...sim, ...freshData, reachable: true };
-                    } else {
-                        return { ...sim, reachable: false };
                     }
+                    return { ...sim, reachable: false };
                 }
             });
-            
-            const updatedSimulators = await Promise.all(refreshPromises);
-            discoveredSimulators = updatedSimulators;
-            renderTabs(updatedSimulators);
+
+            discoveredSimulators = await Promise.all(refreshPromises);
+            renderSimulatorCards();
+            updateStats();
         }
-        
-        // Render the simulator tabs
-        function renderTabs(simulators) {
-            const container = document.getElementById('tabsContainer');
-            const tabsBar = document.getElementById('simulatorTabs');
-            
-            if (!container) return;
-            
-            // Merge discovered with manual simulators
+
+        function renderSimulatorCards() {
+            const grid = document.getElementById('simsGrid');
+            if (!grid) return;
+
             const manualSims = getManualSimulators();
-            const allSimulators = [...simulators];
-            
-            // Add manual simulators that aren't already in the list
+            const allSimulators = [...discoveredSimulators];
+
             manualSims.forEach(manual => {
-                const exists = allSimulators.some(s => s.ip === manual.ip);
-                if (!exists) {
+                if (!allSimulators.some(s => s.ip === manual.ip)) {
                     allSimulators.push({
                         simulator_id: manual.simulator_id || 99,
                         simulator_name: manual.name || `Sim (${manual.ip})`,
@@ -1931,809 +1477,592 @@ ADMIN_HTML_CONTENT = r"""
                     });
                 }
             });
-            
-            // Sort by simulator_id
+
             allSimulators.sort((a, b) => (a.simulator_id || 0) - (b.simulator_id || 0));
-            
-            // Always show tabs bar for staff portal functionality
-            // This allows staff to add other simulators via the "+" button
-            tabsBar.style.display = 'flex';
-            document.body.classList.add('has-tabs');
-            
-            // Clear and rebuild tabs
-            container.innerHTML = '';
-            
-            allSimulators.forEach(sim => {
-                const tab = document.createElement('div');
-                tab.className = 'sim-tab';
-                
-                // Determine tab state
-                const isCurrent = sim.ip === currentSimulatorIp || sim.is_current;
-                const hasDriver = sim.current_driver && sim.current_driver.trim() !== '';
-                const isReachable = sim.reachable !== false; // Default to true if not set
-                
-                // Check for time expired state
-                const timerExpired = sim.timer_active && sim.timer_seconds_left === 0;
-                const lapsExpired = sim.laps_active && sim.laps_progress && 
-                                    sim.laps_progress.count >= sim.laps_progress.target && 
-                                    sim.laps_progress.target > 0;
-                const sessionExpired = timerExpired || lapsExpired;
-                
-                if (sessionExpired && hasDriver) {
-                    tab.classList.add('time-expired');
-                } else if (!isReachable && !isCurrent) {
-                    tab.classList.add('unreachable');
-                } else if (isCurrent) {
-                    tab.classList.add('current');
-                } else if (hasDriver) {
-                    tab.classList.add('has-driver');
-                } else {
-                    tab.classList.add('no-driver');
+
+            if (allSimulators.length === 0) {
+                grid.innerHTML = '<div style="color: #6e6e6e; text-align: center; padding: 20px;">No simulators found</div>';
+                return;
+            }
+
+            grid.innerHTML = allSimulators.map(sim => {
+                const hasDriver = sim.current_driver && sim.current_driver.trim();
+                const isReachable = sim.reachable !== false;
+
+                // Determine card state
+                let cardClass = 'available';
+                if (!isReachable) cardClass = 'offline';
+                else if (hasDriver) {
+                    cardClass = 'occupied';
+                    // Check for expiring/expired
+                    if (sim.timer_active && sim.timer_seconds_left !== undefined) {
+                        if (sim.timer_seconds_left === 0) cardClass = 'expired';
+                        else if (sim.timer_seconds_left <= 120) cardClass = 'expiring';
+                    }
+                    if (sim.laps_active && sim.laps_progress) {
+                        if (sim.laps_progress.count >= sim.laps_progress.target && sim.laps_progress.target > 0) {
+                            cardClass = 'expired';
+                        }
+                    }
                 }
-                
-                // Status dot (green for online, red for offline)
-                const statusDot = isCurrent ? 'online' : (isReachable ? 'online' : 'offline');
-                const statusText = !isReachable && !isCurrent ? 'Offline' : (hasDriver ? sim.current_driver : 'No driver');
-                
-                // Session info (timer or laps)
-                let sessionInfo = '';
-                if (sim.timer_active && sim.timer_seconds_left !== undefined) {
+
+                // Format timer display
+                let timerDisplay = '';
+                if (hasDriver && sim.timer_active && sim.timer_seconds_left !== undefined) {
                     const mins = Math.floor(sim.timer_seconds_left / 60);
                     const secs = sim.timer_seconds_left % 60;
-                    sessionInfo = `${mins}:${secs.toString().padStart(2, '0')}`;
-                    if (sim.timer_seconds_left === 0) sessionInfo = '0:00';
-                } else if (sim.laps_active && sim.laps_progress) {
-                    sessionInfo = `${sim.laps_progress.count}/${sim.laps_progress.target} laps`;
+                    timerDisplay = `${mins}:${secs.toString().padStart(2, '0')}`;
                 }
-                
-                // Tab content
-                tab.innerHTML = `
-                    <div><span class="status-dot ${statusDot}"></span>${sim.simulator_name}</div>
-                    <span class="driver-name">${statusText}</span>
-                    ${sessionInfo ? `<span class="session-info">${sessionInfo}</span>` : ''}
+
+                // Laps display
+                let lapsDisplay = '';
+                if (hasDriver && sim.laps_active && sim.laps_progress) {
+                    lapsDisplay = `${sim.laps_progress.count}/${sim.laps_progress.target} laps`;
+                }
+
+                // Check if queue has someone waiting
+                const hasQueueWaiting = queueData.queue && queueData.queue.length > 0 && !queueData.queue[0].assigned_to;
+
+                return `
+                    <div class="sim-card ${cardClass}" onclick="onSimCardClick('${sim.ip}', ${sim.port || 5001}, ${hasDriver}, ${isReachable})">
+                        <div class="sim-card-header">
+                            <span class="sim-card-name">${escapeHtml(sim.simulator_name)}</span>
+                            <span class="sim-card-status ${isReachable ? '' : 'offline'}"></span>
+                        </div>
+                        <div class="sim-card-driver ${hasDriver ? '' : 'available-text'}">
+                            ${hasDriver ? escapeHtml(sim.current_driver) : 'AVAILABLE'}
+                        </div>
+                        ${timerDisplay ? `<div class="sim-card-timer">${timerDisplay}</div>` : ''}
+                        ${lapsDisplay ? `<div class="sim-card-laps">${lapsDisplay}</div>` : ''}
+                        ${isReachable ? (
+                            hasDriver
+                                ? `<button class="sim-card-action end-session" onclick="event.stopPropagation(); endSessionOnSim('${sim.ip}')">END</button>`
+                                : `<button class="sim-card-action seat-next" onclick="event.stopPropagation(); seatNextGuest('${sim.ip}')" ${hasQueueWaiting ? '' : 'disabled'}>SEAT NEXT</button>`
+                        ) : '<button class="sim-card-action" disabled style="background:#3e3e42;color:#6e6e6e;">OFFLINE</button>'}
+                    </div>
                 `;
-                
-                // Setup long-press for context menu (only for non-current simulators)
-                if (!isCurrent) {
-                    setupLongPress(tab, sim);
-                }
-                
-                // Click to navigate to that simulator
-                if (!isCurrent) {
-                    if (isReachable) {
-                        tab.onclick = (e) => {
-                            // Don't navigate if this was a long-press
-                            if (e.defaultPrevented) return;
-                            navigateToSimulator(sim.ip, sim.port || 5001);
-                        };
-                    } else {
-                        tab.onclick = (e) => {
-                            if (e.defaultPrevented) return;
-                            alert(`Cannot connect to ${sim.simulator_name} (${sim.ip})\\n\\nMake sure:\\n• The simulator PC is running Lap Time Sender\\n• Both devices are on the same network\\n• Windows Firewall allows port 5001`);
-                        };
-                    }
-                }
-                
-                container.appendChild(tab);
-            });
+            }).join('');
         }
-        
-        // Navigate to a different simulator
-        function navigateToSimulator(ip, port = 5001) {
-            window.location.href = `http://${ip}:${port}`;
-        }
-        
-        // Open settings modal
-        function openSettingsModal() {
-            const modal = document.getElementById('settingsModal');
-            modal.classList.add('active');
-            renderManualSimulatorList();
-        }
-        
-        // Close settings modal
-        function closeSettingsModal() {
-            const modal = document.getElementById('settingsModal');
-            modal.classList.remove('active');
-        }
-        
-        // Context menu state
-        let contextMenuSimulator = null;
-        let longPressTimer = null;
-        const LONG_PRESS_DURATION = 500; // ms
-        
-        // Open context menu for a simulator
-        function openContextMenu(sim) {
-            contextMenuSimulator = sim;
-            document.getElementById('contextMenuHeader').textContent = sim.simulator_name || sim.name || 'Simulator';
 
-            // Show/hide End Session option based on whether sim has an active driver
-            const endSessionItem = document.getElementById('contextEndSession');
-            const hasDriver = sim.current_driver && sim.current_driver.trim() !== '';
-            if (endSessionItem) {
-                endSessionItem.style.display = hasDriver ? 'flex' : 'none';
+        function onSimCardClick(ip, port, hasDriver, isReachable) {
+            if (!isReachable) {
+                alert(`Cannot connect to simulator at ${ip}`);
+                return;
             }
-
-            document.getElementById('contextMenuOverlay').classList.add('active');
+            // Long press could open edit menu - for now just navigate
+            if (ip !== currentSimulatorIp) {
+                window.location.href = `http://${ip}:${port}/admin`;
+            }
         }
 
-        // Close context menu
-        function closeContextMenu() {
-            document.getElementById('contextMenuOverlay').classList.remove('active');
-            contextMenuSimulator = null;
-        }
-
-        // End session on the simulator from context menu
-        async function endSessionOnContextSim() {
-            if (!contextMenuSimulator || !contextMenuSimulator.ip) {
-                closeContextMenu();
+        async function seatNextGuest(simIp) {
+            const queue = queueData.queue || [];
+            const nextGuest = queue.find(g => !g.assigned_to);
+            if (!nextGuest) {
+                alert('No guests waiting in queue');
                 return;
             }
 
-            const simName = contextMenuSimulator.simulator_name || contextMenuSimulator.name || 'this simulator';
-            const driverName = contextMenuSimulator.current_driver || 'the driver';
+            const sim = discoveredSimulators.find(s => s.ip === simIp);
+            const simName = sim ? sim.simulator_name : `Sim at ${simIp}`;
 
-            if (!confirm(`End session for ${driverName} on ${simName}?`)) {
-                closeContextMenu();
-                return;
-            }
-
-            const success = await forceEndSessionOnSim(contextMenuSimulator.ip);
-            if (success) {
-                console.log('Session ended on ' + contextMenuSimulator.ip);
-            } else {
-                alert('Failed to end session on ' + simName);
-            }
-            closeContextMenu();
-        }
-        
-        // Edit simulator
-        function editSimulator() {
-            if (!contextMenuSimulator) return;
-            closeContextMenu();
-            
-            document.getElementById('editSimIp').value = contextMenuSimulator.ip || '';
-            document.getElementById('editSimName').value = contextMenuSimulator.simulator_name || contextMenuSimulator.name || '';
-            document.getElementById('editSimModal').classList.add('active');
-        }
-        
-        // Close edit modal
-        function closeEditModal() {
-            document.getElementById('editSimModal').classList.remove('active');
-        }
-        
-        // Save simulator edit
-        async function saveSimulatorEdit() {
-            const oldIp = contextMenuSimulator?.ip;
-            const newIp = document.getElementById('editSimIp').value.trim();
-            const newName = document.getElementById('editSimName').value.trim();
-            
-            if (!newIp) {
-                alert('Please enter an IP address');
-                return;
-            }
-            
-            // Basic IP validation
-            if (!/^\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}$/.test(newIp)) {
-                alert('Please enter a valid IP address');
-                return;
-            }
-            
-            // Update in localStorage
-            const manualSims = getManualSimulators();
-            const existingIndex = manualSims.findIndex(s => s.ip === oldIp);
-            
-            if (existingIndex >= 0) {
-                // Update existing
-                manualSims[existingIndex] = { ip: newIp, name: newName || `Sim (${newIp})`, port: 5001 };
-            } else {
-                // Add as new manual simulator
-                manualSims.push({ ip: newIp, name: newName || `Sim (${newIp})`, port: 5001 });
-            }
-            
-            // If IP changed, remove old from server
-            if (oldIp && oldIp !== newIp) {
-                try {
-                    await fetch(`/api/known_simulators/${oldIp}`, { method: 'DELETE' });
-                } catch (e) { console.log('Could not remove old IP from server'); }
-            }
-            
-            // Save new/updated to server
             try {
-                await fetch('/api/known_simulators', {
+                // Step 1: Assign guest to simulator
+                const assignResponse = await fetch('/api/queue/assign', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ ip: newIp, name: newName })
+                    body: JSON.stringify({
+                        queue_id: nextGuest.id,
+                        simulator_ip: simIp,
+                        simulator_name: simName
+                    })
                 });
-            } catch (e) { console.log('Could not save to server'); }
-            
-            saveManualSimulators(manualSims);
-            closeEditModal();
-            initializeSimulatorTabs();
+                const assignData = await assignResponse.json();
+
+                if (!assignData.success) {
+                    alert('Failed to assign guest: ' + (assignData.error || 'Unknown error'));
+                    return;
+                }
+
+                // Step 2: Start session on that simulator
+                const startResponse = await fetch(`http://${simIp}:5001/api/session/start_remote`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ driver_name: nextGuest.name, queue_id: nextGuest.id })
+                });
+                const startData = await startResponse.json();
+
+                if (startData.success) {
+                    // Remove from queue after successful start
+                    await fetch('/api/queue/remove', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ id: nextGuest.id })
+                    });
+                    refreshQueue();
+                    refreshSimulators();
+                } else {
+                    alert('Session start failed: ' + (startData.error || 'Unknown error'));
+                }
+            } catch (e) {
+                console.error('Error seating guest:', e);
+                alert('Failed to connect to simulator');
+            }
         }
-        
-        // Delete simulator
-        async function deleteSimulator() {
-            if (!contextMenuSimulator) return;
-            
-            const ip = contextMenuSimulator.ip;
-            const name = contextMenuSimulator.simulator_name || contextMenuSimulator.name || 'this simulator';
-            
-            if (!confirm(`Delete ${name} (${ip})?`)) {
-                closeContextMenu();
+
+        async function endSessionOnSim(simIp) {
+            try {
+                const response = await fetch(`http://${simIp}:5001/api/session/force_end`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' }
+                });
+                const data = await response.json();
+                if (data.success) {
+                    refreshSimulators();
+                    refreshQueue();
+                }
+            } catch (e) {
+                console.error('Error ending session:', e);
+                alert('Failed to end session');
+            }
+        }
+
+        // ============================================
+        // QUEUE MANAGEMENT
+        // ============================================
+
+        async function refreshQueue() {
+            try {
+                const response = await fetch('/api/queue');
+                const data = await response.json();
+                if (data.success) {
+                    queueData = data;
+                    renderQueue(data.queue);
+                    updateStats();
+                }
+            } catch (e) {
+                console.error('Error fetching queue:', e);
+            }
+        }
+
+        function renderQueue(queue) {
+            const list = document.getElementById('queueList');
+            if (!queue || queue.length === 0) {
+                list.innerHTML = '<div class="queue-empty">Queue is empty - guests can join at /queue</div>';
                 return;
             }
-            
-            // Remove from localStorage
-            const manualSims = getManualSimulators();
-            const filtered = manualSims.filter(s => s.ip !== ip);
-            saveManualSimulators(filtered);
-            
-            // Remove from server
-            try {
-                await fetch(`/api/known_simulators/${ip}`, { method: 'DELETE' });
-            } catch (e) { console.log('Could not remove from server'); }
-            
-            closeContextMenu();
-            initializeSimulatorTabs();
+
+            list.innerHTML = queue.map(entry => {
+                const notifiedBadge = entry.notified ? '<span class="notified-badge" title="SMS sent">&#128276;</span>' : '';
+                return `
+                    <div class="queue-item" data-id="${entry.id}">
+                        <div class="position">#${entry.position}</div>
+                        <div class="guest-info">
+                            <div class="guest-name">${escapeHtml(entry.name)} ${notifiedBadge}</div>
+                            <div class="guest-wait">${entry.wait_display || 'Just joined'}</div>
+                        </div>
+                        <button class="remove-btn" onclick="removeFromQueue('${entry.id}')">&times;</button>
+                    </div>
+                `;
+            }).join('');
         }
-        
-        // Setup long-press handler on a tab element
-        function setupLongPress(tab, sim) {
-            let pressTimer = null;
-            let didLongPress = false;
-            let touchStartPos = null;
-            
-            const startPress = (e) => {
-                didLongPress = false;
-                // Store initial touch position
-                if (e.touches && e.touches[0]) {
-                    touchStartPos = { x: e.touches[0].clientX, y: e.touches[0].clientY };
-                }
-                pressTimer = setTimeout(() => {
-                    didLongPress = true;
-                    openContextMenu(sim);
-                    // Vibrate on mobile if supported
-                    if (navigator.vibrate) navigator.vibrate(50);
-                }, LONG_PRESS_DURATION);
-            };
-            
-            const endPress = (e) => {
-                clearTimeout(pressTimer);
-                if (didLongPress) {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    e.stopImmediatePropagation();
-                }
-            };
-            
-            const movePress = (e) => {
-                // Cancel if moved more than 10px (user is scrolling)
-                if (touchStartPos && e.touches && e.touches[0]) {
-                    const dx = Math.abs(e.touches[0].clientX - touchStartPos.x);
-                    const dy = Math.abs(e.touches[0].clientY - touchStartPos.y);
-                    if (dx > 10 || dy > 10) {
-                        clearTimeout(pressTimer);
+
+        async function removeFromQueue(queueId) {
+            try {
+                await fetch('/api/queue/remove', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ id: queueId })
+                });
+                refreshQueue();
+            } catch (e) {
+                console.error('Error removing from queue:', e);
+            }
+        }
+
+        function updateStats() {
+            // Update waiting count
+            const waitingCount = queueData.total_in_queue || 0;
+            document.getElementById('waitingCount').textContent = waitingCount;
+
+            // Update available count
+            const availableCount = discoveredSimulators.filter(s =>
+                s.reachable !== false && (!s.current_driver || !s.current_driver.trim())
+            ).length;
+            document.getElementById('availableCount').textContent = availableCount;
+
+            // Update average wait time
+            fetch('/api/queue/stats')
+                .then(r => r.json())
+                .then(stats => {
+                    if (stats.avg_session_time_display) {
+                        document.getElementById('avgWaitTime').textContent = stats.avg_session_time_display;
                     }
+                })
+                .catch(() => {});
+        }
+
+        // ============================================
+        // MODAL FUNCTIONS
+        // ============================================
+
+        function openRegisterModal() {
+            document.getElementById('registerModal').classList.add('active');
+            document.getElementById('driverName').focus();
+            loadSettings(); // Check if email is required
+        }
+
+        function closeRegisterModal() {
+            document.getElementById('registerModal').classList.remove('active');
+        }
+
+        function openManualLapModal() {
+            document.getElementById('manualLapModal').classList.add('active');
+            document.getElementById('manualDriverName').focus();
+        }
+
+        function closeManualLapModal() {
+            document.getElementById('manualLapModal').classList.remove('active');
+        }
+
+        function openSettingsModal() {
+            document.getElementById('settingsModal').classList.add('active');
+            renderManualSimulatorList();
+        }
+
+        function closeSettingsModal() {
+            document.getElementById('settingsModal').classList.remove('active');
+        }
+
+        function openEditModal(sim) {
+            editingSimulator = sim;
+            document.getElementById('editSimIp').value = sim.ip || '';
+            document.getElementById('editSimName').value = sim.simulator_name || sim.name || '';
+            document.getElementById('editSimModal').classList.add('active');
+        }
+
+        function closeEditModal() {
+            document.getElementById('editSimModal').classList.remove('active');
+            editingSimulator = null;
+        }
+
+        // ============================================
+        // DRIVER REGISTRATION
+        // ============================================
+
+        function updateDriver() {
+            const driverName = document.getElementById('driverName').value.trim();
+            const statusEl = document.getElementById('registerStatus');
+
+            if (!driverName) {
+                statusEl.textContent = 'Please enter a driver name';
+                statusEl.className = 'status error';
+                return;
+            }
+
+            let payload = { driver_name: driverName };
+
+            // Check if email required
+            const emailGroup = document.getElementById('emailGroup');
+            if (emailGroup.style.display !== 'none') {
+                const driverEmail = document.getElementById('driverEmail').value.trim();
+                if (!driverEmail) {
+                    statusEl.textContent = 'Email address is required';
+                    statusEl.className = 'status error';
+                    return;
                 }
-            };
-            
-            const cancelPress = () => {
-                clearTimeout(pressTimer);
-            };
-            
-            // Touch events for mobile - use passive: false to allow preventDefault
-            tab.addEventListener('touchstart', startPress, { passive: false });
-            tab.addEventListener('touchend', endPress, { passive: false });
-            tab.addEventListener('touchmove', movePress, { passive: true });
-            tab.addEventListener('touchcancel', cancelPress);
-            
-            // Mouse events for desktop (right-click)
-            tab.addEventListener('contextmenu', (e) => {
-                e.preventDefault();
-                openContextMenu(sim);
+                payload.driver_email = driverEmail;
+            }
+
+            fetch('/set_driver', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (data.success) {
+                    statusEl.textContent = 'Driver registered successfully!';
+                    statusEl.className = 'status success';
+                    document.getElementById('driverName').value = '';
+                    if (emailGroup.style.display !== 'none') {
+                        document.getElementById('driverEmail').value = '';
+                    }
+                    setTimeout(() => {
+                        closeRegisterModal();
+                        statusEl.className = 'status';
+                        refreshSimulators();
+                    }, 1500);
+                } else {
+                    statusEl.textContent = 'Failed to register driver';
+                    statusEl.className = 'status error';
+                }
+            })
+            .catch(e => {
+                statusEl.textContent = 'Error connecting to server';
+                statusEl.className = 'status error';
             });
         }
-        
-        // Render manual simulator list in modal
+
+        // ============================================
+        // MANUAL LAP ENTRY
+        // ============================================
+
+        function parseLapTime(input) {
+            input = input.trim();
+            if (input.includes(':')) {
+                const parts = input.split(':');
+                if (parts.length !== 2) return null;
+                const minutes = parseInt(parts[0]);
+                const seconds = parseFloat(parts[1]);
+                if (isNaN(minutes) || isNaN(seconds)) return null;
+                return minutes * 60 + seconds;
+            } else {
+                const seconds = parseFloat(input);
+                return isNaN(seconds) ? null : seconds;
+            }
+        }
+
+        function submitManualLapTime() {
+            const driverName = document.getElementById('manualDriverName').value.trim();
+            const lapTimeInput = document.getElementById('manualLapTime').value.trim();
+            const statusEl = document.getElementById('manualStatus');
+
+            if (!driverName) {
+                statusEl.textContent = 'Please enter a driver name';
+                statusEl.className = 'status error';
+                return;
+            }
+
+            if (!lapTimeInput) {
+                statusEl.textContent = 'Please enter a lap time';
+                statusEl.className = 'status error';
+                return;
+            }
+
+            const lapTimeSeconds = parseLapTime(lapTimeInput);
+            if (lapTimeSeconds === null || lapTimeSeconds < 5 || lapTimeSeconds > 3600) {
+                statusEl.textContent = 'Invalid lap time format';
+                statusEl.className = 'status error';
+                return;
+            }
+
+            fetch('/api/manual_lap', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ driver_name: driverName, lap_time: lapTimeSeconds })
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (data.success) {
+                    statusEl.textContent = `Lap time ${data.formatted_time} sent!`;
+                    statusEl.className = 'status success';
+                    document.getElementById('manualLapTime').value = '';
+                    setTimeout(() => {
+                        closeManualLapModal();
+                        statusEl.className = 'status';
+                    }, 1500);
+                } else {
+                    statusEl.textContent = data.message || 'Failed to send lap time';
+                    statusEl.className = 'status error';
+                }
+            })
+            .catch(e => {
+                statusEl.textContent = 'Error connecting to server';
+                statusEl.className = 'status error';
+            });
+        }
+
+        // ============================================
+        // SIMULATOR SETTINGS
+        // ============================================
+
+        function getManualSimulators() {
+            try {
+                const stored = localStorage.getItem(STORAGE_KEY);
+                return stored ? JSON.parse(stored) : [];
+            } catch (e) { return []; }
+        }
+
+        function saveManualSimulators(simulators) {
+            try {
+                localStorage.setItem(STORAGE_KEY, JSON.stringify(simulators));
+            } catch (e) {}
+        }
+
         function renderManualSimulatorList() {
             const list = document.getElementById('manualSimList');
             const manualSims = getManualSimulators();
-            
+
             if (manualSims.length === 0) {
-                list.innerHTML = '<p style="color: #9d9d9d; text-align: center; font-size: 13px;">No manual simulators added</p>';
+                list.innerHTML = '<p style="color: #6e6e6e; text-align: center; font-size: 13px;">No manual simulators added</p>';
                 return;
             }
-            
-            list.innerHTML = manualSims.map((sim, index) => `
-                <div class="manual-sim-item">
-                    <div>
-                        <strong>${sim.name}</strong>
-                        <div style="font-size: 12px; color: #9d9d9d;">${sim.ip}:${sim.port || 5001}</div>
+
+            list.innerHTML = manualSims.map((sim, idx) => `
+                <div class="sim-config-item">
+                    <div class="info">
+                        <strong>${escapeHtml(sim.name)}</strong>
+                        <small>${sim.ip}:${sim.port || 5001}</small>
                     </div>
-                    <button class="remove-btn" onclick="removeManualSimulator(${index})">Remove</button>
+                    <button class="remove-btn" onclick="removeManualSimulator(${idx})">Remove</button>
                 </div>
             `).join('');
         }
-        
-        // Add manual simulator
+
         async function addManualSimulator() {
-            const ipInput = document.getElementById('manualSimIp');
-            const nameInput = document.getElementById('manualSimName');
-            
-            const ip = ipInput.value.trim();
-            const name = nameInput.value.trim() || `Sim (${ip})`;
-            
-            if (!ip) {
-                alert('Please enter an IP address');
+            const ip = document.getElementById('manualSimIp').value.trim();
+            const name = document.getElementById('manualSimName').value.trim() || `Sim (${ip})`;
+
+            if (!ip || !/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(ip)) {
+                alert('Please enter a valid IP address');
                 return;
             }
-            
-            // Basic IP validation
-            if (!/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(ip)) {
-                alert('Please enter a valid IP address (e.g., 192.168.1.10)');
-                return;
-            }
-            
+
             const manualSims = getManualSimulators();
-            
-            // Check if already exists
             if (manualSims.some(s => s.ip === ip)) {
-                alert('This simulator IP is already added');
+                alert('This simulator is already added');
                 return;
             }
-            
-            // Save to localStorage (for browser persistence)
+
             manualSims.push({ ip, name, port: 5001 });
             saveManualSimulators(manualSims);
-            
-            // Also save to server config (so it persists across all devices)
+
             try {
                 await fetch('/api/known_simulators', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ ip, name })
                 });
-            } catch (e) {
-                console.log('Could not save to server config:', e);
-            }
-            
-            // Clear inputs
-            ipInput.value = '';
-            nameInput.value = '';
-            
-            // Refresh UI
+            } catch (e) {}
+
+            document.getElementById('manualSimIp').value = '';
+            document.getElementById('manualSimName').value = '';
             renderManualSimulatorList();
-            initializeSimulatorTabs();
+            initializeSimulators();
         }
-        
-        // Remove manual simulator
+
         async function removeManualSimulator(index) {
             const manualSims = getManualSimulators();
             const removed = manualSims[index];
             manualSims.splice(index, 1);
             saveManualSimulators(manualSims);
-            
-            // Also remove from server config
+
             if (removed && removed.ip) {
                 try {
-                    await fetch(`/api/known_simulators/${removed.ip}`, {
-                        method: 'DELETE'
-                    });
-                } catch (e) {
-                    console.log('Could not remove from server config:', e);
-                }
+                    await fetch(`/api/known_simulators/${removed.ip}`, { method: 'DELETE' });
+                } catch (e) {}
             }
-            
+
             renderManualSimulatorList();
-            initializeSimulatorTabs();
+            initializeSimulators();
         }
-        
-        // Initialize simulator tabs on page load
-        async function initializeSimulatorTabs() {
+
+        async function saveSimulatorEdit() {
+            const oldIp = editingSimulator?.ip;
+            const newIp = document.getElementById('editSimIp').value.trim();
+            const newName = document.getElementById('editSimName').value.trim();
+
+            if (!newIp || !/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(newIp)) {
+                alert('Please enter a valid IP address');
+                return;
+            }
+
+            const manualSims = getManualSimulators();
+            const existingIndex = manualSims.findIndex(s => s.ip === oldIp);
+
+            if (existingIndex >= 0) {
+                manualSims[existingIndex] = { ip: newIp, name: newName || `Sim (${newIp})`, port: 5001 };
+            } else {
+                manualSims.push({ ip: newIp, name: newName || `Sim (${newIp})`, port: 5001 });
+            }
+
+            if (oldIp && oldIp !== newIp) {
+                try { await fetch(`/api/known_simulators/${oldIp}`, { method: 'DELETE' }); } catch (e) {}
+            }
+
+            try {
+                await fetch('/api/known_simulators', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ ip: newIp, name: newName })
+                });
+            } catch (e) {}
+
+            saveManualSimulators(manualSims);
+            closeEditModal();
+            initializeSimulators();
+        }
+
+        // ============================================
+        // UTILITIES
+        // ============================================
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text || '';
+            return div.innerHTML;
+        }
+
+        function loadSettings() {
+            fetch('/get_settings')
+                .then(r => r.json())
+                .then(data => {
+                    const emailGroup = document.getElementById('emailGroup');
+                    if (emailGroup) {
+                        emailGroup.style.display = data.require_email ? 'block' : 'none';
+                    }
+                })
+                .catch(() => {});
+        }
+
+        // ============================================
+        // INITIALIZATION
+        // ============================================
+
+        async function initializeSimulators() {
             const statusEl = document.getElementById('discoveryStatus');
             if (statusEl) statusEl.textContent = 'Searching for simulators...';
-            
+
             const simulators = await discoverSimulators();
-            
+
             if (statusEl) {
                 const total = simulators.length;
                 const online = simulators.filter(s => s.reachable !== false).length;
-                const offline = total - online;
-                
                 if (total <= 1) {
-                    statusEl.textContent = 'Only this simulator found. Add others manually below.';
-                } else if (offline > 0) {
-                    statusEl.textContent = `Found ${total} simulators (${online} online, ${offline} offline)`;
+                    statusEl.textContent = 'Only this simulator found. Add others below.';
                 } else {
-                    statusEl.textContent = `Found ${total} simulators on network`;
+                    statusEl.textContent = `Found ${total} simulators (${online} online)`;
                 }
             }
-            
-            renderTabs(simulators);
+
+            renderSimulatorCards();
+            updateStats();
         }
-        
-        // Periodically refresh tabs with live data
-        function startTabRefresh() {
-            // Fast live refresh every 2 seconds for timer/driver updates
-            setInterval(async () => {
-                await refreshTabsLive();
-            }, 2000);
-            
-            // Full discovery every 30 seconds to find new/removed simulators
-            setInterval(async () => {
-                await initializeSimulatorTabs();
-            }, 30000);
-        }
-        
-        // Initialize on page load
+
+        // Start polling
         document.addEventListener('DOMContentLoaded', () => {
-            initializeSimulatorTabs();
-            startTabRefresh();
+            initializeSimulators();
+            refreshQueue();
+
+            // Refresh simulators every 2 seconds
+            setInterval(refreshSimulators, 2000);
+
+            // Refresh queue every 5 seconds
+            setInterval(refreshQueue, 5000);
+
+            // Full discovery every 30 seconds
+            setInterval(initializeSimulators, 30000);
         });
-        
-        // ============================================
-        // END MULTI-SIMULATOR TABS FUNCTIONALITY
-        // ============================================
-        
-        function showStatus(message, isError) {
-            const status = document.getElementById('status');
-            status.textContent = message;
-            status.style.display = 'block';
-            status.className = 'status ' + (isError ? 'error' : 'success');
-            setTimeout(() => {
-                status.style.display = 'none';
-            }, 3000);
-        }
 
-        function updateDriver() {
-            const driverName = document.getElementById('driverName').value;
-            if (!driverName) {
-                showStatus('Please enter a driver name', true);
-                return;
-            }
-            
-            let payload = { driver_name: driverName };
-            
-            // Add email if required
-            const emailGroup = document.getElementById('emailGroup');
-            if (emailGroup.style.display !== 'none') {
-                const driverEmail = document.getElementById('driverEmail').value;
-                if (!driverEmail) {
-                    showStatus('⚠️ Email address is required!', true);
-                    // Highlight the email field
-                    document.getElementById('driverEmail').style.border = '2px solid red';
-                    document.getElementById('driverEmail').focus();
-                    return;
+        // Close modals on overlay click
+        document.querySelectorAll('.modal-overlay').forEach(overlay => {
+            overlay.addEventListener('click', (e) => {
+                if (e.target === overlay) {
+                    overlay.classList.remove('active');
                 }
-                if (!validateEmail(driverEmail)) {
-                    showStatus('⚠️ Please enter a valid email address (e.g., name@example.com)', true);
-                    // Highlight the email field
-                    document.getElementById('driverEmail').style.border = '2px solid red';
-                    document.getElementById('driverEmail').focus();
-                    return;
-                }
-                
-                // Clear any previous highlighting
-                document.getElementById('driverEmail').style.border = '1px solid #ddd';
-                
-                payload.driver_email = driverEmail;
-            }
-
-            fetch('/set_driver', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                },
-                body: JSON.stringify(payload)
-            })
-            .then(response => response.json())
-            .then(data => {
-                if (data.success) {
-                    // Update current driver display
-                    document.getElementById('currentDriverName').textContent = data.driver_name;
-                    document.getElementById('currentDriverBox').style.display = 'flex';
-                    
-                    // Clear form fields
-                    document.getElementById('driverName').value = '';
-                    if (emailGroup.style.display !== 'none') {
-                        document.getElementById('driverEmail').value = '';
-                    }
-                    
-                    showStatus('Driver information updated successfully!', false);
-                } else {
-                    showStatus('Failed to update driver information', true);
-                }
-            })
-            .catch(error => {
-                showStatus('Error connecting to server', true);
-                console.error('Error:', error);
             });
-        }
-        
-        function validateEmail(email) {
-            const re = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-            return re.test(email);
-        }
-        
-        function parseLapTime(input) {
-            // Parse lap time in various formats
-            // Supports: "1:23.456" (mm:ss.xxx) or "83.456" (total seconds)
-            input = input.trim();
-            
-            // Check if it's in mm:ss.xxx format
-            if (input.includes(':')) {
-                const parts = input.split(':');
-                if (parts.length !== 2) {
-                    return null;
-                }
-                const minutes = parseInt(parts[0]);
-                const seconds = parseFloat(parts[1]);
-                if (isNaN(minutes) || isNaN(seconds)) {
-                    return null;
-                }
-                return minutes * 60 + seconds;
-            } else {
-                // Assume it's already in seconds
-                const seconds = parseFloat(input);
-                if (isNaN(seconds)) {
-                    return null;
-                }
-                return seconds;
-            }
-        }
-        
-        function showManualStatus(message, isError) {
-            const status = document.getElementById('manualStatus');
-            status.textContent = message;
-            status.style.display = 'block';
-            status.className = 'status ' + (isError ? 'error' : 'success');
-            setTimeout(() => {
-                status.style.display = 'none';
-            }, 5000);
-        }
-        
-        function openManualLapModal() {
-            const modal = document.getElementById('manualLapModal');
-            modal.classList.add('active');
-            // Focus on driver name field
-            document.getElementById('manualDriverName').focus();
-        }
-        
-        function closeManualLapModal() {
-            const modal = document.getElementById('manualLapModal');
-            modal.classList.remove('active');
-        }
-        
-        // Close modal when clicking outside of content
-        document.addEventListener('click', function(event) {
-            const modal = document.getElementById('manualLapModal');
-            if (event.target === modal) {
-                closeManualLapModal();
-            }
         });
-        
-        function submitManualLapTime() {
-            const driverName = document.getElementById('manualDriverName').value.trim();
-            const lapTimeInput = document.getElementById('manualLapTime').value.trim();
-            
-            // Validation
-            if (!driverName) {
-                showManualStatus('⚠️ Please enter a driver name', true);
-                return;
-            }
-            
-            if (!lapTimeInput) {
-                showManualStatus('⚠️ Please enter a lap time', true);
-                return;
-            }
-            
-            // Parse the lap time
-            const lapTimeSeconds = parseLapTime(lapTimeInput);
-            if (lapTimeSeconds === null) {
-                showManualStatus('⚠️ Invalid lap time format. Use mm:ss.xxx or seconds', true);
-                return;
-            }
-            
-            // Validate lap time range (5 seconds to 60 minutes)
-            if (lapTimeSeconds < 5 || lapTimeSeconds > 3600) {
-                showManualStatus('⚠️ Lap time must be between 5 seconds and 60 minutes', true);
-                return;
-            }
-            
-            // Send to server
-            fetch('/api/manual_lap', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                },
-                body: JSON.stringify({
-                    driver_name: driverName,
-                    lap_time: lapTimeSeconds
-                })
-            })
-            .then(response => response.json())
-            .then(data => {
-                if (data.success) {
-                    showManualStatus(`✅ Lap time ${data.formatted_time} sent successfully!`, false);
-                    // Clear the form
-                    document.getElementById('manualLapTime').value = '';
-                    // Optionally clear driver name too
-                    // document.getElementById('manualDriverName').value = '';
-                    
-                    // Close modal after brief delay to show success message
-                    setTimeout(() => {
-                        closeManualLapModal();
-                    }, 1500);
-                } else {
-                    showManualStatus(`❌ ${data.message || 'Failed to send lap time'}`, true);
-                }
-            })
-            .catch(error => {
-                showManualStatus('❌ Error connecting to server', true);
-                console.error('Error:', error);
-            });
-        }
-        
-        function checkTimerAndSettings() {
-            fetch('/get_settings')
-                .then(response => response.json())
-                .then(data => {
-                    // Update email field visibility
-                    const emailGroup = document.getElementById('emailGroup');
-                    const wasHidden = emailGroup.style.display === 'none';
-                    emailGroup.style.display = data.require_email ? 'block' : 'none';
-                    
-                    // Highlight email field when it first appears
-                    if (wasHidden && data.require_email) {
-                        // Add attention animation
-                        emailGroup.style.animation = 'none';
-                        setTimeout(() => {
-                            emailGroup.style.animation = 'highlight-field 1.5s';
-                        }, 10);
-                    }
-                    
-                    // Update background image - set directly to body in a more reliable way
-                    if (data.background_image) {
-                        const imageUrl = `/backgrounds/${data.background_image}`;
-                        document.body.style.backgroundImage = `url('${imageUrl}')`;
-                        
-                        // Preload image to ensure it's fully loaded
-                        const img = new Image();
-                        img.onload = function() {
-                            console.log(`Background image loaded: ${img.width}x${img.height}`);
-                            
-                            // Force background size based on image dimensions vs screen
-                            const screenRatio = window.innerWidth / window.innerHeight;
-                            const imageRatio = img.width / img.height;
-                            
-                            if (Math.abs(screenRatio - imageRatio) > 0.2) {
-                                // If ratios are very different, use 100% 100%
-                                document.body.style.backgroundSize = '100% 100%';
-                                console.log('Using 100% 100% sizing due to ratio difference');
-                            } else {
-                                // Otherwise cover works better
-                                document.body.style.backgroundSize = 'cover';
-                                console.log('Using cover sizing due to similar ratios');
-                            }
-                        };
-                        img.src = imageUrl;
-                    } else {
-                        document.body.style.backgroundImage = 'none';
-                    }
-                    
-                    // Check timer
-                    const timerStatus = document.getElementById('timerStatus');
-                    const container = document.getElementById('container');
-                    
-                    // Helper function to clear all timer CSS classes
-                    function clearTimerClasses() {
-                        timerStatus.classList.remove('timer-active', 'timer-warning', 'timer-expired', 'laps-active', 'laps-outlap');
-                    }
-                    
-                    // Render rotation status: time or laps
-                    if (data.rotation_mode === 'Laps' && data.laps_active) {
-                        clearTimerClasses();
-                        if (!data.laps_progress.started) {
-                            // Out lap in progress
-                            timerStatus.classList.add('laps-outlap');
-                            timerStatus.innerHTML = `
-                                <span class="timer-label">Out Lap</span>
-                                <span class="timer-text">🏁 Warming Up...</span>
-                            `;
-                        } else {
-                            // Laps in progress
-                            timerStatus.classList.add('laps-active');
-                            const lapCount = data.laps_progress.count;
-                            const lapTarget = data.laps_progress.target;
-                            const progressPercent = Math.min(100, (lapCount / lapTarget) * 100);
-                            timerStatus.innerHTML = `
-                                <span class="timer-label">Laps Completed</span>
-                                <span class="timer-text">🏁 ${lapCount} / ${lapTarget}</span>
-                                <div class="progress-bar-container">
-                                    <div class="progress-bar-fill" style="width: ${progressPercent}%"></div>
-                                </div>
-                            `;
-                        }
-                        timerStatus.style.display = 'block';
-                        container.classList.remove('timer-alert');
-                    } else if (data.timer_active && data.timer_seconds_left <= 0) {
-                        // Timer expired
-                        clearTimerClasses();
-                        timerStatus.classList.add('timer-expired');
-                        timerStatus.innerHTML = `
-                            <span class="timer-text">🚨 TIME EXPIRED 🚨</span>
-                            <span class="timer-label">Please Change Driver</span>
-                        `;
-                        timerStatus.style.display = 'block';
-                        container.classList.add('timer-alert');
-                    } else if (data.timer_active) {
-                        // Timer active
-                        clearTimerClasses();
-                        const minutes = Math.floor(data.timer_seconds_left / 60);
-                        const seconds = data.timer_seconds_left % 60;
-                        const formattedTime = `${minutes}:${seconds.toString().padStart(2, '0')}`;
-                        
-                        // Warning state when less than 2 minutes remain
-                        if (data.timer_seconds_left <= 120) {
-                            timerStatus.classList.add('timer-warning');
-                            timerStatus.innerHTML = `
-                                <span class="timer-label">⚠️ Time Running Low!</span>
-                                <span class="timer-text">⏱️ ${formattedTime}</span>
-                            `;
-                        } else {
-                            timerStatus.classList.add('timer-active');
-                            timerStatus.innerHTML = `
-                                <span class="timer-label">Time Remaining</span>
-                                <span class="timer-text">⏱️ ${formattedTime}</span>
-                            `;
-                        }
-                        timerStatus.style.display = 'block';
-                        container.classList.remove('timer-alert');
-                    } else {
-                        // No timer or lap-based rotation
-                        clearTimerClasses();
-                        timerStatus.style.display = 'none';
-                        container.classList.remove('timer-alert');
-                    }
-                })
-                .catch(error => console.error('Error:', error));
-        }
-
-        // Load current driver name when page loads
-        fetch('/get_driver')
-            .then(response => response.json())
-            .then(data => {
-                if (data.driver_name) {
-                    // On initial load, populate the form with current driver
-                    if (isInitialLoad) {
-                        document.getElementById('driverName').value = data.driver_name;
-                        isInitialLoad = false;
-                    }
-                    
-                    // Always update the current driver display
-                    document.getElementById('currentDriverName').textContent = data.driver_name;
-                    document.getElementById('currentDriverBox').style.display = 'flex';
-                }
-            })
-            .catch(error => console.error('Error:', error));
-         
-        // Apply a secondary fix after page fully loads
-        window.addEventListener('load', function() {
-            // Force body to full viewport height again after load
-            document.body.style.minHeight = '100vh';
-            document.documentElement.style.minHeight = '100vh';
-            
-            // Force background to cover screen
-            if (document.body.style.backgroundImage && document.body.style.backgroundImage !== 'none') {
-                document.body.style.backgroundSize = '100% 100%';
-            }
-            
-            console.log('Applied additional fixes on load');
-        });
-            
-        // Check settings and timer immediately and then every second
-        checkTimerAndSettings();
-        setInterval(checkTimerAndSettings, 1000);
     </script>
 </body>
 </html>
@@ -2908,33 +2237,10 @@ QUEUE_HTML_CONTENT = r"""
     </div>
 
     <script>
-        let receiverUrl = null;
-
-        // Get receiver URL from simulator
-        async function getReceiverUrl() {
-            if (receiverUrl) return true;
-            try {
-                const resp = await fetch('/api/get_receiver_url');
-                const data = await resp.json();
-                if (data.success && data.receiver_url) {
-                    receiverUrl = data.receiver_url;
-                    return true;
-                }
-            } catch (e) {
-                console.error('Error getting receiver URL:', e);
-            }
-            return false;
-        }
-
-        // Update queue count display
+        // Update queue count display (uses local proxy endpoint)
         async function updateQueueCount() {
-            if (!receiverUrl) {
-                await getReceiverUrl();
-            }
-            if (!receiverUrl) return;
-
             try {
-                const response = await fetch(receiverUrl + '/api/queue');
+                const response = await fetch('/api/queue');
                 const data = await response.json();
                 if (data.success) {
                     const count = data.total_in_queue || 0;
@@ -2961,22 +2267,12 @@ QUEUE_HTML_CONTENT = r"""
                 return;
             }
 
-            // Get receiver URL first
-            if (!receiverUrl) {
-                const gotUrl = await getReceiverUrl();
-                if (!gotUrl) {
-                    errorMsg.textContent = 'Unable to connect to queue server. Please try again.';
-                    errorMsg.style.display = 'block';
-                    return;
-                }
-            }
-
             joinBtn.disabled = true;
             joinBtn.textContent = 'Joining...';
             errorMsg.style.display = 'none';
 
             try {
-                const response = await fetch(receiverUrl + '/api/queue/join', {
+                const response = await fetch('/api/queue/join', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ name: name, phone: phone })
@@ -3042,15 +2338,252 @@ QUEUE_HTML_CONTENT = r"""
 
         // Initialize
         loadSettings();
-        getReceiverUrl().then(() => {
-            updateQueueCount();
-        });
+        updateQueueCount();
 
         // Update queue count every 10 seconds
         setInterval(updateQueueCount, 10000);
 
         // Focus on name input on load
         document.getElementById('guestName').focus();
+    </script>
+</body>
+</html>
+"""
+
+# Queue display page for TV screens (no internet required)
+QUEUE_DISPLAY_HTML_CONTENT = r"""
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Queue Display</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="refresh" content="30">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        html, body {
+            width: 100%; height: 100vh; overflow: hidden;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            font-family: 'Segoe UI', Arial, sans-serif;
+            color: #ffffff;
+        }
+        .container {
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+            padding: 30px;
+        }
+
+        /* Header with title */
+        .header {
+            text-align: center;
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+        .header h1 {
+            font-size: 48px;
+            font-weight: 300;
+            color: #4ec9b0;
+            text-transform: uppercase;
+            letter-spacing: 4px;
+        }
+
+        /* Now Serving Banner */
+        .now-serving {
+            background: linear-gradient(135deg, #007acc 0%, #0056b3 100%);
+            border-radius: 16px;
+            padding: 30px;
+            margin-bottom: 30px;
+            text-align: center;
+            box-shadow: 0 8px 32px rgba(0, 122, 204, 0.4);
+        }
+        .now-serving-label {
+            font-size: 24px;
+            text-transform: uppercase;
+            letter-spacing: 3px;
+            opacity: 0.9;
+            margin-bottom: 10px;
+        }
+        .now-serving-name {
+            font-size: 64px;
+            font-weight: bold;
+            animation: pulse-glow 2s ease-in-out infinite;
+        }
+        @keyframes pulse-glow {
+            0%, 100% { text-shadow: 0 0 20px rgba(255,255,255,0.5); }
+            50% { text-shadow: 0 0 40px rgba(255,255,255,0.8); }
+        }
+        .now-serving.empty {
+            background: linear-gradient(135deg, #3e3e42 0%, #2d2d30 100%);
+            box-shadow: none;
+        }
+        .now-serving.empty .now-serving-name {
+            font-size: 48px;
+            opacity: 0.7;
+            animation: none;
+        }
+
+        /* Queue List */
+        .queue-section {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            min-height: 0;
+        }
+        .queue-header {
+            font-size: 28px;
+            font-weight: 300;
+            margin-bottom: 20px;
+            color: #9d9d9d;
+            text-transform: uppercase;
+            letter-spacing: 2px;
+        }
+        .queue-list {
+            flex: 1;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+        .queue-item {
+            display: flex;
+            align-items: center;
+            background: rgba(255,255,255,0.05);
+            border-radius: 12px;
+            padding: 20px 30px;
+            border-left: 4px solid #007acc;
+        }
+        .queue-item .position {
+            font-size: 36px;
+            font-weight: bold;
+            color: #007acc;
+            min-width: 80px;
+        }
+        .queue-item .name {
+            flex: 1;
+            font-size: 32px;
+            font-weight: 500;
+        }
+        .queue-item .wait {
+            font-size: 24px;
+            color: #9d9d9d;
+        }
+        .queue-item .notified {
+            margin-left: 20px;
+            font-size: 28px;
+            color: #4ec9b0;
+        }
+
+        .queue-empty {
+            text-align: center;
+            padding: 60px;
+            font-size: 32px;
+            color: #6e6e6e;
+            font-style: italic;
+        }
+
+        /* Footer */
+        .footer {
+            text-align: center;
+            padding: 20px;
+            color: #6e6e6e;
+            font-size: 18px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>Sim Racing Queue</h1>
+        </div>
+
+        <div class="now-serving empty" id="nowServing">
+            <div class="now-serving-label">Now Serving</div>
+            <div class="now-serving-name" id="nowServingName">Waiting for first guest...</div>
+        </div>
+
+        <div class="queue-section">
+            <div class="queue-header">Up Next</div>
+            <div class="queue-list" id="queueList">
+                <div class="queue-empty">Queue is empty</div>
+            </div>
+        </div>
+
+        <div class="footer">
+            Scan the QR code at the kiosk to join the queue
+        </div>
+    </div>
+
+    <script>
+        let currentlyServing = null;
+
+        async function refreshDisplay() {
+            try {
+                // Fetch queue
+                const response = await fetch('/api/queue');
+                const data = await response.json();
+
+                if (!data.success) {
+                    console.error('Queue fetch failed');
+                    return;
+                }
+
+                const queue = data.queue || [];
+                const nowServingEl = document.getElementById('nowServing');
+                const nowServingName = document.getElementById('nowServingName');
+                const queueList = document.getElementById('queueList');
+
+                // Fetch simulator info to find who's being served
+                const simsResponse = await fetch('/api/discover_simulators');
+                const simsData = await simsResponse.json();
+                const simulators = simsData.simulators || [];
+
+                // Find current drivers (active sessions)
+                const activeDrivers = simulators
+                    .filter(s => s.current_driver && s.current_driver.trim())
+                    .map(s => s.current_driver);
+
+                // Show now serving
+                if (activeDrivers.length > 0) {
+                    nowServingEl.classList.remove('empty');
+                    nowServingName.textContent = activeDrivers[0];
+                    currentlyServing = activeDrivers[0];
+                } else {
+                    nowServingEl.classList.add('empty');
+                    nowServingName.textContent = queue.length > 0 ? 'Ready for next guest' : 'Waiting for first guest...';
+                    currentlyServing = null;
+                }
+
+                // Show queue
+                if (queue.length === 0) {
+                    queueList.innerHTML = '<div class="queue-empty">Queue is empty - join at the kiosk!</div>';
+                } else {
+                    queueList.innerHTML = queue.map(entry => {
+                        const notifiedBadge = entry.notified ? '<span class="notified" title="Notified">🔔</span>' : '';
+                        return `
+                            <div class="queue-item">
+                                <span class="position">#${entry.position}</span>
+                                <span class="name">${escapeHtml(entry.name)}</span>
+                                <span class="wait">${entry.wait_display || ''}</span>
+                                ${notifiedBadge}
+                            </div>
+                        `;
+                    }).join('');
+                }
+
+            } catch (e) {
+                console.error('Error refreshing display:', e);
+            }
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text || '';
+            return div.innerHTML;
+        }
+
+        // Initial load and refresh every 5 seconds
+        refreshDisplay();
+        setInterval(refreshDisplay, 5000);
     </script>
 </body>
 </html>
@@ -3074,6 +2607,10 @@ def admin():
 @app.route('/queue')
 def queue_page():
     return QUEUE_HTML_CONTENT
+
+@app.route('/queue-display')
+def queue_display_page():
+    return QUEUE_DISPLAY_HTML_CONTENT
 
 @app.route('/get_driver', methods=['GET'])
 def get_driver():
@@ -3179,6 +2716,177 @@ def get_receiver_url():
             first_url = url.split(',')[0].strip()
             return jsonify({'success': True, 'receiver_url': first_url})
     return jsonify({'success': False, 'error': 'Receiver URL not configured'})
+
+# ============================================
+# QUEUE PROXY ENDPOINTS
+# These proxy queue API calls to the Receiver while handling SMS locally
+# ============================================
+
+def get_receiver_base_url():
+    """Get receiver base URL for proxying requests"""
+    if main_window and hasattr(main_window, 'current_server_url'):
+        url = main_window.current_server_url
+        if url:
+            return url.split(',')[0].strip()
+    return None
+
+@app.route('/api/queue', methods=['GET'])
+def proxy_queue_list():
+    """Proxy queue list from Receiver"""
+    receiver_url = get_receiver_base_url()
+    if not receiver_url:
+        return jsonify({'success': False, 'error': 'Receiver not connected'}), 503
+
+    try:
+        response = requests.get(f"{receiver_url}/api/queue", timeout=5)
+        data = response.json()
+
+        # Add notification status to each queue entry
+        if data.get('success') and data.get('queue'):
+            for entry in data['queue']:
+                entry['notified'] = entry.get('id') in notified_queue_ids
+
+        return jsonify(data), response.status_code
+    except Exception as e:
+        print(f"[Queue Proxy] Error fetching queue: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 503
+
+@app.route('/api/queue/join', methods=['POST'])
+def proxy_queue_join():
+    """Proxy join request to Receiver, then send confirmation SMS"""
+    receiver_url = get_receiver_base_url()
+    print(f"[Queue] Join request received, receiver_url={receiver_url}")
+    if not receiver_url:
+        print("[Queue] ERROR: No receiver connected!")
+        return jsonify({'success': False, 'error': 'Receiver not connected'}), 503
+
+    try:
+        data = request.get_json() or {}
+        name = data.get('name', 'Unknown')
+        phone = data.get('phone', '')
+        print(f"[Queue] Processing join: name='{name}', phone='{phone or 'none'}'")
+
+        response = requests.post(
+            f"{receiver_url}/api/queue/join",
+            json=data,
+            headers={'Content-Type': 'application/json'},
+            timeout=5
+        )
+        result = response.json()
+        print(f"[Queue] Join result: {result}")
+
+        # Send confirmation SMS if phone provided and join was successful
+        if result.get('success') and phone:
+            position = result.get('position', '?')
+            wait_display = result.get('wait_display', 'a few minutes')
+            confirmation_msg = f"Hi {name}! You're #{position} in the sim racing queue. Estimated wait: {wait_display}. We'll text you when it's almost your turn!"
+
+            print(f"[SMS] Sending queue confirmation to {phone}")
+            try:
+                # Clean phone number
+                import re
+                clean_phone = re.sub(r'[^\d+]', '', phone)
+                if not clean_phone.startswith('+') and not clean_phone.startswith('1'):
+                    clean_phone = '+1' + clean_phone
+                elif clean_phone.startswith('1') and len(clean_phone) == 11:
+                    clean_phone = '+' + clean_phone
+
+                sms_sent = send_sms_textbelt(clean_phone, confirmation_msg)
+                result['confirmation_sms_sent'] = sms_sent
+                print(f"[SMS] Confirmation {'sent' if sms_sent else 'failed'} to {name}")
+            except Exception as sms_e:
+                print(f"[SMS] Confirmation error: {sms_e}")
+                result['confirmation_sms_sent'] = False
+
+        return jsonify(result), response.status_code
+    except Exception as e:
+        print(f"[Queue] ERROR joining queue: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 503
+
+@app.route('/api/queue/remove', methods=['POST'])
+def proxy_queue_remove():
+    """Proxy remove request to Receiver"""
+    receiver_url = get_receiver_base_url()
+    if not receiver_url:
+        return jsonify({'success': False, 'error': 'Receiver not connected'}), 503
+
+    try:
+        data = request.get_json() or {}
+        response = requests.post(
+            f"{receiver_url}/api/queue/remove",
+            json=data,
+            headers={'Content-Type': 'application/json'},
+            timeout=5
+        )
+        return jsonify(response.json()), response.status_code
+    except Exception as e:
+        print(f"[Queue Proxy] Error removing from queue: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 503
+
+@app.route('/api/queue/assign', methods=['POST'])
+def proxy_queue_assign():
+    """Proxy assign request to Receiver, then send SMS locally"""
+    receiver_url = get_receiver_base_url()
+    print(f"[Queue] Assign request received, receiver_url={receiver_url}")
+    if not receiver_url:
+        print("[Queue] ERROR: No receiver connected!")
+        return jsonify({'success': False, 'error': 'Receiver not connected'}), 503
+
+    try:
+        data = request.get_json() or {}
+        print(f"[Queue] Assign request data: {data}")
+
+        # Forward to Receiver
+        response = requests.post(
+            f"{receiver_url}/api/queue/assign",
+            json=data,
+            headers={'Content-Type': 'application/json'},
+            timeout=5
+        )
+        result = response.json()
+        print(f"[Queue] Assign result from receiver: {result}")
+
+        # If Receiver succeeded and returned phone, send SMS from Sender
+        if result.get('success'):
+            phone = result.get('phone')
+            name = result.get('name', 'Guest')
+            simulator_name = data.get('simulator_name', 'your simulator')
+
+            if phone:
+                print(f"[SMS] Attempting to send notification to {name} at {phone}")
+                sms_sent = send_sms_notification(
+                    phone_number=phone,
+                    driver_name=name,
+                    simulator_name=simulator_name
+                )
+                result['sms_sent'] = sms_sent
+                print(f"[SMS] Notification result: {'sent' if sms_sent else 'failed'}")
+            else:
+                print(f"[SMS] No phone number for {name}, skipping SMS")
+                result['sms_sent'] = False
+        else:
+            print(f"[Queue] Assign failed: {result.get('error', 'Unknown error')}")
+
+        return jsonify(result), response.status_code
+    except Exception as e:
+        print(f"[Queue] ERROR assigning: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 503
+
+@app.route('/api/queue/stats', methods=['GET'])
+def proxy_queue_stats():
+    """Proxy stats from Receiver"""
+    receiver_url = get_receiver_base_url()
+    if not receiver_url:
+        return jsonify({'success': False, 'error': 'Receiver not connected'}), 503
+
+    try:
+        response = requests.get(f"{receiver_url}/api/queue/stats", timeout=5)
+        return jsonify(response.json()), response.status_code
+    except Exception as e:
+        print(f"[Queue Proxy] Error fetching stats: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 503
 
 @app.route('/api/session/start_remote', methods=['POST'])
 def start_remote_session():
@@ -7689,7 +7397,13 @@ class LapTimeSenderWindow(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
-    
+
+    # Load SMS configuration for queue notifications
+    load_sms_config()
+
+    # Start proactive SMS notification background thread
+    start_queue_notification_thread()
+
     # Set application icon - use absolute path and handle resource path properly
     if getattr(sys, 'frozen', False):
         # Running as compiled
@@ -7697,7 +7411,7 @@ def main():
     else:
         # Running from script
         base_path = os.path.dirname(os.path.abspath(__file__))
-        
+
     icon_path = os.path.join(base_path, 'resources', 'icon.png')
     
     if os.path.exists(icon_path):
