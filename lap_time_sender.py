@@ -1398,6 +1398,9 @@ ADMIN_HTML_CONTENT = r"""
     <div class="context-menu-overlay" id="contextMenuOverlay" onclick="closeContextMenu()">
         <div class="context-menu" onclick="event.stopPropagation()">
             <div class="context-menu-header" id="contextMenuHeader">Sim 1</div>
+            <div class="context-menu-item" id="contextEndSession" onclick="endSessionOnContextSim()" style="display: none;">
+                ⏹️ End Session
+            </div>
             <div class="context-menu-item" onclick="editSimulator()">
                 ✏️ Edit
             </div>
@@ -1647,11 +1650,16 @@ ADMIN_HTML_CONTENT = r"""
             const assignedEntry = queueData.queue?.find(e => e.assigned_to === myIp);
             const activeSession = queueData.active_sessions?.[myIp];
 
-            if (activeSession) {
+            // Also check if current simulator has an active driver (from discovered simulators)
+            const currentSim = discoveredSimulators.find(s => s.ip === myIp || s.is_current);
+            const hasActiveDriver = currentSim && currentSim.current_driver && currentSim.current_driver.trim() !== '';
+
+            if (activeSession || hasActiveDriver) {
                 // Session active - enable end button
                 startBtn.disabled = true;
                 endBtn.disabled = false;
-                statusEl.textContent = `Session active: ${activeSession.driver_name || 'Unknown'}`;
+                const driverName = activeSession?.driver_name || currentSim?.current_driver || 'Unknown';
+                statusEl.textContent = `Session active: ${driverName}`;
             } else if (assignedEntry) {
                 // Guest assigned but session not started
                 startBtn.disabled = false;
@@ -1761,16 +1769,40 @@ ADMIN_HTML_CONTENT = r"""
 
         async function forceEndSession() {
             try {
+                // End session on the current simulator (the one we're viewing)
+                // Since pages navigate to different sim IPs, this always targets the correct sim
                 const response = await fetch('/api/session/force_end', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' }
                 });
                 const data = await response.json();
                 if (data.success) {
+                    // Refresh simulator info to update UI
+                    await refreshSimulatorTabs();
                     refreshQueue();
                 }
             } catch (e) {
                 console.error('Error ending session:', e);
+                alert('Failed to end session: ' + e.message);
+            }
+        }
+
+        // End session on a specific simulator (by IP)
+        async function forceEndSessionOnSim(simulatorIp) {
+            try {
+                const response = await fetch(`http://${simulatorIp}:5001/api/session/force_end`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' }
+                });
+                const data = await response.json();
+                if (data.success) {
+                    await refreshSimulatorTabs();
+                    refreshQueue();
+                }
+                return data.success;
+            } catch (e) {
+                console.error('Error ending session on ' + simulatorIp + ':', e);
+                return false;
             }
         }
 
@@ -2013,13 +2045,45 @@ ADMIN_HTML_CONTENT = r"""
         function openContextMenu(sim) {
             contextMenuSimulator = sim;
             document.getElementById('contextMenuHeader').textContent = sim.simulator_name || sim.name || 'Simulator';
+
+            // Show/hide End Session option based on whether sim has an active driver
+            const endSessionItem = document.getElementById('contextEndSession');
+            const hasDriver = sim.current_driver && sim.current_driver.trim() !== '';
+            if (endSessionItem) {
+                endSessionItem.style.display = hasDriver ? 'flex' : 'none';
+            }
+
             document.getElementById('contextMenuOverlay').classList.add('active');
         }
-        
+
         // Close context menu
         function closeContextMenu() {
             document.getElementById('contextMenuOverlay').classList.remove('active');
             contextMenuSimulator = null;
+        }
+
+        // End session on the simulator from context menu
+        async function endSessionOnContextSim() {
+            if (!contextMenuSimulator || !contextMenuSimulator.ip) {
+                closeContextMenu();
+                return;
+            }
+
+            const simName = contextMenuSimulator.simulator_name || contextMenuSimulator.name || 'this simulator';
+            const driverName = contextMenuSimulator.current_driver || 'the driver';
+
+            if (!confirm(`End session for ${driverName} on ${simName}?`)) {
+                closeContextMenu();
+                return;
+            }
+
+            const success = await forceEndSessionOnSim(contextMenuSimulator.ip);
+            if (success) {
+                console.log('Session ended on ' + contextMenuSimulator.ip);
+            } else {
+                alert('Failed to end session on ' + simName);
+            }
+            closeContextMenu();
         }
         
         // Edit simulator
