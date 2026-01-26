@@ -297,6 +297,35 @@ def save_sms_config():
     except Exception as e:
         print(f"[SMS] Error saving config: {e}")
 
+def format_phone_e164(phone_number):
+    """Format phone number to E.164 format (+1XXXXXXXXXX) for SMS APIs."""
+    import re
+    # Remove everything except digits and +
+    clean = re.sub(r'[^\d+]', '', phone_number or '')
+
+    if not clean:
+        return None
+
+    # Already has + prefix - validate and return
+    if clean.startswith('+'):
+        return clean if len(clean) >= 11 else None
+
+    # Has country code (11 digits starting with 1)
+    if clean.startswith('1') and len(clean) == 11:
+        return '+' + clean
+
+    # 10-digit US number - add +1
+    if len(clean) == 10:
+        return '+1' + clean
+
+    # For any other case, try adding +1 if reasonable length
+    if 10 <= len(clean) <= 11:
+        if not clean.startswith('1'):
+            return '+1' + clean
+        return '+' + clean
+
+    return None  # Invalid
+
 def send_sms_notification(phone_number, driver_name, simulator_name="your simulator"):
     """Send SMS notification via configured provider"""
     global sms_config
@@ -309,15 +338,12 @@ def send_sms_notification(phone_number, driver_name, simulator_name="your simula
         print(f"[SMS] SKIPPED: SMS is disabled in config")
         return False
 
-    if not phone_number or len(phone_number) < 10:
-        print(f"[SMS] SKIPPED: Invalid phone number '{phone_number}' (too short)")
+    # Clean up phone number using unified formatter
+    clean_phone = format_phone_e164(phone_number)
+    if not clean_phone:
+        print(f"[SMS] SKIPPED: Could not format phone '{phone_number}'")
         return False
-
-    # Clean up phone number
-    clean_phone = ''.join(filter(str.isdigit, phone_number))
-    if len(clean_phone) == 10:
-        clean_phone = "1" + clean_phone  # Add US country code
-    print(f"[SMS] Cleaned phone: {clean_phone}")
+    print(f"[SMS] Formatted phone: {clean_phone}")
 
     # Format message
     message = sms_config.get("message_template", "It's your turn to race!").format(
@@ -435,13 +461,11 @@ def send_headsup_notification(phone_number, name, wait_minutes):
     # Format message
     message = template.format(name=name, wait=int(wait_minutes))
 
-    # Clean phone number
-    import re
-    clean_phone = re.sub(r'[^\d+]', '', phone_number)
-    if not clean_phone.startswith('+') and not clean_phone.startswith('1'):
-        clean_phone = '+1' + clean_phone
-    elif clean_phone.startswith('1') and len(clean_phone) == 11:
-        clean_phone = '+' + clean_phone
+    # Clean phone number using unified formatter
+    clean_phone = format_phone_e164(phone_number)
+    if not clean_phone:
+        print(f"[SMS] Heads-up skipped: Invalid phone '{phone_number}'")
+        return False
 
     print(f"[SMS] Sending heads-up to {name}: {message}")
 
@@ -537,6 +561,51 @@ def start_queue_notification_thread():
     thread = threading.Thread(target=queue_notification_checker, daemon=True)
     thread.start()
     return thread
+
+def calculate_wait_display(position):
+    """Calculate wait time display based on queue position and available sims."""
+    try:
+        # Get simulators via internal discovery
+        current_ip = get_local_ip()
+        discovered = SimulatorDiscovery.discover()
+
+        # Build list with current sim
+        all_sims = []
+        if main_window:
+            all_sims.append({
+                'current_driver': main_window.driver_name.text() or None,
+                'reachable': True
+            })
+        for sim in discovered:
+            if sim.get('ip') != current_ip:
+                all_sims.append(sim)
+
+        # Count available (reachable + no current driver)
+        available = sum(1 for s in all_sims
+                       if s.get('reachable', True) != False
+                       and not (s.get('current_driver') or '').strip())
+        total_sims = max(1, len(all_sims))
+    except Exception as e:
+        print(f"[Queue] Error getting simulators: {e}")
+        available = 0
+        total_sims = 1
+
+    # Special cases
+    if position == 1 and available > 0:
+        return "You're Next!"
+    if position <= available and available > 0:
+        return "Immediately"
+
+    # Calculate wait: (position / num_sims) * 6 minutes
+    AVG_SESSION_MINUTES = 6
+    estimated_wait = (position / total_sims) * AVG_SESSION_MINUTES
+
+    if estimated_wait < 1:
+        return "< 1 minute"
+    elif estimated_wait < 2:
+        return "~1 minute"
+    else:
+        return f"~{int(round(estimated_wait))} minutes"
 
 # Create Flask app with no output
 app = Flask(__name__)
@@ -2741,10 +2810,12 @@ def proxy_queue_list():
         response = requests.get(f"{receiver_url}/api/queue", timeout=5)
         data = response.json()
 
-        # Add notification status to each queue entry
+        # Add notification status and wait_display to each queue entry
         if data.get('success') and data.get('queue'):
             for entry in data['queue']:
                 entry['notified'] = entry.get('id') in notified_queue_ids
+                # Add wait_display for each position
+                entry['wait_display'] = calculate_wait_display(entry.get('position', 1))
 
         return jsonify(data), response.status_code
     except Exception as e:
@@ -2775,7 +2846,15 @@ def proxy_queue_join():
         result = response.json()
         print(f"[Queue] Join result: {result}")
 
+        # Calculate wait_display locally
+        if result.get('success'):
+            position = result.get('position', 1)
+            result['wait_display'] = calculate_wait_display(position)
+            print(f"[Queue] Calculated wait: {result['wait_display']} (pos={position})")
+
         # Send confirmation SMS if phone provided and join was successful
+        print(f"[SMS] Checking SMS conditions: success={result.get('success')}, phone='{phone}', phone_bool={bool(phone)}")
+
         if result.get('success') and phone:
             position = result.get('position', '?')
             wait_display = result.get('wait_display', 'a few minutes')
@@ -2783,20 +2862,23 @@ def proxy_queue_join():
 
             print(f"[SMS] Sending queue confirmation to {phone}")
             try:
-                # Clean phone number
-                import re
-                clean_phone = re.sub(r'[^\d+]', '', phone)
-                if not clean_phone.startswith('+') and not clean_phone.startswith('1'):
-                    clean_phone = '+1' + clean_phone
-                elif clean_phone.startswith('1') and len(clean_phone) == 11:
-                    clean_phone = '+' + clean_phone
-
-                sms_sent = send_sms_textbelt(clean_phone, confirmation_msg)
-                result['confirmation_sms_sent'] = sms_sent
-                print(f"[SMS] Confirmation {'sent' if sms_sent else 'failed'} to {name}")
+                # Clean phone number using unified formatter
+                clean_phone = format_phone_e164(phone)
+                if not clean_phone:
+                    print(f"[SMS] Confirmation skipped: Could not format phone '{phone}'")
+                    result['confirmation_sms_sent'] = False
+                else:
+                    print(f"[SMS] Formatted phone: {clean_phone}")
+                    sms_sent = send_sms_textbelt(clean_phone, confirmation_msg)
+                    result['confirmation_sms_sent'] = sms_sent
+                    print(f"[SMS] Confirmation {'sent' if sms_sent else 'FAILED'} to {name} at {clean_phone}")
             except Exception as sms_e:
-                print(f"[SMS] Confirmation error: {sms_e}")
+                print(f"[SMS] Confirmation ERROR: {sms_e}")
+                import traceback
+                traceback.print_exc()
                 result['confirmation_sms_sent'] = False
+        else:
+            print(f"[SMS] Skipping SMS: success={result.get('success')}, phone provided={bool(phone)}")
 
         return jsonify(result), response.status_code
     except Exception as e:
@@ -2822,6 +2904,28 @@ def proxy_queue_remove():
     except Exception as e:
         print(f"[Queue Proxy] Error removing from queue: {e}")
         return jsonify({'success': False, 'error': str(e)}), 503
+
+@app.route('/api/sms/test', methods=['POST'])
+def test_sms():
+    """Test SMS sending - for debugging"""
+    data = request.get_json() or {}
+    phone = data.get('phone', '')
+    message = data.get('message', 'Test message from Sim Racing Queue!')
+
+    clean_phone = format_phone_e164(phone)
+    if not clean_phone:
+        return jsonify({'success': False, 'error': f'Invalid phone format: {phone}'}), 400
+
+    print(f"[SMS Test] Sending test to {clean_phone}")
+    success = send_sms_textbelt(clean_phone, message)
+
+    return jsonify({
+        'success': success,
+        'phone_input': phone,
+        'phone_formatted': clean_phone,
+        'sms_enabled': sms_config.get('enabled'),
+        'provider': sms_config.get('provider')
+    })
 
 @app.route('/api/queue/assign', methods=['POST'])
 def proxy_queue_assign():
