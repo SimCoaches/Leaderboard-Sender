@@ -3384,31 +3384,37 @@ class GameMonitor(QThread):
         try:
             while self.running:
                 try:
+                    # Only attempt to connect if not already connected
                     if not self.is_connected:
                         self.connection_status.emit(f"Attempting to connect to {self.game_name}...", "orange")
-                    
-                    success, data_handle = self.connect_to_game()
-                    if not success:
-                        if self.game_name == "iRacing":
-                            self.connection_status.emit("Waiting for iRacing... 🔄", "rgb(107, 114, 128)")
-                        else:
-                            self.connection_status.emit(f"{self.game_name} not running", "orange")
-                        time.sleep(1)
-                        continue
-                    
-                    if not self.is_connected:
+
+                        success, data_handle = self.connect_to_game()
+                        if not success:
+                            if self.game_name == "iRacing":
+                                self.connection_status.emit("Waiting for iRacing... 🔄", "rgb(107, 114, 128)")
+                            else:
+                                self.connection_status.emit(f"{self.game_name} not running", "orange")
+                            time.sleep(1)
+                            continue
+
                         self.is_connected = True
                         self.connection_status.emit(f"Connected to {self.game_name}! ✅", "green")
-                    
-                    is_valid_lap, lap_time = self.read_lap_time(data_handle)
-                    
+
+                    # Read lap time - returns (is_valid_lap, lap_time)
+                    # A special return of (False, -1) indicates disconnection
+                    is_valid_lap, lap_time = self.read_lap_time(None)
+
+                    # Check for disconnection signal
+                    if lap_time == -1:
+                        raise ConnectionError("Game disconnected")
+
                     if is_valid_lap and lap_time > 0 and lap_time != self.last_lap_time:
                         self.last_lap_time = lap_time
                         driver = self.get_current_driver()
                         self.lap_completed.emit(lap_time, driver)
-                    
+
                     self.msleep(100)  # Check every 100ms
-                    
+
                 except Exception as e:
                     if self.is_connected:
                         self.is_connected = False
@@ -3418,7 +3424,7 @@ class GameMonitor(QThread):
                         if hasattr(self, 'cleanup_handles'):
                             self.cleanup_handles()
                     self.msleep(1000)
-                    
+
         except Exception as e:
             print(f"{self.game_name} Monitor error: {str(e)}")
             self.connection_status.emit(f"Error monitoring {self.game_name}: {str(e)}", "red")
@@ -4039,78 +4045,96 @@ class AssettoCorsaMonitor(GameMonitor):
         """Attempt to connect to Assetto Corsa via shared memory"""
         try:
             print("\n=== Attempting AC Connection ===")
-            
+
+            # Clean up any existing handles first
+            self.cleanup_handles()
+
             # Connect to physics shared memory
             physics_mem = "Local\\acpmf_physics"
             graphics_mem = "Local\\acpmf_graphics"
-            
+
             print(f"Connecting to physics: {physics_mem}")
             print(f"Connecting to graphics: {graphics_mem}")
-            
+
             try:
                 self.physics_handle = mmap.mmap(-1, ctypes.sizeof(AssettoCorsaData), physics_mem)
                 self.graphics_handle = mmap.mmap(-1, ctypes.sizeof(AssettoCorsaGraphicsData), graphics_mem)
             except Exception as e:
                 print(f"Failed to open shared memory: {e}")
+                self.cleanup_handles()
                 return False, None
-            
+
             # Read initial data to verify connection
             graphics = AssettoCorsaGraphicsData()
             raw_data = self.graphics_handle.read(ctypes.sizeof(AssettoCorsaGraphicsData))
             self.graphics_handle.seek(0)
             ctypes.memmove(ctypes.byref(graphics), raw_data, ctypes.sizeof(AssettoCorsaGraphicsData))
-            
+
             # Verify we're getting valid data by checking status
+            # Status: 0=OFF, 1=REPLAY, 2=LIVE, 3=PAUSE
             if graphics.status == 0:  # AC is not running
                 print("AC is not running (status = 0)")
-                self.physics_handle.close()
-                self.graphics_handle.close()
+                self.cleanup_handles()
                 return False, None
-            
-            print("Successfully connected to Assetto Corsa")
+
+            print(f"Successfully connected to Assetto Corsa (status: {graphics.status})")
+            self.last_completed_laps = graphics.completedLaps  # Sync lap count to avoid false triggers
             return True, None
-            
+
         except Exception as e:
             print(f"\n=== Connection Error ===")
             print(f"Failed to connect to AC: {str(e)}")
             print("=====================")
-            if self.physics_handle:
-                self.physics_handle.close()
-            if self.graphics_handle:
-                self.graphics_handle.close()
+            self.cleanup_handles()
             return False, None
     
     def read_lap_time(self, _):
-        """Read lap time from Assetto Corsa shared memory"""
+        """Read lap time from Assetto Corsa shared memory
+
+        Returns:
+            (is_valid_lap, lap_time) - Normal lap data
+            (False, -1) - Signals disconnection (game closed or went to menu)
+        """
         try:
+            # Check if handles are valid
+            if not self.graphics_handle or not self.physics_handle:
+                print("AC handles are not initialized")
+                return False, -1  # Signal disconnection
+
             # Read graphics data for lap times
             graphics = AssettoCorsaGraphicsData()
             raw_data = self.graphics_handle.read(ctypes.sizeof(AssettoCorsaGraphicsData))
             self.graphics_handle.seek(0)
             ctypes.memmove(ctypes.byref(graphics), raw_data, ctypes.sizeof(AssettoCorsaGraphicsData))
-            
+
+            # Check if AC is still running (status 0 = OFF/closed)
+            if graphics.status == 0:
+                print("AC status is 0 (game closed or in menu)")
+                return False, -1  # Signal disconnection
+
             # Read physics data for additional validation
             physics = AssettoCorsaData()
             raw_data = self.physics_handle.read(ctypes.sizeof(AssettoCorsaData))
             self.physics_handle.seek(0)
             ctypes.memmove(ctypes.byref(physics), raw_data, ctypes.sizeof(AssettoCorsaData))
-            
+
             # Debug info only when lap completed (reduce spam)
             if graphics.completedLaps > self.last_completed_laps:
                 print(f"\n=== Lap Completed ===")
                 print(f"Completed Laps: {graphics.completedLaps}")
                 print(f"Last Time: {graphics.lastTime}")
                 print(f"Speed: {physics.speedKmh:.1f} km/h")
-            
+                print(f"Status: {graphics.status}")
+
             # Check if we've completed a new lap
             if graphics.completedLaps > self.last_completed_laps:
                 self.last_completed_laps = graphics.completedLaps
-                
+
                 # Validate racing context first
                 if not is_valid_racing_context(graphics, physics, "Assetto Corsa"):
                     return False, 0
-                
-                # Convert last time from string (mm:ss.xxx) to seconds
+
+                # Convert last time from milliseconds to seconds
                 try:
                     last_time = graphics.iLastTime / 1000.0  # Convert from ms to seconds
                     if validate_lap_time(last_time, "Assetto Corsa"):
@@ -4121,12 +4145,17 @@ class AssettoCorsaMonitor(GameMonitor):
                 except Exception as e:
                     print(f"Error processing lap time: {e}")
                     pass
-            
+
             return False, 0
-            
+
+        except (ValueError, OSError) as e:
+            # Handle closed/invalid mmap handles
+            print(f"AC shared memory error (likely game closed): {e}")
+            return False, -1  # Signal disconnection
+
         except Exception as e:
             print(f"Error reading lap time: {str(e)}")
-            return False, 0
+            return False, -1  # Signal disconnection on unexpected errors
             
     def cleanup_handles(self):
         """Safely cleanup memory mapped file handles"""

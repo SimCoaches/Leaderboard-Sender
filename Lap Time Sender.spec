@@ -8,7 +8,7 @@ a = Analysis(
     ['lap_time_sender.py'],
     pathex=[],
     binaries=[
-        (r"C:\Users\Lawrence's PC\AppData\Local\Programs\Python\Python311\Lib\site-packages\PyQt6\sip.cp311-win_amd64.pyd", "PyQt6")
+        (r"C:\Users\Lawrence Thomas\AppData\Local\Programs\Python\Python311\Lib\site-packages\PyQt6\sip.cp311-win_amd64.pyd", "PyQt6")
     ] + qrcode_binaries,
     datas=[('resources', 'resources')] + qrcode_datas,
     hiddenimports=['sip'] + qrcode_hiddenimports,
