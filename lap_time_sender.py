@@ -9,6 +9,7 @@ import ctypes
 import mmap
 import irsdk
 import shutil
+import uuid
 from pathlib import Path
 from datetime import datetime
 from abc import ABC, abstractmethod
@@ -724,6 +725,11 @@ HTML_CONTENT = r"""
             <input type="email" id="driverEmail" placeholder="Enter email address (required)" required>
             <small style="color: #6e6e6e; font-style: italic;">Required for driver communication</small>
         </div>
+        <div class="input-group">
+            <label for="driverPhone">📱 Phone Number:</label>
+            <input type="text" id="driverPhone" placeholder="Enter phone number (optional)">
+            <small style="color: #6e6e6e; font-style: italic;">Optional for partner race result integrations</small>
+        </div>
         <button onclick="updateDriver()">🏁 Register as Active Driver</button>
         <div id="status" class="status" style="display: none;"></div>
         <div id="timerStatus" style="display: none; margin-top: 15px;"></div>
@@ -740,6 +746,7 @@ HTML_CONTENT = r"""
         function updateDriver() {
             const driverName = document.getElementById('driverName').value.trim();
             const driverEmail = document.getElementById('driverEmail')?.value?.trim() || '';
+            const driverPhone = document.getElementById('driverPhone')?.value?.trim() || '';
             const statusDiv = document.getElementById('status');
             const emailRequired = document.getElementById('emailGroup').style.display !== 'none';
 
@@ -759,7 +766,7 @@ HTML_CONTENT = r"""
             fetch('/set_driver', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ driver_name: driverName, driver_email: driverEmail })
+                body: JSON.stringify({ driver_name: driverName, driver_email: driverEmail, driver_phone: driverPhone })
             })
             .then(response => response.json())
             .then(data => {
@@ -1382,6 +1389,10 @@ ADMIN_HTML_CONTENT = r"""
                     <label for="driverEmail">Email Address</label>
                     <input type="email" id="driverEmail" placeholder="Enter email address">
                 </div>
+                <div class="input-group">
+                    <label for="driverPhone">Phone Number</label>
+                    <input type="text" id="driverPhone" placeholder="Enter phone number (optional)">
+                </div>
                 <button class="primary" onclick="updateDriver()">Register</button>
                 <div id="registerStatus" class="status"></div>
             </div>
@@ -1657,7 +1668,11 @@ ADMIN_HTML_CONTENT = r"""
                 const startResponse = await fetch(`http://${simIp}:5001/api/session/start_remote`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ driver_name: nextGuest.name, queue_id: nextGuest.id })
+                    body: JSON.stringify({
+                        driver_name: nextGuest.name,
+                        queue_id: nextGuest.id,
+                        driver_phone: nextGuest.phone || assignData.phone || ''
+                    })
                 });
                 const startData = await startResponse.json();
 
@@ -1821,6 +1836,7 @@ ADMIN_HTML_CONTENT = r"""
 
         function updateDriver() {
             const driverName = document.getElementById('driverName').value.trim();
+            const driverPhone = document.getElementById('driverPhone')?.value?.trim() || '';
             const statusEl = document.getElementById('registerStatus');
 
             if (!driverName) {
@@ -1829,7 +1845,7 @@ ADMIN_HTML_CONTENT = r"""
                 return;
             }
 
-            let payload = { driver_name: driverName };
+            let payload = { driver_name: driverName, driver_phone: driverPhone };
 
             // Check if email required
             const emailGroup = document.getElementById('emailGroup');
@@ -1854,6 +1870,7 @@ ADMIN_HTML_CONTENT = r"""
                     statusEl.textContent = 'Driver registered successfully!';
                     statusEl.className = 'status success';
                     document.getElementById('driverName').value = '';
+                    document.getElementById('driverPhone').value = '';
                     if (emailGroup.style.display !== 'none') {
                         document.getElementById('driverEmail').value = '';
                     }
@@ -2693,6 +2710,7 @@ def set_driver():
         data = request.get_json()
         driver_name = data.get('driver_name', '')
         driver_email = data.get('driver_email', '')
+        driver_phone = data.get('driver_phone', '')
         
         if main_window:
             # Emit signal to UI thread to update driver and start video
@@ -2704,9 +2722,10 @@ def set_driver():
                     main_window.update_driver_name(driver_name)
             except Exception:
                 main_window.update_driver_name(driver_name)
-            # Store email if provided
-            if driver_email:
-                main_window.last_driver_email = driver_email
+            # Store contact fields for the active session. Empty values clear
+            # previous-driver data so old contact info is not reused.
+            main_window.last_driver_email = driver_email or ""
+            main_window.last_driver_phone = driver_phone or ""
             return jsonify({'success': True, 'driver_name': driver_name})
     except Exception as e:
         print(f"Error setting driver: {str(e)}")
@@ -3000,6 +3019,7 @@ def start_remote_session():
         data = request.get_json() or {}
         driver_name = data.get('driver_name', '').strip()
         queue_id = data.get('queue_id', '')
+        driver_phone = data.get('driver_phone', '')
 
         if not driver_name:
             return jsonify({'success': False, 'error': 'driver_name is required'}), 400
@@ -3007,6 +3027,8 @@ def start_remote_session():
         if main_window:
             # Store queue ID for session tracking
             main_window.assigned_queue_id = queue_id
+            main_window.last_driver_email = ""
+            main_window.last_driver_phone = driver_phone or ""
 
             # Use signal to update driver on UI thread (triggers session start)
             if ui_bridge:
@@ -6042,6 +6064,8 @@ class LapTimeSenderWindow(QMainWindow):
         
         # Current driver info (hidden)
         self.last_driver_email = ""
+        self.last_driver_phone = ""
+        self.current_session_id = ""
         # Video playback state
         self.pre_session_video_required = False
         self.pre_session_video_path = ""
@@ -6388,6 +6412,11 @@ class LapTimeSenderWindow(QMainWindow):
                 "driver_name": str(driver_name).strip(),  # Use resolved driver name (may be override)
                 "lap_time": float(round(lap_time, 3)),  # Round to 3 decimal places
             }
+
+            # Include session ID for partner integrations. Older receivers ignore it.
+            if not getattr(self, 'current_session_id', ''):
+                self.current_session_id = str(uuid.uuid4())
+            data["session_id"] = self.current_session_id
             
             # Include formatted time if available
             if formatted_time:
@@ -6397,6 +6426,10 @@ class LapTimeSenderWindow(QMainWindow):
             if hasattr(self, 'last_driver_email') and self.last_driver_email:
                 data["email"] = self.last_driver_email  # Changed from "driver_email" to "email"
                 print(f"Including driver email: {self.last_driver_email}")
+
+            # Include phone if a future registration/queue flow provides it.
+            if hasattr(self, 'last_driver_phone') and self.last_driver_phone:
+                data["phone"] = self.last_driver_phone
                 
             # Get the server URL from the saved value, not from the UI
             server_url_str = self.current_server_url
@@ -6698,6 +6731,7 @@ class LapTimeSenderWindow(QMainWindow):
             self._flush_pending_beamng_laps(old_driver)
         
         self.driver_name.setText(name)
+        self.current_session_id = str(uuid.uuid4())
         
         # Clear any expired timer message from previous session
         self.status_label.setText("Ready")
@@ -7076,7 +7110,9 @@ class LapTimeSenderWindow(QMainWindow):
                 data = {
                     'simulator_ip': get_local_ip(),
                     'driver_name': driver_name,
-                    'queue_id': queue_id or ''
+                    'queue_id': queue_id or '',
+                    'session_id': getattr(self, 'current_session_id', ''),
+                    'phone': getattr(self, 'last_driver_phone', '')
                 }
                 response = requests.post(
                     f"{self.current_server_url}/api/session/started",
@@ -7566,4 +7602,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
