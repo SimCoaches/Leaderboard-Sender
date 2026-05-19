@@ -7112,6 +7112,7 @@ class LapTimeSenderWindow(QMainWindow):
                     'driver_name': driver_name,
                     'queue_id': queue_id or '',
                     'session_id': getattr(self, 'current_session_id', ''),
+                    'email': getattr(self, 'last_driver_email', ''),
                     'phone': getattr(self, 'last_driver_phone', '')
                 }
                 response = requests.post(
