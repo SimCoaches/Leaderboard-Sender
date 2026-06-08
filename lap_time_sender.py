@@ -327,6 +327,23 @@ def format_phone_e164(phone_number):
 
     return None  # Invalid
 
+def is_valid_email_address(email):
+    """Basic email shape check for required lead-gen fields."""
+    email = str(email or '').strip()
+    if not email or ' ' in email or '@' not in email:
+        return False
+    local, _, domain = email.rpartition('@')
+    return bool(local and '.' in domain and not domain.startswith('.') and not domain.endswith('.'))
+
+def is_lead_gen_enabled():
+    """Return whether the driver sign-in flow should require contact info."""
+    window = globals().get('main_window')
+    return bool(
+        window
+        and hasattr(window, 'email_field_enabled')
+        and window.email_field_enabled.isChecked()
+    )
+
 def send_sms_notification(phone_number, driver_name, simulator_name="your simulator"):
     """Send SMS notification via configured provider"""
     global sms_config
@@ -648,7 +665,7 @@ HTML_CONTENT = r"""
         h1 { color: #cccccc; margin-bottom: 20px; text-align: center; }
         .input-group { margin-bottom: 20px; }
         label { display: block; margin-bottom: 5px; color: #9d9d9d; font-weight: bold; }
-        input[type="text"], input[type="email"] {
+        input[type="text"], input[type="email"], input[type="tel"] {
             width: 100%; padding: 12px; font-size: 18px;
             border: 1px solid #3e3e42; border-radius: 4px;
             background-color: #2d2d30; color: #cccccc;
@@ -727,8 +744,8 @@ HTML_CONTENT = r"""
         </div>
         <div class="input-group">
             <label for="driverPhone">📱 Phone Number:</label>
-            <input type="text" id="driverPhone" placeholder="Enter phone number (optional)">
-            <small style="color: #6e6e6e; font-style: italic;">Optional for partner race result integrations</small>
+            <input type="tel" id="driverPhone" placeholder="Enter phone number (optional)">
+            <small id="driverPhoneHelp" style="color: #6e6e6e; font-style: italic;">Optional for partner race result integrations</small>
         </div>
         <button onclick="updateDriver()">🏁 Register as Active Driver</button>
         <div id="status" class="status" style="display: none;"></div>
@@ -748,7 +765,9 @@ HTML_CONTENT = r"""
             const driverEmail = document.getElementById('driverEmail')?.value?.trim() || '';
             const driverPhone = document.getElementById('driverPhone')?.value?.trim() || '';
             const statusDiv = document.getElementById('status');
-            const emailRequired = document.getElementById('emailGroup').style.display !== 'none';
+            const emailGroup = document.getElementById('emailGroup');
+            const leadGenEnabled = emailGroup.style.display !== 'none';
+            const driverEmailInput = document.getElementById('driverEmail');
 
             if (!driverName) {
                 statusDiv.textContent = 'Please enter your name';
@@ -756,8 +775,20 @@ HTML_CONTENT = r"""
                 statusDiv.style.display = 'block';
                 return;
             }
-            if (emailRequired && !driverEmail) {
+            if (leadGenEnabled && !driverEmail) {
                 statusDiv.textContent = 'Please enter your email address';
+                statusDiv.className = 'status error';
+                statusDiv.style.display = 'block';
+                return;
+            }
+            if (leadGenEnabled && driverEmailInput && !driverEmailInput.checkValidity()) {
+                statusDiv.textContent = 'Please enter a valid email address';
+                statusDiv.className = 'status error';
+                statusDiv.style.display = 'block';
+                return;
+            }
+            if (leadGenEnabled && !driverPhone) {
+                statusDiv.textContent = 'Please enter your phone number';
                 statusDiv.className = 'status error';
                 statusDiv.style.display = 'block';
                 return;
@@ -797,8 +828,24 @@ HTML_CONTENT = r"""
             fetch('/get_settings')
                 .then(response => response.json())
                 .then(data => {
-                    // Email field
-                    document.getElementById('emailGroup').style.display = data.require_email ? 'block' : 'none';
+                    // Lead Gen contact fields
+                    const leadGenEnabled = Boolean(data.lead_gen_enabled || data.require_email);
+                    document.getElementById('emailGroup').style.display = leadGenEnabled ? 'block' : 'none';
+                    const phoneInput = document.getElementById('driverPhone');
+                    const phoneLabel = document.querySelector('label[for="driverPhone"]');
+                    if (phoneLabel) {
+                        phoneLabel.innerHTML = leadGenEnabled
+                            ? 'Phone Number: <span style="color: #f48771;">*</span>'
+                            : 'Phone Number: <span style="color: #6e6e6e; font-weight: normal;">(optional)</span>';
+                    }
+                    if (phoneInput) {
+                        phoneInput.required = leadGenEnabled;
+                        phoneInput.placeholder = leadGenEnabled ? 'Enter phone number (required)' : 'Enter phone number (optional)';
+                    }
+                    const phoneHelp = document.getElementById('driverPhoneHelp');
+                    if (phoneHelp) {
+                        phoneHelp.textContent = leadGenEnabled ? 'Required for race result delivery' : 'Optional for partner race result integrations';
+                    }
                     // Background
                     if (data.background_image) {
                         document.body.style.backgroundImage = 'url("/backgrounds/' + data.background_image + '")';
@@ -1386,12 +1433,13 @@ ADMIN_HTML_CONTENT = r"""
                     <small>This will appear on the leaderboard</small>
                 </div>
                 <div class="input-group" id="emailGroup" style="display: none;">
-                    <label for="driverEmail">Email Address</label>
-                    <input type="email" id="driverEmail" placeholder="Enter email address">
+                    <label for="driverEmail">Email Address <span style="color: #f48771;">*</span></label>
+                    <input type="email" id="driverEmail" placeholder="Enter email address (required)">
                 </div>
                 <div class="input-group">
                     <label for="driverPhone">Phone Number</label>
                     <input type="text" id="driverPhone" placeholder="Enter phone number (optional)">
+                    <small id="driverPhoneHelp">Optional for partner race result integrations</small>
                 </div>
                 <button class="primary" onclick="updateDriver()">Register</button>
                 <div id="registerStatus" class="status"></div>
@@ -1671,6 +1719,7 @@ ADMIN_HTML_CONTENT = r"""
                     body: JSON.stringify({
                         driver_name: nextGuest.name,
                         queue_id: nextGuest.id,
+                        driver_email: nextGuest.email || assignData.email || '',
                         driver_phone: nextGuest.phone || assignData.phone || ''
                     })
                 });
@@ -1836,6 +1885,8 @@ ADMIN_HTML_CONTENT = r"""
 
         function updateDriver() {
             const driverName = document.getElementById('driverName').value.trim();
+            const driverEmailInput = document.getElementById('driverEmail');
+            const driverEmail = driverEmailInput?.value?.trim() || '';
             const driverPhone = document.getElementById('driverPhone')?.value?.trim() || '';
             const statusEl = document.getElementById('registerStatus');
 
@@ -1845,18 +1896,27 @@ ADMIN_HTML_CONTENT = r"""
                 return;
             }
 
-            let payload = { driver_name: driverName, driver_phone: driverPhone };
+            let payload = { driver_name: driverName, driver_email: driverEmail, driver_phone: driverPhone };
 
             // Check if email required
             const emailGroup = document.getElementById('emailGroup');
-            if (emailGroup.style.display !== 'none') {
-                const driverEmail = document.getElementById('driverEmail').value.trim();
+            const leadGenEnabled = emailGroup.style.display !== 'none';
+            if (leadGenEnabled) {
                 if (!driverEmail) {
                     statusEl.textContent = 'Email address is required';
                     statusEl.className = 'status error';
                     return;
                 }
-                payload.driver_email = driverEmail;
+                if (driverEmailInput && !driverEmailInput.checkValidity()) {
+                    statusEl.textContent = 'Please enter a valid email address';
+                    statusEl.className = 'status error';
+                    return;
+                }
+                if (!driverPhone) {
+                    statusEl.textContent = 'Phone number is required';
+                    statusEl.className = 'status error';
+                    return;
+                }
             }
 
             fetch('/set_driver', {
@@ -2095,8 +2155,24 @@ ADMIN_HTML_CONTENT = r"""
                 .then(r => r.json())
                 .then(data => {
                     const emailGroup = document.getElementById('emailGroup');
+                    const leadGenEnabled = Boolean(data.lead_gen_enabled || data.require_email);
                     if (emailGroup) {
-                        emailGroup.style.display = data.require_email ? 'block' : 'none';
+                        emailGroup.style.display = leadGenEnabled ? 'block' : 'none';
+                    }
+                    const phoneInput = document.getElementById('driverPhone');
+                    const phoneLabel = document.querySelector('label[for="driverPhone"]');
+                    if (phoneLabel) {
+                        phoneLabel.innerHTML = leadGenEnabled
+                            ? 'Phone Number <span style="color: #f48771;">*</span>'
+                            : 'Phone Number <span style="color: #6e6e6e; font-weight: normal;">(optional)</span>';
+                    }
+                    if (phoneInput) {
+                        phoneInput.required = leadGenEnabled;
+                        phoneInput.placeholder = leadGenEnabled ? 'Enter phone number (required)' : 'Enter phone number (optional)';
+                    }
+                    const phoneHelp = document.getElementById('driverPhoneHelp');
+                    if (phoneHelp) {
+                        phoneHelp.textContent = leadGenEnabled ? 'Required for race result delivery' : 'Optional for partner race result integrations';
                     }
                 })
                 .catch(() => {});
@@ -2187,7 +2263,7 @@ QUEUE_HTML_CONTENT = r"""
         .subtitle { text-align: center; color: #9d9d9d; margin-bottom: 25px; font-size: 14px; }
         .input-group { margin-bottom: 18px; }
         label { display: block; margin-bottom: 6px; color: #cccccc; font-weight: 600; font-size: 14px; }
-        input[type="text"], input[type="tel"] {
+        input[type="text"], input[type="email"], input[type="tel"] {
             width: 100%; padding: 14px; font-size: 18px;
             border: 2px solid #3e3e42; border-radius: 8px;
             background-color: #2d2d30; color: #ffffff;
@@ -2293,8 +2369,12 @@ QUEUE_HTML_CONTENT = r"""
                 <label for="guestName">Your Name</label>
                 <input type="text" id="guestName" placeholder="Enter your name" required autocomplete="off">
             </div>
+            <div class="input-group" id="guestEmailGroup" style="display: none;">
+                <label for="guestEmail">Email <span style="color: #f48771;">*</span></label>
+                <input type="email" id="guestEmail" placeholder="Enter email address" autocomplete="off">
+            </div>
             <div class="input-group">
-                <label for="guestPhone">Phone <span class="optional">(optional)</span></label>
+                <label for="guestPhone">Phone <span id="guestPhoneRequired" style="color: #f48771; display: none;">*</span><span id="guestPhoneOptional" class="optional">(optional)</span></label>
                 <input type="tel" id="guestPhone" placeholder="555-123-4567" autocomplete="off">
             </div>
             <button id="joinBtn" onclick="joinQueue()">Join Queue</button>
@@ -2340,16 +2420,37 @@ QUEUE_HTML_CONTENT = r"""
 
         async function joinQueue() {
             const nameInput = document.getElementById('guestName');
+            const emailInput = document.getElementById('guestEmail');
             const phoneInput = document.getElementById('guestPhone');
             const name = nameInput.value.trim();
+            const email = emailInput?.value?.trim() || '';
             const phone = phoneInput.value.trim();
             const errorMsg = document.getElementById('errorMsg');
             const joinBtn = document.getElementById('joinBtn');
+            const leadGenEnabled = document.body.dataset.leadGen === 'true';
 
             if (!name) {
                 errorMsg.textContent = 'Please enter your name';
                 errorMsg.style.display = 'block';
                 nameInput.focus();
+                return;
+            }
+            if (leadGenEnabled && !email) {
+                errorMsg.textContent = 'Please enter your email address';
+                errorMsg.style.display = 'block';
+                emailInput.focus();
+                return;
+            }
+            if (leadGenEnabled && emailInput && !emailInput.checkValidity()) {
+                errorMsg.textContent = 'Please enter a valid email address';
+                errorMsg.style.display = 'block';
+                emailInput.focus();
+                return;
+            }
+            if (leadGenEnabled && !phone) {
+                errorMsg.textContent = 'Please enter your phone number';
+                errorMsg.style.display = 'block';
+                phoneInput.focus();
                 return;
             }
 
@@ -2361,7 +2462,7 @@ QUEUE_HTML_CONTENT = r"""
                 const response = await fetch('/api/queue/join', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ name: name, phone: phone })
+                    body: JSON.stringify({ name: name, email: email, phone: phone })
                 });
                 const data = await response.json();
 
@@ -2371,6 +2472,7 @@ QUEUE_HTML_CONTENT = r"""
 
                     // Clear form for next person
                     nameInput.value = '';
+                    if (emailInput) emailInput.value = '';
                     phoneInput.value = '';
 
                     // Hide success after 4 seconds and reset
@@ -2415,6 +2517,19 @@ QUEUE_HTML_CONTENT = r"""
             fetch('/get_settings')
                 .then(response => response.json())
                 .then(data => {
+                    const leadGenEnabled = Boolean(data.lead_gen_enabled || data.require_email);
+                    document.body.dataset.leadGen = leadGenEnabled ? 'true' : 'false';
+                    const emailGroup = document.getElementById('guestEmailGroup');
+                    const emailInput = document.getElementById('guestEmail');
+                    const phoneInput = document.getElementById('guestPhone');
+                    if (emailGroup) emailGroup.style.display = leadGenEnabled ? 'block' : 'none';
+                    if (emailInput) emailInput.required = leadGenEnabled;
+                    document.getElementById('guestPhoneRequired').style.display = leadGenEnabled ? 'inline' : 'none';
+                    document.getElementById('guestPhoneOptional').style.display = leadGenEnabled ? 'none' : 'inline';
+                    if (phoneInput) {
+                        phoneInput.required = leadGenEnabled;
+                        phoneInput.placeholder = leadGenEnabled ? 'Phone number required' : '555-123-4567';
+                    }
                     if (data.background_image) {
                         document.body.style.backgroundImage = 'url("/backgrounds/' + data.background_image + '")';
                     }
@@ -2707,12 +2822,33 @@ def get_driver():
 @app.route('/set_driver', methods=['POST'])
 def set_driver():
     try:
-        data = request.get_json()
-        driver_name = data.get('driver_name', '')
-        driver_email = data.get('driver_email', '')
-        driver_phone = data.get('driver_phone', '')
+        data = request.get_json() or {}
+        driver_name = str(data.get('driver_name') or '').strip()
+        driver_email = str(data.get('driver_email') or '').strip()
+        driver_phone = str(data.get('driver_phone') or '').strip()
+
+        if not driver_name:
+            return jsonify({'success': False, 'error': 'driver_name is required'}), 400
+
+        if is_lead_gen_enabled():
+            if not driver_email:
+                return jsonify({'success': False, 'error': 'email is required when Lead Gen is enabled'}), 400
+            if not is_valid_email_address(driver_email):
+                return jsonify({'success': False, 'error': 'valid email is required when Lead Gen is enabled'}), 400
+
+            formatted_phone = format_phone_e164(driver_phone)
+            if not formatted_phone:
+                return jsonify({'success': False, 'error': 'valid phone is required when Lead Gen is enabled'}), 400
+            driver_phone = formatted_phone
+        elif driver_phone:
+            driver_phone = format_phone_e164(driver_phone) or driver_phone
         
         if main_window:
+            # Store contact fields before changing the driver so session-start
+            # notifications and partner events carry the right data.
+            main_window.last_driver_email = driver_email or ""
+            main_window.last_driver_phone = driver_phone or ""
+
             # Emit signal to UI thread to update driver and start video
             try:
                 if ui_bridge:
@@ -2722,10 +2858,6 @@ def set_driver():
                     main_window.update_driver_name(driver_name)
             except Exception:
                 main_window.update_driver_name(driver_name)
-            # Store contact fields for the active session. Empty values clear
-            # previous-driver data so old contact info is not reused.
-            main_window.last_driver_email = driver_email or ""
-            main_window.last_driver_phone = driver_phone or ""
             return jsonify({'success': True, 'driver_name': driver_name})
     except Exception as e:
         print(f"Error setting driver: {str(e)}")
@@ -2735,7 +2867,9 @@ def set_driver():
 def get_settings():
     if not main_window:
         return jsonify({
+            'lead_gen_enabled': False,
             'require_email': False,
+            'require_phone': False,
             'background_image': None,
             'timer_active': False,
             'timer_seconds_left': 0,
@@ -2748,8 +2882,8 @@ def get_settings():
             }
         })
     
-    # Get email requirement
-    require_email = main_window.email_field_enabled.isChecked()
+    # Lead Gen requires both email and phone before a driver can continue.
+    lead_gen_enabled = is_lead_gen_enabled()
     
     # Get background image
     background_image = os.path.basename(main_window.background_image_path.text()) if main_window.background_image_path.text() else None
@@ -2776,7 +2910,9 @@ def get_settings():
     }
     
     return jsonify({
-        'require_email': require_email,
+        'lead_gen_enabled': lead_gen_enabled,
+        'require_email': lead_gen_enabled,
+        'require_phone': lead_gen_enabled,
         'background_image': background_image,
         'timer_active': timer_active,
         'timer_seconds_left': timer_seconds_left,
@@ -2852,9 +2988,29 @@ def proxy_queue_join():
 
     try:
         data = request.get_json() or {}
-        name = data.get('name', 'Unknown')
-        phone = data.get('phone', '')
-        print(f"[Queue] Processing join: name='{name}', phone='{phone or 'none'}'")
+        name = str(data.get('name') or '').strip()
+        email = str(data.get('email') or '').strip()
+        phone = str(data.get('phone') or '').strip()
+        print(f"[Queue] Processing join: name='{name}', email='{email or 'none'}', phone='{phone or 'none'}'")
+
+        if not name:
+            return jsonify({'success': False, 'error': 'Name is required'}), 400
+
+        if is_lead_gen_enabled():
+            if not email:
+                return jsonify({'success': False, 'error': 'Email is required'}), 400
+            if not is_valid_email_address(email):
+                return jsonify({'success': False, 'error': 'Valid email is required'}), 400
+            formatted_phone = format_phone_e164(phone)
+            if not formatted_phone:
+                return jsonify({'success': False, 'error': 'Valid phone is required'}), 400
+            phone = formatted_phone
+        elif phone:
+            phone = format_phone_e164(phone) or phone
+
+        data['name'] = name
+        data['email'] = email
+        data['phone'] = phone
 
         response = requests.post(
             f"{receiver_url}/api/queue/join",
@@ -3017,17 +3173,30 @@ def start_remote_session():
     global main_window, ui_bridge
     try:
         data = request.get_json() or {}
-        driver_name = data.get('driver_name', '').strip()
+        driver_name = str(data.get('driver_name') or '').strip()
         queue_id = data.get('queue_id', '')
-        driver_phone = data.get('driver_phone', '')
+        driver_email = str(data.get('driver_email') or '').strip()
+        driver_phone = str(data.get('driver_phone') or '').strip()
 
         if not driver_name:
             return jsonify({'success': False, 'error': 'driver_name is required'}), 400
 
+        if is_lead_gen_enabled():
+            if not driver_email:
+                return jsonify({'success': False, 'error': 'driver_email is required when Lead Gen is enabled'}), 400
+            if not is_valid_email_address(driver_email):
+                return jsonify({'success': False, 'error': 'valid driver_email is required when Lead Gen is enabled'}), 400
+            formatted_phone = format_phone_e164(driver_phone)
+            if not formatted_phone:
+                return jsonify({'success': False, 'error': 'valid driver_phone is required when Lead Gen is enabled'}), 400
+            driver_phone = formatted_phone
+        elif driver_phone:
+            driver_phone = format_phone_e164(driver_phone) or driver_phone
+
         if main_window:
             # Store queue ID for session tracking
             main_window.assigned_queue_id = queue_id
-            main_window.last_driver_email = ""
+            main_window.last_driver_email = driver_email or ""
             main_window.last_driver_phone = driver_phone or ""
 
             # Use signal to update driver on UI thread (triggers session start)
@@ -5695,8 +5864,8 @@ class LapTimeSenderWindow(QMainWindow):
         """)
         grid_layout.addWidget(self.driver_name, 0, 1, 1, 3)
         
-        # Row 1: Email toggle (compact)
-        email_label = QLabel("Email Required:")
+        # Row 1: Lead Gen toggle (compact)
+        email_label = QLabel("Lead Gen:")
         email_label.setMinimumWidth(80)
         email_label.setMaximumWidth(100)
         email_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
@@ -5708,10 +5877,10 @@ class LapTimeSenderWindow(QMainWindow):
                 font-family: 'Segoe UI', 'Arial', sans-serif;
             }
         """)
-        email_label.setToolTip("Require drivers to enter email addresses")
+        email_label.setToolTip("Require drivers to enter email and phone before racing")
         grid_layout.addWidget(email_label, 1, 0)
         
-        self.email_field_enabled = QPushButton("☐ Optional")
+        self.email_field_enabled = QPushButton("Off")
         self.email_field_enabled.setCheckable(True)
         self.email_field_enabled.setChecked(False)
         self.email_field_enabled.setMinimumWidth(70)
@@ -5737,8 +5906,8 @@ class LapTimeSenderWindow(QMainWindow):
                 border: 1px solid #007acc;
             }
         """)
-        self.email_field_enabled.toggled.connect(lambda checked: self.email_field_enabled.setText("⊠ Required" if checked else "☐ Optional"))
-        self.email_field_enabled.setText("☐ Optional")
+        self.email_field_enabled.toggled.connect(lambda checked: self.email_field_enabled.setText("On" if checked else "Off"))
+        self.email_field_enabled.setText("Off")
         grid_layout.addWidget(self.email_field_enabled, 1, 1)
         
         # Hidden timer widgets for backwards compatibility
@@ -6397,13 +6566,15 @@ class LapTimeSenderWindow(QMainWindow):
                 self.show_error(f"Invalid lap time: {lap_time:.3f}s. Must be between 5s and 60 minutes.")
                 return False
                 
-            # Check if email is required but not provided (SKIP FOR MANUAL ENTRIES)
-            # Manual entries don't have email associated, so we allow them through
-            email_required = self.email_field_enabled.isChecked() if hasattr(self, 'email_field_enabled') else False
-            print(f"Email required: {email_required}, Has email: {hasattr(self, 'last_driver_email') and self.last_driver_email}")
-            if email_required and from_game and (not hasattr(self, 'last_driver_email') or not self.last_driver_email):
-                print("FAILED: Email required but not provided (from_game=True)")
-                self.show_error("Email is required but not provided. Please set driver email via the web interface.")
+            # Lead Gen contact data is required for telemetry laps. Manual entries
+            # can still be used by staff for corrections without a sign-in record.
+            lead_gen_enabled = self.email_field_enabled.isChecked() if hasattr(self, 'email_field_enabled') else False
+            has_email = bool(getattr(self, 'last_driver_email', ''))
+            has_phone = bool(getattr(self, 'last_driver_phone', ''))
+            print(f"Lead Gen required: {lead_gen_enabled}, Has email: {has_email}, Has phone: {has_phone}")
+            if lead_gen_enabled and from_game and (not has_email or not has_phone):
+                print("FAILED: Lead Gen contact info required but not provided (from_game=True)")
+                self.show_error("Lead Gen requires email and phone. Please register via the web interface.")
                 return False
 
             # Prepare data with strict type conversion
@@ -7208,10 +7379,10 @@ class LapTimeSenderWindow(QMainWindow):
             self.show_success("Waiting screen media selected")
             
     def on_update_driver_settings(self):
-        """Update driver-related settings (timer, email field, background)"""
-        # Process email field setting
-        email_required = self.email_field_enabled.isChecked()
-        print(f"Email requirement updated: {'Enabled' if email_required else 'Disabled'}")
+        """Update driver-related settings (timer, lead-gen fields, background)"""
+        # Process Lead Gen setting
+        lead_gen_enabled = self.email_field_enabled.isChecked()
+        print(f"Lead Gen updated: {'Enabled' if lead_gen_enabled else 'Disabled'}")
         
         # Process rotation mode first, and drive timer/laps from it
         timer_enabled = False
@@ -7277,8 +7448,8 @@ class LapTimeSenderWindow(QMainWindow):
         # Show confirmation message based on what was updated
         message = "📱 iPad interface settings updated successfully"
         details = []
-        if email_required:
-            details.append("Email required")
+        if lead_gen_enabled:
+            details.append("Lead Gen required")
         if timer_enabled:
             details.append(f"Timer: {timer_minutes}min")
         if self.background_image_path.text():
