@@ -1,17 +1,19 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 from PyInstaller.utils.hooks import collect_all
+import PyQt6.sip
 
 qrcode_datas, qrcode_binaries, qrcode_hiddenimports = collect_all('qrcode')
+sip_binary = PyQt6.sip.__file__
 
 a = Analysis(
     ['lap_time_sender.py'],
     pathex=[],
     binaries=[
-        (r"C:\Users\Lawrence Thomas\AppData\Local\Programs\Python\Python311\Lib\site-packages\PyQt6\sip.cp311-win_amd64.pyd", "PyQt6")
+        (sip_binary, "PyQt6")
     ] + qrcode_binaries,
     datas=[('resources', 'resources')] + qrcode_datas,
-    hiddenimports=['sip'] + qrcode_hiddenimports,
+    hiddenimports=qrcode_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
