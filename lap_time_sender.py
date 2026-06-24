@@ -13,7 +13,7 @@ import uuid
 from pathlib import Path
 from datetime import datetime
 from abc import ABC, abstractmethod
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, send_from_directory, g
 from flask_cors import CORS
 from zeroconf import ServiceInfo, Zeroconf
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
@@ -26,8 +26,6 @@ from PyQt6.QtMultimediaWidgets import QVideoWidget
 import qrcode
 from io import BytesIO
 import os
-
-DEFAULT_BRANDED_BACKGROUND = 'iPad Events Background (Sim Coaches Branded).png'
 
 def get_runtime_base_path():
     """Return the bundled app base path when frozen, otherwise the source folder."""
@@ -67,9 +65,8 @@ def find_resource_file(filename):
     return None, safe_name
 
 def get_default_web_background():
-    """Return the bundled branded iPad background filename when available."""
-    directory, safe_name = find_resource_file(DEFAULT_BRANDED_BACKGROUND)
-    return safe_name if directory else None
+    """Return no default image so mobile pages use a plain black backdrop."""
+    return None
 
 def format_time_ms(milliseconds):
     """Format milliseconds into a readable time string (mm:ss.xxx)"""
@@ -138,7 +135,26 @@ def is_valid_racing_context(graphics_data, physics_data=None, context=""):
         
         # For iRacing, we could add similar checks here in the future
         # when we have access to pit/session status from iRacing SDK
-        
+
+        # For EA Sports F1
+        elif context == "EA Sports F1" and graphics_data:
+            # Reject if car is in pit lane or pit box
+            if hasattr(graphics_data, 'm_pitStatus') and graphics_data.m_pitStatus != 0:
+                print(f"WARNING: Skipping lap - car is in pit (pitStatus: {graphics_data.m_pitStatus})")
+                return False
+
+            # Reject if lap was invalidated (corner cut, etc.)
+            if hasattr(graphics_data, 'm_currentLapInvalid') and graphics_data.m_currentLapInvalid != 0:
+                print(f"WARNING: Skipping lap - lap invalidated (corner cut)")
+                return False
+
+            # Only accept flying lap (1) or on-track (4) driver status
+            if hasattr(graphics_data, 'm_driverStatus'):
+                valid_statuses = (1, 4)  # 1=flying lap, 4=on track
+                if graphics_data.m_driverStatus not in valid_statuses:
+                    print(f"WARNING: Skipping lap - invalid driver status ({graphics_data.m_driverStatus})")
+                    return False
+
         return True
         
     except Exception as e:
@@ -192,6 +208,7 @@ def configure_firewall():
     rules = [
         ("Lap Time Sender - Web Interface", "TCP", "5001"),
         ("Lap Time Sender - Discovery", "UDP", "5003"),
+        ("Lap Time Sender - F1 Telemetry", "UDP", "20777"),
     ]
     
     for rule_name, protocol, port in rules:
@@ -216,6 +233,21 @@ def configure_firewall():
                 print(f"[OK] Firewall rule already exists for port {port} ({protocol})")
         except Exception as e:
             print(f"WARNING: Could not configure firewall for port {port}: {e}")
+
+def get_resources_dir():
+    """Get the absolute path to the bundled 'resources' directory.
+
+    When frozen by PyInstaller the resources are extracted into sys._MEIPASS
+    (the app's _internal folder). When running from source they live next to
+    this script. Relative paths fail on installed PCs because the working
+    directory is not the app folder, which is why the mobile logo only showed
+    up when running from source.
+    """
+    if getattr(sys, 'frozen', False):
+        base_path = sys._MEIPASS
+    else:
+        base_path = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base_path, 'resources')
 
 def get_config_path():
     """Get the path to the simulators config file."""
@@ -249,6 +281,41 @@ def save_known_simulators(simulators):
         return True
     except Exception as e:
         print(f"WARNING: Could not save simulators config: {e}")
+        return False
+
+def get_settings_path():
+    """Get the path to the application settings file."""
+    if getattr(sys, 'frozen', False):
+        # Running as compiled executable
+        base_path = Path(sys.executable).parent
+    else:
+        # Running from script
+        base_path = Path(__file__).parent
+    return base_path / 'settings.json'
+
+def load_app_settings():
+    """Load application settings from file."""
+    settings_path = get_settings_path()
+    if settings_path.exists():
+        try:
+            with open(settings_path, 'r') as f:
+                settings = json.load(f)
+                print(f"[Settings] Loaded from {settings_path}")
+                return settings
+        except Exception as e:
+            print(f"WARNING: Could not load settings: {e}")
+    return {}
+
+def save_app_settings(settings):
+    """Save application settings to file."""
+    settings_path = get_settings_path()
+    try:
+        with open(settings_path, 'w') as f:
+            json.dump(settings, f, indent=2)
+        print(f"[Settings] Saved to {settings_path}")
+        return True
+    except Exception as e:
+        print(f"WARNING: Could not save settings: {e}")
         return False
 
 def add_known_simulator(ip, name=None):
@@ -510,6 +577,51 @@ def send_sms_twilio(phone_number, message):
 
 notified_queue_ids = set()  # Track who's been texted
 
+# ============================================
+# ASYNC SMS QUEUE SYSTEM
+# Sends SMS in background to avoid blocking request handlers
+# ============================================
+import queue as queue_module
+
+sms_send_queue = queue_module.Queue()
+_sms_worker_started = False
+
+def sms_background_worker():
+    """Background worker that processes SMS queue - never blocks request handlers"""
+    print("[SMS] Background worker started")
+    while True:
+        try:
+            task = sms_send_queue.get()
+            if task is None:
+                break  # Shutdown signal
+            phone, message, task_type = task
+            try:
+                if sms_config.get("provider") == "twilio":
+                    send_sms_twilio(phone, message)
+                else:
+                    send_sms_textbelt(phone, message)
+                print(f"[SMS Background] {task_type} sent to {phone}")
+            except Exception as e:
+                print(f"[SMS Background] Error sending {task_type}: {e}")
+            sms_send_queue.task_done()
+        except Exception as e:
+            print(f"[SMS Background] Worker error: {e}")
+
+def start_sms_worker():
+    """Start the SMS background worker thread (idempotent)"""
+    global _sms_worker_started
+    if not _sms_worker_started:
+        _sms_worker_started = True
+        sms_thread = threading.Thread(target=sms_background_worker, daemon=True)
+        sms_thread.start()
+        print("[SMS] Background worker thread started")
+
+def queue_sms_async(phone, message, task_type="notification"):
+    """Queue an SMS for background sending - returns immediately"""
+    start_sms_worker()  # Ensure worker is running
+    sms_send_queue.put((phone, message, task_type))
+    print(f"[SMS] Queued {task_type} for {phone} (queue size: {sms_send_queue.qsize()})")
+
 def send_headsup_notification(phone_number, name, wait_minutes):
     """Send proactive heads-up SMS when guest's turn is approaching"""
     if not sms_config.get("enabled"):
@@ -677,6 +789,243 @@ log = logging.getLogger('werkzeug')
 log.disabled = True
 CORS(app)  # Enable CORS for all routes
 
+# ============================================
+# ENTERPRISE-GRADE INSTRUMENTATION
+# Correlation IDs and timing for request tracing
+# ============================================
+import uuid
+from functools import wraps
+
+# Slow request threshold (milliseconds)
+SLOW_REQUEST_THRESHOLD_MS = 2000
+
+# Track slow requests for visibility
+slow_request_count = 0
+last_slow_request_time = None
+last_slow_request_path = None
+
+@app.before_request
+def before_request_timing():
+    """Add correlation ID and start timing for every request"""
+    from flask import g
+    g.request_start_time = time.time()
+    g.correlation_id = request.headers.get('X-Correlation-ID') or str(uuid.uuid4())[:8]
+
+@app.after_request
+def after_request_timing(response):
+    """Log timing and detect slow requests"""
+    global slow_request_count, last_slow_request_time, last_slow_request_path
+    from flask import g
+
+    if hasattr(g, 'request_start_time'):
+        duration_ms = (time.time() - g.request_start_time) * 1000
+        correlation_id = getattr(g, 'correlation_id', 'unknown')
+
+        # Add correlation ID to response headers
+        response.headers['X-Correlation-ID'] = correlation_id
+        response.headers['X-Response-Time-Ms'] = str(int(duration_ms))
+
+        # Log slow requests prominently
+        if duration_ms > SLOW_REQUEST_THRESHOLD_MS:
+            slow_request_count += 1
+            last_slow_request_time = datetime.now()
+            last_slow_request_path = request.path
+
+            print(f"\n{'='*60}")
+            print(f"⚠️  SLOW REQUEST DETECTED [{correlation_id}]")
+            print(f"Time: {datetime.now().strftime('%H:%M:%S')}")
+            print(f"Path: {request.path}")
+            print(f"Method: {request.method}")
+            print(f"Duration: {duration_ms:.0f}ms (threshold: {SLOW_REQUEST_THRESHOLD_MS}ms)")
+            print(f"Client: {request.remote_addr}")
+            print(f"Total slow requests this session: {slow_request_count}")
+            print(f"{'='*60}\n")
+
+    return response
+
+# ============================================
+# CONNECTION RELIABILITY
+# Connection pooling, heartbeat, and circuit breaker
+# ============================================
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+# Create a session with connection pooling and auto-retry
+receiver_session = requests.Session()
+retry_strategy = Retry(
+    total=2,  # Max 2 retries
+    backoff_factor=0.5,  # Wait 0.5s, then 1s between retries
+    status_forcelist=[500, 502, 503, 504],  # Retry on server errors
+)
+adapter = HTTPAdapter(
+    max_retries=retry_strategy,
+    pool_connections=10,
+    pool_maxsize=10
+)
+receiver_session.mount('http://', adapter)
+receiver_session.mount('https://', adapter)
+
+class CircuitBreaker:
+    """
+    Circuit breaker pattern for automatic failure recovery.
+
+    When the receiver fails multiple times in a row, stop trying for a while
+    to avoid overwhelming it and to allow recovery.
+
+    States:
+    - CLOSED: Normal operation, requests go through
+    - OPEN: Too many failures, requests are blocked
+    - HALF_OPEN: Testing if service recovered
+    """
+
+    def __init__(self, failure_threshold=3, recovery_time=30):
+        self.failure_threshold = failure_threshold
+        self.recovery_time = recovery_time
+        self.failures = 0
+        self.last_failure_time = 0
+        self.state = 'closed'
+        self._lock = threading.Lock()
+
+    def is_open(self):
+        """Check if circuit is open (blocking requests)"""
+        with self._lock:
+            if self.state == 'closed':
+                return False
+
+            # Check if recovery time has passed
+            if time.time() - self.last_failure_time > self.recovery_time:
+                self.state = 'half_open'
+                return False
+
+            return True
+
+    def record_failure(self):
+        """Record a failure"""
+        with self._lock:
+            self.failures += 1
+            self.last_failure_time = time.time()
+
+            if self.failures >= self.failure_threshold:
+                self.state = 'open'
+                print(f"\n{'='*60}")
+                print(f"⚠️  CIRCUIT BREAKER OPEN")
+                print(f"Receiver failed {self.failures} times in a row")
+                print(f"Blocking requests for {self.recovery_time}s")
+                print(f"{'='*60}\n")
+
+    def record_success(self):
+        """Record a success"""
+        with self._lock:
+            if self.state == 'half_open':
+                print("[Circuit Breaker] Service recovered, closing circuit")
+            self.failures = 0
+            self.state = 'closed'
+
+    def get_status(self):
+        """Get current status for diagnostics"""
+        return {
+            'state': self.state,
+            'failures': self.failures,
+            'last_failure': self.last_failure_time,
+            'recovery_time': self.recovery_time
+        }
+
+# Global circuit breaker instance
+receiver_circuit = CircuitBreaker(failure_threshold=3, recovery_time=30)
+
+# Heartbeat tracking
+_heartbeat_latency = None
+_heartbeat_last_success = None
+_heartbeat_thread_started = False
+
+def heartbeat_thread():
+    """Background thread that monitors receiver connectivity"""
+    global _heartbeat_latency, _heartbeat_last_success
+
+    print("[Heartbeat] Background monitor started")
+
+    while True:
+        try:
+            receiver_url = get_receiver_base_url()
+            if receiver_url:
+                start = time.time()
+                try:
+                    resp = receiver_session.get(f"{receiver_url}/health", timeout=2)
+                    latency = (time.time() - start) * 1000
+
+                    if resp.status_code == 200:
+                        _heartbeat_latency = latency
+                        _heartbeat_last_success = time.time()
+                        receiver_circuit.record_success()
+
+                        if latency > 500:
+                            print(f"[Heartbeat] ⚠️ High latency: {latency:.0f}ms")
+                    else:
+                        print(f"[Heartbeat] ❌ Receiver returned {resp.status_code}")
+                        receiver_circuit.record_failure()
+                except requests.Timeout:
+                    print(f"[Heartbeat] ❌ Timeout after 2s")
+                    receiver_circuit.record_failure()
+                except requests.ConnectionError as e:
+                    print(f"[Heartbeat] ❌ Connection error: {e}")
+                    receiver_circuit.record_failure()
+        except Exception as e:
+            print(f"[Heartbeat] Error: {e}")
+
+        time.sleep(10)  # Check every 10 seconds
+
+def start_heartbeat_thread():
+    """Start the heartbeat thread if not already running"""
+    global _heartbeat_thread_started
+    if not _heartbeat_thread_started:
+        _heartbeat_thread_started = True
+        thread = threading.Thread(target=heartbeat_thread, daemon=True)
+        thread.start()
+
+def forward_to_receiver(path, data=None, method='POST', timeout=3):
+    """
+    Forward a request to the receiver with circuit breaker protection.
+
+    Features:
+    - Uses connection pooling (keep-alive)
+    - Automatic retry on transient failures
+    - Circuit breaker to prevent cascading failures
+    - Reduced timeout (3s instead of 5s)
+    """
+    receiver_url = get_receiver_base_url()
+    if not receiver_url:
+        return None, "Receiver not connected"
+
+    # Check circuit breaker
+    if receiver_circuit.is_open():
+        return None, "Circuit breaker open - receiver unavailable"
+
+    url = f"{receiver_url}{path}"
+
+    try:
+        if method == 'POST':
+            response = receiver_session.post(
+                url,
+                json=data,
+                headers={'Content-Type': 'application/json'},
+                timeout=timeout
+            )
+        else:
+            response = receiver_session.get(url, timeout=timeout)
+
+        receiver_circuit.record_success()
+        return response, None
+
+    except requests.Timeout:
+        receiver_circuit.record_failure()
+        return None, f"Timeout after {timeout}s"
+    except requests.ConnectionError as e:
+        receiver_circuit.record_failure()
+        return None, f"Connection error: {e}"
+    except Exception as e:
+        receiver_circuit.record_failure()
+        return None, f"Error: {e}"
+
 # Simple kiosk HTML page - driver registration only (no admin features)
 HTML_CONTENT = r"""
 <!DOCTYPE html>
@@ -691,7 +1040,7 @@ HTML_CONTENT = r"""
         html, body {
             width: 100%; height: 100vh; overflow: hidden;
             position: fixed; top: 0; left: 0;
-            background-color: #1e1e1e;
+            background-color: #000000;
         }
         body {
             font-family: 'Segoe UI', Arial, sans-serif;
@@ -759,9 +1108,21 @@ HTML_CONTENT = r"""
         }
         .timer-alert { animation: flash 1s infinite; }
         @keyframes flash { 0%, 100% { background-color: #252526; } 50% { background-color: rgba(244, 135, 113, 0.4); } }
+        /* Connection status indicator */
+        #connectionStatus {
+            position: fixed; top: 10px; right: 10px; padding: 6px 12px;
+            border-radius: 20px; font-size: 12px; font-weight: bold;
+            background-color: #2d2d30; border: 1px solid #3e3e42;
+            z-index: 1000; transition: all 0.3s ease;
+        }
+        #connectionStatus.connected { color: #4ec9b0; border-color: #4ec9b0; }
+        #connectionStatus.connecting { color: #ce9178; border-color: #ce9178; animation: pulse 1.5s infinite; }
+        #connectionStatus.disconnected { color: #f48771; border-color: #f48771; }
+        button:disabled { background-color: #555; cursor: not-allowed; opacity: 0.7; }
     </style>
 </head>
 <body>
+    <div id="connectionStatus" class="connecting">🔄 Connecting...</div>
     <div class="container" id="container">
         <h1>🏁 Driver Registration</h1>
         <p style="text-align: center; color: #9d9d9d; margin-bottom: 20px; font-style: italic;">
@@ -804,7 +1165,101 @@ HTML_CONTENT = r"""
     </div>
 
     <script>
-        function updateDriver() {
+        // Connection state management
+        let isConnected = false;
+        let connectionAttempts = 0;
+        let pollInterval = 1000;
+        const maxPollInterval = 10000;
+        let pendingSubmission = null;
+
+        // Enterprise-grade submission with timeout and retry
+        const REQUEST_TIMEOUT_MS = 5000;  // 5 second timeout per attempt
+        const MAX_RETRIES = 3;
+
+        async function submitWithRetry(url, options, maxRetries = MAX_RETRIES) {
+            for (let attempt = 1; attempt <= maxRetries; attempt++) {
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
+                try {
+                    const startTime = Date.now();
+                    const response = await fetch(url, {
+                        ...options,
+                        signal: controller.signal
+                    });
+                    clearTimeout(timeoutId);
+
+                    const duration = Date.now() - startTime;
+                    if (duration > 3000) {
+                        console.warn('⚠️ Slow response: ' + duration + 'ms');
+                    }
+
+                    return await response.json();
+                } catch (e) {
+                    clearTimeout(timeoutId);
+
+                    if (e.name === 'AbortError') {
+                        console.log('Request timeout on attempt ' + attempt + '/' + maxRetries);
+                    } else {
+                        console.log('Request failed on attempt ' + attempt + '/' + maxRetries + ': ' + e.message);
+                    }
+
+                    if (attempt === maxRetries) {
+                        throw new Error('Request failed after ' + maxRetries + ' attempts');
+                    }
+
+                    // Wait before retry (exponential backoff)
+                    await new Promise(r => setTimeout(r, 1000 * attempt));
+                }
+            }
+        }
+
+        function updateConnectionStatus(connected, message) {
+            const indicator = document.getElementById('connectionStatus');
+            const submitBtn = document.querySelector('button');
+            isConnected = connected;
+
+            if (connected) {
+                indicator.textContent = '🟢 Connected';
+                indicator.className = 'connected';
+                submitBtn.disabled = false;
+                submitBtn.textContent = '🏁 Register as Active Driver';
+            } else {
+                indicator.textContent = message || '🔴 Reconnecting...';
+                indicator.className = message ? 'connecting' : 'disconnected';
+                submitBtn.disabled = true;
+                submitBtn.textContent = 'Waiting for server...';
+            }
+        }
+
+        async function waitForServer() {
+            const maxAttempts = 60;  // Up to 2 minutes of trying
+            updateConnectionStatus(false, '🔄 Connecting...');
+
+            while (connectionAttempts < maxAttempts) {
+                connectionAttempts++;
+                try {
+                    const response = await fetch('/health', {
+                        method: 'GET',
+                        signal: AbortSignal.timeout ? AbortSignal.timeout(3000) : undefined
+                    });
+                    if (response.ok) {
+                        updateConnectionStatus(true);
+                        connectionAttempts = 0;
+                        pollInterval = 1000;
+                        return true;
+                    }
+                } catch (e) {
+                    console.log('Connection attempt ' + connectionAttempts + ' failed, retrying...');
+                }
+                updateConnectionStatus(false, '🔄 Connecting... (' + connectionAttempts + ')');
+                await new Promise(r => setTimeout(r, 2000));
+            }
+            updateConnectionStatus(false, '🔴 Server unavailable');
+            return false;
+        }
+
+        async function updateDriver() {
             const driverName = document.getElementById('driverName').value.trim();
             const driverEmail = document.getElementById('driverEmail')?.value?.trim() || '';
             const driverPhone = document.getElementById('driverPhone')?.value?.trim() || '';
@@ -838,29 +1293,56 @@ HTML_CONTENT = r"""
                 return;
             }
 
-            fetch('/set_driver', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ driver_name: driverName, driver_email: driverEmail, driver_phone: driverPhone })
-            })
-            .then(response => response.json())
-            .then(data => {
+            // Check connection first
+            if (!isConnected) {
+                statusDiv.textContent = '⏳ Waiting for server connection...';
+                statusDiv.className = 'status error';
+                statusDiv.style.display = 'block';
+                pendingSubmission = { driver_name: driverName, driver_email: driverEmail, driver_phone: driverPhone };
+                return;
+            }
+
+            try {
+                // Submit with timeout and retry for reliability
+                const data = await submitWithRetry('/set_driver', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ driver_name: driverName, driver_email: driverEmail, driver_phone: driverPhone })
+                }, 3);
+
                 if (data.success) {
                     statusDiv.textContent = '✅ Registered as ' + driverName + '!';
                     statusDiv.className = 'status success';
                     document.getElementById('currentDriverName').textContent = driverName;
                     document.getElementById('currentDriverBox').style.display = 'flex';
+                    pendingSubmission = null;
                 } else {
-                    statusDiv.textContent = '❌ Failed to register';
+                    statusDiv.textContent = data.error ? '❌ ' + data.error : '❌ Failed to register';
                     statusDiv.className = 'status error';
                 }
                 statusDiv.style.display = 'block';
-            })
-            .catch(error => {
-                statusDiv.textContent = '❌ Connection error';
+            } catch (error) {
+                statusDiv.textContent = '⏳ Queued - will retry when connected...';
                 statusDiv.className = 'status error';
                 statusDiv.style.display = 'block';
-            });
+                pendingSubmission = { driver_name: driverName, driver_email: driverEmail, driver_phone: driverPhone };
+                updateConnectionStatus(false);
+            }
+        }
+
+        // Auto-retry pending submissions when connection restored
+        async function retryPendingSubmission() {
+            if (pendingSubmission && isConnected) {
+                console.log('Retrying pending submission...');
+                document.getElementById('driverName').value = pendingSubmission.driver_name;
+                if (pendingSubmission.driver_email) {
+                    document.getElementById('driverEmail').value = pendingSubmission.driver_email;
+                }
+                if (pendingSubmission.driver_phone) {
+                    document.getElementById('driverPhone').value = pendingSubmission.driver_phone;
+                }
+                await updateDriver();
+            }
         }
 
         function clearTimerClasses() {
@@ -868,10 +1350,23 @@ HTML_CONTENT = r"""
             el.classList.remove('timer-active', 'timer-warning', 'timer-expired', 'laps-active', 'laps-outlap');
         }
 
+        let consecutiveErrors = 0;
+
         function checkTimerAndSettings() {
             fetch('/get_settings')
-                .then(response => response.json())
+                .then(response => {
+                    if (!response.ok) throw new Error('Server error');
+                    return response.json();
+                })
                 .then(data => {
+                    // Connection restored - reset backoff
+                    consecutiveErrors = 0;
+                    pollInterval = 1000;
+                    if (!isConnected) {
+                        updateConnectionStatus(true);
+                        retryPendingSubmission();
+                    }
+
                     // Lead Gen contact fields
                     const leadGenEnabled = Boolean(data.lead_gen_enabled || data.require_email);
                     document.getElementById('emailGroup').style.display = leadGenEnabled ? 'block' : 'none';
@@ -893,6 +1388,8 @@ HTML_CONTENT = r"""
                     // Background
                     if (data.background_image) {
                         document.body.style.backgroundImage = 'url("/backgrounds/' + data.background_image + '")';
+                    } else {
+                        document.body.style.backgroundImage = 'none';
                     }
                     // Timer/Laps display
                     const timerStatus = document.getElementById('timerStatus');
@@ -943,23 +1440,46 @@ HTML_CONTENT = r"""
                         container.classList.remove('timer-alert');
                     }
                 })
-                .catch(error => console.error('Error:', error));
+                .catch(error => {
+                    consecutiveErrors++;
+                    // Exponential backoff: 1s, 2s, 4s, 8s, max 10s
+                    pollInterval = Math.min(1000 * Math.pow(2, consecutiveErrors), maxPollInterval);
+                    console.log('Poll error, backing off to ' + pollInterval + 'ms');
+                    if (consecutiveErrors >= 3) {
+                        updateConnectionStatus(false);
+                    }
+                })
+                .finally(() => {
+                    setTimeout(checkTimerAndSettings, pollInterval);
+                });
         }
 
-        // Load current driver
-        fetch('/get_driver')
-            .then(response => response.json())
-            .then(data => {
-                if (data.driver_name) {
-                    document.getElementById('driverName').value = data.driver_name;
-                    document.getElementById('currentDriverName').textContent = data.driver_name;
-                    document.getElementById('currentDriverBox').style.display = 'flex';
-                }
-            })
-            .catch(error => console.error('Error:', error));
+        // Initialize on page load
+        async function initializePage() {
+            // Wait for server to be ready (handles cold start)
+            const connected = await waitForServer();
 
-        checkTimerAndSettings();
-        setInterval(checkTimerAndSettings, 1000);
+            if (connected) {
+                // Load current driver
+                try {
+                    const response = await fetch('/get_driver');
+                    const data = await response.json();
+                    if (data.driver_name) {
+                        document.getElementById('driverName').value = data.driver_name;
+                        document.getElementById('currentDriverName').textContent = data.driver_name;
+                        document.getElementById('currentDriverBox').style.display = 'flex';
+                    }
+                } catch (error) {
+                    console.error('Error loading driver:', error);
+                }
+            }
+
+            // Start polling (uses setTimeout with exponential backoff internally)
+            checkTimerAndSettings();
+        }
+
+        // Start initialization
+        initializePage();
     </script>
 </body>
 </html>
@@ -2288,7 +2808,7 @@ QUEUE_HTML_CONTENT = r"""
         html, body {
             width: 100%; height: 100vh; overflow: hidden;
             position: fixed; top: 0; left: 0;
-            background-color: #1e1e1e;
+            background-color: #000000;
         }
         body {
             font-family: 'Segoe UI', Arial, sans-serif;
@@ -2576,6 +3096,8 @@ QUEUE_HTML_CONTENT = r"""
                     }
                     if (data.background_image) {
                         document.body.style.backgroundImage = 'url("/backgrounds/' + data.background_image + '")';
+                    } else {
+                        document.body.style.backgroundImage = 'none';
                     }
                 })
                 .catch(e => console.error('Error loading settings:', e));
@@ -2733,9 +3255,53 @@ QUEUE_DISPLAY_HTML_CONTENT = r"""
             color: #6e6e6e;
             font-size: 18px;
         }
+
+        /* Connection status indicator */
+        .connection-status {
+            position: fixed;
+            top: 10px;
+            right: 10px;
+            padding: 8px 16px;
+            border-radius: 20px;
+            font-size: 14px;
+            font-weight: 500;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            z-index: 1000;
+        }
+        .connection-status.connected {
+            background: rgba(78, 201, 176, 0.2);
+            color: #4ec9b0;
+        }
+        .connection-status.slow {
+            background: rgba(255, 193, 7, 0.2);
+            color: #ffc107;
+        }
+        .connection-status.disconnected {
+            background: rgba(220, 53, 69, 0.2);
+            color: #dc3545;
+            animation: pulse-warning 1s ease-in-out infinite;
+        }
+        @keyframes pulse-warning {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: currentColor;
+        }
     </style>
 </head>
 <body>
+    <!-- Connection status indicator -->
+    <div class="connection-status connected" id="connectionStatus">
+        <span class="status-dot"></span>
+        <span id="statusText">Connected</span>
+    </div>
+
     <div class="container">
         <div class="header">
             <h1>Sim Racing Queue</h1>
@@ -2760,11 +3326,67 @@ QUEUE_DISPLAY_HTML_CONTENT = r"""
 
     <script>
         let currentlyServing = null;
+        let lastResponseTime = 0;
+        let connectionLost = false;
+        let slowRequestCount = 0;
+        let eventSource = null;
+
+        // Connection status thresholds
+        const SLOW_THRESHOLD_MS = 3000;
+        const TIMEOUT_MS = 10000;
+
+        function updateConnectionStatus(status, message) {
+            const statusEl = document.getElementById('connectionStatus');
+            const textEl = document.getElementById('statusText');
+
+            statusEl.className = 'connection-status ' + status;
+            textEl.textContent = message;
+        }
+
+        async function timedFetch(url, options = {}) {
+            const startTime = Date.now();
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), TIMEOUT_MS);
+
+            try {
+                const response = await fetch(url, { ...options, signal: controller.signal });
+                clearTimeout(timeoutId);
+
+                const duration = Date.now() - startTime;
+                lastResponseTime = duration;
+
+                // Log response time from server header if available
+                const serverTime = response.headers.get('X-Response-Time-Ms');
+                const correlationId = response.headers.get('X-Correlation-ID');
+
+                if (duration > SLOW_THRESHOLD_MS) {
+                    slowRequestCount++;
+                    console.warn(`⚠️ Slow request [${correlationId}]: ${url} took ${duration}ms (server: ${serverTime}ms)`);
+                    updateConnectionStatus('slow', `Slow (${duration}ms)`);
+                } else if (connectionLost) {
+                    connectionLost = false;
+                    console.log('Connection restored');
+                    updateConnectionStatus('connected', 'Connected');
+                } else {
+                    updateConnectionStatus('connected', 'Connected');
+                }
+
+                return response;
+            } catch (e) {
+                clearTimeout(timeoutId);
+                if (e.name === 'AbortError') {
+                    connectionLost = true;
+                    updateConnectionStatus('disconnected', 'Timeout - Retrying...');
+                    throw new Error('Request timed out');
+                }
+                throw e;
+            }
+        }
 
         async function refreshDisplay() {
             try {
-                // Fetch queue
-                const response = await fetch('/api/queue');
+                // Fetch queue with timing
+                const response = await timedFetch('/api/queue');
                 const data = await response.json();
 
                 if (!data.success) {
@@ -2778,7 +3400,7 @@ QUEUE_DISPLAY_HTML_CONTENT = r"""
                 const queueList = document.getElementById('queueList');
 
                 // Fetch simulator info to find who's being served
-                const simsResponse = await fetch('/api/discover_simulators');
+                const simsResponse = await timedFetch('/api/discover_simulators');
                 const simsData = await simsResponse.json();
                 const simulators = simsData.simulators || [];
 
@@ -2817,6 +3439,8 @@ QUEUE_DISPLAY_HTML_CONTENT = r"""
 
             } catch (e) {
                 console.error('Error refreshing display:', e);
+                connectionLost = true;
+                updateConnectionStatus('disconnected', 'Connection Lost');
             }
         }
 
@@ -2826,9 +3450,82 @@ QUEUE_DISPLAY_HTML_CONTENT = r"""
             return div.innerHTML;
         }
 
-        // Initial load and refresh every 5 seconds
+        // Try to connect via SSE for real-time updates
+        function connectSSE() {
+            if (eventSource) {
+                eventSource.close();
+            }
+
+            try {
+                eventSource = new EventSource('/api/queue/stream');
+
+                eventSource.onopen = () => {
+                    console.log('SSE connected - real-time updates active');
+                    updateConnectionStatus('connected', 'Real-time');
+                };
+
+                eventSource.onmessage = (event) => {
+                    try {
+                        const data = JSON.parse(event.data);
+                        if (data.queue !== undefined) {
+                            // Direct queue update from SSE
+                            updateQueueDisplay(data.queue);
+                        }
+                    } catch (e) {
+                        console.error('SSE parse error:', e);
+                    }
+                };
+
+                eventSource.onerror = () => {
+                    console.log('SSE error - falling back to polling');
+                    eventSource.close();
+                    eventSource = null;
+                    // Fall back to polling
+                };
+            } catch (e) {
+                console.log('SSE not supported - using polling');
+            }
+        }
+
+        function updateQueueDisplay(queue) {
+            const queueList = document.getElementById('queueList');
+            if (queue.length === 0) {
+                queueList.innerHTML = '<div class="queue-empty">Queue is empty - join at the kiosk!</div>';
+            } else {
+                queueList.innerHTML = queue.map(entry => {
+                    const notifiedBadge = entry.notified ? '<span class="notified" title="Notified">🔔</span>' : '';
+                    return `
+                        <div class="queue-item">
+                            <span class="position">#${entry.position}</span>
+                            <span class="name">${escapeHtml(entry.name)}</span>
+                            <span class="wait">${entry.wait_display || ''}</span>
+                            ${notifiedBadge}
+                        </div>
+                    `;
+                }).join('');
+            }
+        }
+
+        // Keep-alive ping to maintain connection
+        setInterval(() => {
+            fetch('/health').catch(() => {
+                connectionLost = true;
+                updateConnectionStatus('disconnected', 'Connection Lost');
+            });
+        }, 30000);
+
+        // Initial load
         refreshDisplay();
-        setInterval(refreshDisplay, 5000);
+
+        // Try SSE first, fall back to polling
+        connectSSE();
+
+        // Polling as fallback (or primary if SSE fails)
+        setInterval(() => {
+            if (!eventSource || eventSource.readyState !== EventSource.OPEN) {
+                refreshDisplay();
+            }
+        }, 5000);
     </script>
 </body>
 </html>
@@ -2857,6 +3554,145 @@ def queue_page():
 def queue_display_page():
     return QUEUE_DISPLAY_HTML_CONTENT
 
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Fast health check endpoint - no blocking operations"""
+    return jsonify({
+        'status': 'ok',
+        'timestamp': int(time.time()),
+        'simulator_id': main_window.simulator_id.currentText() if main_window else None,
+        'server_ready': main_window is not None and ui_bridge is not None
+    })
+
+# ============================================
+# SERVER-SENT EVENTS (SSE) FOR REAL-TIME UPDATES
+# Pushes queue updates instantly instead of polling
+# ============================================
+from flask import Response, stream_with_context
+
+# Track last known queue state for change detection
+_sse_last_queue_hash = None
+_sse_clients_connected = 0
+
+def get_queue_data_for_sse():
+    """Fetch queue data from receiver for SSE broadcast using pooled connection"""
+    receiver_url = get_receiver_base_url()
+    if not receiver_url:
+        return None
+
+    # Check circuit breaker first
+    if receiver_circuit.is_open():
+        return None
+
+    try:
+        # Use pooled session for connection reuse
+        response = receiver_session.get(f"{receiver_url}/api/queue", timeout=2)
+        if response.status_code == 200:
+            data = response.json()
+            if data.get('success'):
+                queue = data.get('queue', [])
+                # Add notification status
+                for entry in queue:
+                    entry['notified'] = entry.get('id') in notified_queue_ids
+                    entry['wait_display'] = calculate_wait_display(entry.get('position', 1))
+                receiver_circuit.record_success()
+                return queue
+    except Exception as e:
+        receiver_circuit.record_failure()
+        print(f"[SSE] Error fetching queue: {e}")
+    return None
+
+@app.route('/api/queue/stream')
+def queue_stream():
+    """Server-Sent Events endpoint for real-time queue updates"""
+    global _sse_clients_connected
+
+    def generate():
+        global _sse_last_queue_hash, _sse_clients_connected
+        _sse_clients_connected += 1
+        print(f"[SSE] Client connected (total: {_sse_clients_connected})")
+
+        last_hash = None
+        try:
+            while True:
+                # Fetch current queue
+                queue = get_queue_data_for_sse()
+                if queue is not None:
+                    # Simple hash to detect changes
+                    current_hash = hash(json.dumps(queue, sort_keys=True))
+
+                    if current_hash != last_hash:
+                        last_hash = current_hash
+                        _sse_last_queue_hash = current_hash
+
+                        # Send update to client
+                        data = json.dumps({'queue': queue, 'timestamp': int(time.time())})
+                        yield f"data: {data}\n\n"
+
+                # Check every 500ms
+                time.sleep(0.5)
+        except GeneratorExit:
+            pass
+        finally:
+            _sse_clients_connected -= 1
+            print(f"[SSE] Client disconnected (total: {_sse_clients_connected})")
+
+    return Response(
+        stream_with_context(generate()),
+        mimetype='text/event-stream',
+        headers={
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+            'X-Accel-Buffering': 'no'  # Disable nginx buffering
+        }
+    )
+
+@app.route('/api/diagnostics', methods=['GET'])
+def diagnostics():
+    """Return comprehensive system diagnostics for troubleshooting"""
+    receiver_url = get_receiver_base_url()
+    receiver_ok = False
+    receiver_latency = None
+
+    if receiver_url:
+        try:
+            start = time.time()
+            # Use the pooled session for connection reuse
+            resp = receiver_session.get(f"{receiver_url}/health", timeout=2)
+            receiver_latency = int((time.time() - start) * 1000)
+            receiver_ok = resp.status_code == 200
+        except Exception:
+            pass
+
+    # Circuit breaker status
+    circuit_status = receiver_circuit.get_status()
+
+    return jsonify({
+        'timestamp': int(time.time()),
+        'local_ip': get_local_ip(),
+        'mdns_hostname': f"sim{mdns_service.current_sim_id}.local" if mdns_service.current_sim_id else None,
+        'mdns_healthy': mdns_service.is_healthy() if hasattr(mdns_service, 'is_healthy') else None,
+        'receiver_url': receiver_url,
+        'receiver_connected': receiver_ok,
+        'receiver_latency_ms': receiver_latency,
+        'flask_server': 'waitress',
+        'sms_enabled': sms_config.get('enabled', False),
+        'sms_provider': sms_config.get('provider'),
+        'sms_queue_size': sms_send_queue.qsize() if 'sms_send_queue' in dir() else 0,
+        'simulator_id': main_window.simulator_id.currentText() if main_window else None,
+        'current_driver': main_window.driver_name.text() if main_window else None,
+        # Instrumentation data
+        'slow_request_count': slow_request_count,
+        'last_slow_request_time': last_slow_request_time.isoformat() if last_slow_request_time else None,
+        'last_slow_request_path': last_slow_request_path,
+        'slow_request_threshold_ms': SLOW_REQUEST_THRESHOLD_MS,
+        # Connection reliability
+        'circuit_breaker': circuit_status,
+        'heartbeat_latency_ms': int(_heartbeat_latency) if _heartbeat_latency else None,
+        'heartbeat_last_success': _heartbeat_last_success,
+        'sse_clients_connected': _sse_clients_connected
+    })
+
 @app.route('/get_driver', methods=['GET'])
 def get_driver():
     if main_window:
@@ -2865,11 +3701,15 @@ def get_driver():
 
 @app.route('/set_driver', methods=['POST'])
 def set_driver():
+    import datetime as dt
+    start_time = time.time()
+    print(f"\n[{dt.datetime.now().strftime('%H:%M:%S.%f')[:-3]}] === SET_DRIVER REQUEST RECEIVED ===")
     try:
         data = request.get_json() or {}
         driver_name = str(data.get('driver_name') or '').strip()
         driver_email = str(data.get('driver_email') or '').strip()
         driver_phone = str(data.get('driver_phone') or '').strip()
+        print(f"[{dt.datetime.now().strftime('%H:%M:%S.%f')[:-3]}] Driver: {driver_name}")
 
         if not driver_name:
             return jsonify({'success': False, 'error': 'driver_name is required'}), 400
@@ -2886,7 +3726,7 @@ def set_driver():
             driver_phone = formatted_phone
         elif driver_phone:
             driver_phone = format_phone_e164(driver_phone) or driver_phone
-        
+
         if main_window:
             # Store contact fields before changing the driver so session-start
             # notifications and partner events carry the right data.
@@ -2896,12 +3736,16 @@ def set_driver():
             # Emit signal to UI thread to update driver and start video
             try:
                 if ui_bridge:
+                    print(f"[{dt.datetime.now().strftime('%H:%M:%S.%f')[:-3]}] Emitting signal to UI...")
                     ui_bridge.driver_registered.emit(driver_name)
+                    print(f"[{dt.datetime.now().strftime('%H:%M:%S.%f')[:-3]}] Signal emitted")
                 else:
                     # Fallback (not ideal): direct call
                     main_window.update_driver_name(driver_name)
             except Exception:
                 main_window.update_driver_name(driver_name)
+            elapsed = (time.time() - start_time) * 1000
+            print(f"[{dt.datetime.now().strftime('%H:%M:%S.%f')[:-3]}] === SET_DRIVER COMPLETE ({elapsed:.0f}ms) ===\n")
             return jsonify({'success': True, 'driver_name': driver_name})
     except Exception as e:
         print(f"Error setting driver: {str(e)}")
@@ -2929,7 +3773,7 @@ def get_settings():
     # Lead Gen requires both email and phone before a driver can continue.
     lead_gen_enabled = is_lead_gen_enabled()
     
-    # Get selected background image, falling back to the bundled Sim Coaches branded page.
+    # Get selected background image; otherwise the mobile pages use a plain black backdrop.
     background_image = os.path.basename(main_window.background_image_path.text()) if main_window.background_image_path.text() else get_default_web_background()
     
     # Check timer - only show as active if it has actually started (after video ends)
@@ -3005,13 +3849,14 @@ def get_receiver_base_url():
 
 @app.route('/api/queue', methods=['GET'])
 def proxy_queue_list():
-    """Proxy queue list from Receiver"""
-    receiver_url = get_receiver_base_url()
-    if not receiver_url:
-        return jsonify({'success': False, 'error': 'Receiver not connected'}), 503
+    """Proxy queue list from Receiver with circuit breaker protection"""
+    response, error = forward_to_receiver('/api/queue', method='GET', timeout=3)
+
+    if error:
+        print(f"[Queue Proxy] Error fetching queue: {error}")
+        return jsonify({'success': False, 'error': error}), 503
 
     try:
-        response = requests.get(f"{receiver_url}/api/queue", timeout=5)
         data = response.json()
 
         # Add notification status and wait_display to each queue entry
@@ -3023,110 +3868,101 @@ def proxy_queue_list():
 
         return jsonify(data), response.status_code
     except Exception as e:
-        print(f"[Queue Proxy] Error fetching queue: {e}")
+        print(f"[Queue Proxy] Error parsing response: {e}")
         return jsonify({'success': False, 'error': str(e)}), 503
 
 @app.route('/api/queue/join', methods=['POST'])
 def proxy_queue_join():
-    """Proxy join request to Receiver, then send confirmation SMS"""
-    receiver_url = get_receiver_base_url()
-    print(f"[Queue] Join request received, receiver_url={receiver_url}")
-    if not receiver_url:
-        print("[Queue] ERROR: No receiver connected!")
-        return jsonify({'success': False, 'error': 'Receiver not connected'}), 503
+    """Proxy join request to Receiver with circuit breaker, then send confirmation SMS"""
+    import datetime as dt
+    start_time = time.time()
+    correlation_id = getattr(g, 'correlation_id', 'unknown')
+    print(f"\n[{dt.datetime.now().strftime('%H:%M:%S.%f')[:-3]}] [{correlation_id}] === QUEUE JOIN REQUEST ===")
+
+    data = request.get_json() or {}
+    name = str(data.get('name') or '').strip()
+    email = str(data.get('email') or '').strip()
+    phone = str(data.get('phone') or '').strip()
+    print(f"[{dt.datetime.now().strftime('%H:%M:%S.%f')[:-3]}] [{correlation_id}] Processing: name='{name}', email='{email or 'none'}', phone='{phone or 'none'}'")
+
+    if not name:
+        return jsonify({'success': False, 'error': 'Name is required'}), 400
+
+    if is_lead_gen_enabled():
+        if not email:
+            return jsonify({'success': False, 'error': 'Email is required'}), 400
+        if not is_valid_email_address(email):
+            return jsonify({'success': False, 'error': 'Valid email is required'}), 400
+        formatted_phone = format_phone_e164(phone)
+        if not formatted_phone:
+            return jsonify({'success': False, 'error': 'Valid phone is required'}), 400
+        phone = formatted_phone
+    elif phone:
+        phone = format_phone_e164(phone) or phone
+
+    data['name'] = name
+    data['email'] = email
+    data['phone'] = phone
+
+    # Forward with circuit breaker protection
+    print(f"[{dt.datetime.now().strftime('%H:%M:%S.%f')[:-3]}] [{correlation_id}] Forwarding to Receiver...")
+    forward_start = time.time()
+    response, error = forward_to_receiver('/api/queue/join', data=data, timeout=3)
+    forward_elapsed = (time.time() - forward_start) * 1000
+    print(f"[{dt.datetime.now().strftime('%H:%M:%S.%f')[:-3]}] [{correlation_id}] Receiver responded in {forward_elapsed:.0f}ms")
+
+    if error:
+        print(f"[{dt.datetime.now().strftime('%H:%M:%S.%f')[:-3]}] [{correlation_id}] ERROR: {error}")
+        return jsonify({'success': False, 'error': error}), 503
 
     try:
-        data = request.get_json() or {}
-        name = str(data.get('name') or '').strip()
-        email = str(data.get('email') or '').strip()
-        phone = str(data.get('phone') or '').strip()
-        print(f"[Queue] Processing join: name='{name}', email='{email or 'none'}', phone='{phone or 'none'}'")
-
-        if not name:
-            return jsonify({'success': False, 'error': 'Name is required'}), 400
-
-        if is_lead_gen_enabled():
-            if not email:
-                return jsonify({'success': False, 'error': 'Email is required'}), 400
-            if not is_valid_email_address(email):
-                return jsonify({'success': False, 'error': 'Valid email is required'}), 400
-            formatted_phone = format_phone_e164(phone)
-            if not formatted_phone:
-                return jsonify({'success': False, 'error': 'Valid phone is required'}), 400
-            phone = formatted_phone
-        elif phone:
-            phone = format_phone_e164(phone) or phone
-
-        data['name'] = name
-        data['email'] = email
-        data['phone'] = phone
-
-        response = requests.post(
-            f"{receiver_url}/api/queue/join",
-            json=data,
-            headers={'Content-Type': 'application/json'},
-            timeout=5
-        )
         result = response.json()
-        print(f"[Queue] Join result: {result}")
+        print(f"[{dt.datetime.now().strftime('%H:%M:%S.%f')[:-3]}] [{correlation_id}] Result: {result}")
 
         # Calculate wait_display locally
         if result.get('success'):
             position = result.get('position', 1)
             result['wait_display'] = calculate_wait_display(position)
-            print(f"[Queue] Calculated wait: {result['wait_display']} (pos={position})")
+            print(f"[Queue] [{correlation_id}] Calculated wait: {result['wait_display']} (pos={position})")
 
         # Send confirmation SMS if phone provided and join was successful
-        print(f"[SMS] Checking SMS conditions: success={result.get('success')}, phone='{phone}', phone_bool={bool(phone)}")
+        print(f"[SMS] [{correlation_id}] Checking SMS: success={result.get('success')}, phone='{bool(phone)}'")
 
         if result.get('success') and phone:
             position = result.get('position', '?')
             wait_display = result.get('wait_display', 'a few minutes')
             confirmation_msg = f"Hi {name}! You're #{position} in the sim racing queue. Estimated wait: {wait_display}. We'll text you when it's almost your turn!"
 
-            print(f"[SMS] Sending queue confirmation to {phone}")
-            try:
-                # Clean phone number using unified formatter
-                clean_phone = format_phone_e164(phone)
-                if not clean_phone:
-                    print(f"[SMS] Confirmation skipped: Could not format phone '{phone}'")
-                    result['confirmation_sms_sent'] = False
-                else:
-                    print(f"[SMS] Formatted phone: {clean_phone}")
-                    sms_sent = send_sms_textbelt(clean_phone, confirmation_msg)
-                    result['confirmation_sms_sent'] = sms_sent
-                    print(f"[SMS] Confirmation {'sent' if sms_sent else 'FAILED'} to {name} at {clean_phone}")
-            except Exception as sms_e:
-                print(f"[SMS] Confirmation ERROR: {sms_e}")
-                import traceback
-                traceback.print_exc()
-                result['confirmation_sms_sent'] = False
-        else:
-            print(f"[SMS] Skipping SMS: success={result.get('success')}, phone provided={bool(phone)}")
+            # Use async SMS - queue for background sending (non-blocking!)
+            clean_phone = format_phone_e164(phone)
+            if clean_phone:
+                queue_sms_async(clean_phone, confirmation_msg, "queue_confirmation")
+                result['confirmation_sms_queued'] = True
+                print(f"[SMS] [{correlation_id}] Confirmation queued for {name}")
+            else:
+                result['confirmation_sms_queued'] = False
 
+        total_elapsed = (time.time() - start_time) * 1000
+        print(f"[{dt.datetime.now().strftime('%H:%M:%S.%f')[:-3]}] [{correlation_id}] === COMPLETE ({total_elapsed:.0f}ms) ===\n")
         return jsonify(result), response.status_code
     except Exception as e:
-        print(f"[Queue] ERROR joining queue: {e}")
+        print(f"[Queue] [{correlation_id}] ERROR parsing response: {e}")
         return jsonify({'success': False, 'error': str(e)}), 503
 
 @app.route('/api/queue/remove', methods=['POST'])
 def proxy_queue_remove():
-    """Proxy remove request to Receiver"""
-    receiver_url = get_receiver_base_url()
-    if not receiver_url:
-        return jsonify({'success': False, 'error': 'Receiver not connected'}), 503
+    """Proxy remove request to Receiver with circuit breaker"""
+    data = request.get_json() or {}
+    response, error = forward_to_receiver('/api/queue/remove', data=data, timeout=3)
+
+    if error:
+        print(f"[Queue Proxy] Error removing from queue: {error}")
+        return jsonify({'success': False, 'error': error}), 503
 
     try:
-        data = request.get_json() or {}
-        response = requests.post(
-            f"{receiver_url}/api/queue/remove",
-            json=data,
-            headers={'Content-Type': 'application/json'},
-            timeout=5
-        )
         return jsonify(response.json()), response.status_code
     except Exception as e:
-        print(f"[Queue Proxy] Error removing from queue: {e}")
+        print(f"[Queue Proxy] Error parsing response: {e}")
         return jsonify({'success': False, 'error': str(e)}), 503
 
 @app.route('/api/sms/test', methods=['POST'])
@@ -3153,67 +3989,63 @@ def test_sms():
 
 @app.route('/api/queue/assign', methods=['POST'])
 def proxy_queue_assign():
-    """Proxy assign request to Receiver, then send SMS locally"""
-    receiver_url = get_receiver_base_url()
-    print(f"[Queue] Assign request received, receiver_url={receiver_url}")
-    if not receiver_url:
-        print("[Queue] ERROR: No receiver connected!")
-        return jsonify({'success': False, 'error': 'Receiver not connected'}), 503
+    """Proxy assign request to Receiver with circuit breaker, then send SMS locally"""
+    correlation_id = getattr(g, 'correlation_id', 'unknown')
+    data = request.get_json() or {}
+    print(f"[Queue] [{correlation_id}] Assign request: {data}")
+
+    # Forward with circuit breaker protection
+    response, error = forward_to_receiver('/api/queue/assign', data=data, timeout=3)
+
+    if error:
+        print(f"[Queue] [{correlation_id}] ERROR: {error}")
+        return jsonify({'success': False, 'error': error}), 503
 
     try:
-        data = request.get_json() or {}
-        print(f"[Queue] Assign request data: {data}")
-
-        # Forward to Receiver
-        response = requests.post(
-            f"{receiver_url}/api/queue/assign",
-            json=data,
-            headers={'Content-Type': 'application/json'},
-            timeout=5
-        )
         result = response.json()
-        print(f"[Queue] Assign result from receiver: {result}")
+        print(f"[Queue] [{correlation_id}] Assign result: {result}")
 
-        # If Receiver succeeded and returned phone, send SMS from Sender
+        # If Receiver succeeded and returned phone, send SMS from Sender (async!)
         if result.get('success'):
             phone = result.get('phone')
             name = result.get('name', 'Guest')
             simulator_name = data.get('simulator_name', 'your simulator')
 
             if phone:
-                print(f"[SMS] Attempting to send notification to {name} at {phone}")
-                sms_sent = send_sms_notification(
-                    phone_number=phone,
-                    driver_name=name,
-                    simulator_name=simulator_name
+                # Format the notification message
+                message = sms_config.get("message_template", "It's your turn to race!").format(
+                    name=name,
+                    simulator=simulator_name
                 )
-                result['sms_sent'] = sms_sent
-                print(f"[SMS] Notification result: {'sent' if sms_sent else 'failed'}")
+                clean_phone = format_phone_e164(phone)
+                if clean_phone:
+                    # Use async SMS - queue for background sending (non-blocking!)
+                    queue_sms_async(clean_phone, message, "turn_notification")
+                    result['sms_queued'] = True
+                    print(f"[SMS] [{correlation_id}] Turn notification queued for {name}")
+                else:
+                    result['sms_queued'] = False
             else:
-                print(f"[SMS] No phone number for {name}, skipping SMS")
-                result['sms_sent'] = False
-        else:
-            print(f"[Queue] Assign failed: {result.get('error', 'Unknown error')}")
+                result['sms_queued'] = False
 
         return jsonify(result), response.status_code
     except Exception as e:
-        print(f"[Queue] ERROR assigning: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"[Queue] [{correlation_id}] ERROR parsing response: {e}")
         return jsonify({'success': False, 'error': str(e)}), 503
 
 @app.route('/api/queue/stats', methods=['GET'])
 def proxy_queue_stats():
-    """Proxy stats from Receiver"""
-    receiver_url = get_receiver_base_url()
-    if not receiver_url:
-        return jsonify({'success': False, 'error': 'Receiver not connected'}), 503
+    """Proxy stats from Receiver with circuit breaker"""
+    response, error = forward_to_receiver('/api/queue/stats', method='GET', timeout=3)
+
+    if error:
+        print(f"[Queue Proxy] Error fetching stats: {error}")
+        return jsonify({'success': False, 'error': error}), 503
 
     try:
-        response = requests.get(f"{receiver_url}/api/queue/stats", timeout=5)
         return jsonify(response.json()), response.status_code
     except Exception as e:
-        print(f"[Queue Proxy] Error fetching stats: {e}")
+        print(f"[Queue Proxy] Error parsing response: {e}")
         return jsonify({'success': False, 'error': str(e)}), 503
 
 @app.route('/api/session/start_remote', methods=['POST'])
@@ -3536,7 +4368,23 @@ def manual_lap():
         return jsonify({'success': False, 'message': str(e)}), 500
 
 def run_flask():
-    app.run(host='0.0.0.0', port=5001)
+    """Run Flask with Waitress production WSGI server for multi-threaded handling"""
+    from waitress import serve
+
+    # Start heartbeat thread for connection monitoring
+    start_heartbeat_thread()
+
+    print("[Flask] Starting production server with Waitress (8 threads)...")
+    print("[Flask] Enterprise features enabled:")
+    print("[Flask]   - Correlation IDs for request tracing")
+    print("[Flask]   - Slow request detection (>2s)")
+    print("[Flask]   - Connection pooling with auto-retry")
+    print("[Flask]   - Circuit breaker for failure recovery")
+    print("[Flask]   - Heartbeat monitoring (10s interval)")
+    print("[Flask]   - SSE for real-time updates")
+
+    serve(app, host='0.0.0.0', port=5001, threads=8,
+          connection_limit=100, channel_timeout=30)
 
 def run_beamng_udp_listener():
     """Listen for direct UDP lap data from BeamNG Lua mod - instant lap detection"""
@@ -3782,12 +4630,22 @@ class MDNSService:
     - etc.
 
     Drivers can type 'sim1.local:5001' instead of IP addresses.
+
+    Enhanced with:
+    - Health monitoring to detect service failures
+    - Auto-recovery when mDNS service becomes unhealthy
+    - Aggressive re-announcement during cold start (first 2 minutes)
     """
 
     def __init__(self):
         self.zeroconf = None
         self.service_info = None
         self.current_sim_id = None
+        self.current_port = 5001
+        self.healthy = False
+        self._monitor_thread = None
+        self._announce_thread = None
+        self._stop_monitoring = False
 
     def start(self, simulator_id, port=5001):
         """Start advertising this simulator via mDNS.
@@ -3801,6 +4659,7 @@ class MDNSService:
             self.stop()
 
             self.current_sim_id = simulator_id
+            self.current_port = port
             local_ip = get_local_ip()
 
             # Create service name: sim1, sim2, etc.
@@ -3825,15 +4684,122 @@ class MDNSService:
             self.zeroconf = Zeroconf()
             self.zeroconf.register_service(self.service_info)
 
+            self.healthy = True
+            self._stop_monitoring = False
             print(f"[mDNS] Service registered: http://{service_name}.local:{port}")
+
+            # Start health monitoring
+            self._start_health_monitor()
+
+            # Start aggressive re-announcement for cold start
+            self._start_cold_start_announcer()
+
             return f"{service_name}.local"
 
         except Exception as e:
             print(f"[mDNS] Failed to start service: {e}")
+            self.healthy = False
             return None
+
+    def _start_health_monitor(self):
+        """Start background thread that monitors mDNS health"""
+        def monitor():
+            check_interval = 30  # Check every 30 seconds
+            while not self._stop_monitoring and self.healthy:
+                time.sleep(check_interval)
+                if self._stop_monitoring:
+                    break
+                if not self._verify_registration():
+                    print("[mDNS] Service unhealthy, attempting re-registration...")
+                    self._reregister()
+
+        self._monitor_thread = threading.Thread(target=monitor, daemon=True)
+        self._monitor_thread.start()
+        print("[mDNS] Health monitor started")
+
+    def _start_cold_start_announcer(self):
+        """Aggressively re-announce for first 2 minutes to help cold start"""
+        def announce_loop():
+            # Re-announce every 5 seconds for 2 minutes (24 times)
+            for i in range(24):
+                if self._stop_monitoring:
+                    break
+                time.sleep(5)
+                if self._stop_monitoring or not self.zeroconf or not self.service_info:
+                    break
+                try:
+                    # Force re-announcement by unregister/register
+                    self.zeroconf.unregister_service(self.service_info)
+                    time.sleep(0.3)
+                    self.zeroconf.register_service(self.service_info)
+                    if i < 3:  # Only log first few
+                        print(f"[mDNS] Cold start re-announcement {i+1}/24")
+                except Exception as e:
+                    print(f"[mDNS] Re-announcement error: {e}")
+            print("[mDNS] Cold start announcement period complete")
+
+        self._announce_thread = threading.Thread(target=announce_loop, daemon=True)
+        self._announce_thread.start()
+        print("[mDNS] Cold start announcer started (2 minute aggressive mode)")
+
+    def _verify_registration(self):
+        """Check if our mDNS service is still working"""
+        if not self.current_sim_id or not self.zeroconf:
+            return False
+        try:
+            # Try to resolve our own hostname
+            hostname = f"sim{self.current_sim_id}.local"
+            socket.gethostbyname(hostname)
+            return True
+        except socket.gaierror:
+            return False
+        except Exception:
+            return False
+
+    def _reregister(self):
+        """Re-register the mDNS service after a failure"""
+        if self.current_sim_id:
+            try:
+                # Try to cleanly stop first
+                if self.zeroconf and self.service_info:
+                    try:
+                        self.zeroconf.unregister_service(self.service_info)
+                    except:
+                        pass
+                    try:
+                        self.zeroconf.close()
+                    except:
+                        pass
+
+                # Re-create and register
+                local_ip = get_local_ip()
+                service_name = f"sim{self.current_sim_id}"
+
+                self.service_info = ServiceInfo(
+                    "_http._tcp.local.",
+                    f"{service_name}._http._tcp.local.",
+                    addresses=[socket.inet_aton(local_ip)],
+                    port=self.current_port,
+                    properties={
+                        'path': '/',
+                        'simulator_id': str(self.current_sim_id),
+                        'app': 'Lap Time Sender'
+                    },
+                    server=f"{service_name}.local."
+                )
+
+                self.zeroconf = Zeroconf()
+                self.zeroconf.register_service(self.service_info)
+                self.healthy = True
+                print(f"[mDNS] Service re-registered successfully: {service_name}.local")
+            except Exception as e:
+                print(f"[mDNS] Re-registration failed: {e}")
+                self.healthy = False
 
     def stop(self):
         """Stop the mDNS service."""
+        self._stop_monitoring = True
+        self.healthy = False
         try:
             if self.zeroconf and self.service_info:
                 self.zeroconf.unregister_service(self.service_info)
@@ -3850,6 +4816,10 @@ class MDNSService:
         if new_simulator_id != self.current_sim_id:
             return self.start(new_simulator_id, port)
         return f"sim{self.current_sim_id}.local" if self.current_sim_id else None
+
+    def is_healthy(self):
+        """Check if mDNS service is currently healthy"""
+        return self.healthy and self.zeroconf is not None
 
 
 # Global mDNS service instance
@@ -4851,6 +5821,230 @@ class BeamNGMonitor(GameMonitor):
         self.running = False
         self.wait()
 
+class F1PacketHeader(ctypes.Structure):
+    """EA Sports F1 UDP telemetry packet header (2023/2024/2025 format)"""
+    _pack_ = 1
+    _fields_ = [
+        ('m_packetFormat', ctypes.c_uint16),       # Packet format (year e.g. 2023, 2024)
+        ('m_gameMajorVersion', ctypes.c_uint8),     # Game major version
+        ('m_gameMinorVersion', ctypes.c_uint8),     # Game minor version
+        ('m_packetVersion', ctypes.c_uint8),        # Packet version
+        ('m_packetId', ctypes.c_uint8),             # Packet type identifier
+        ('m_sessionUID', ctypes.c_uint64),          # Unique session identifier
+        ('m_sessionTime', ctypes.c_float),          # Session timestamp
+        ('m_frameIdentifier', ctypes.c_uint32),     # Frame identifier
+        ('m_playerCarIndex', ctypes.c_uint8),       # Index of player's car
+        ('m_secondaryPlayerCarIndex', ctypes.c_uint8),  # Index of secondary player's car (splitscreen)
+    ]
+
+class F1LapData(ctypes.Structure):
+    """Lap data for a single car in EA Sports F1 telemetry (Packet ID 2)"""
+    _pack_ = 1
+    _fields_ = [
+        ('m_lastLapTimeInMS', ctypes.c_uint32),     # Last lap time in milliseconds
+        ('m_currentLapTimeInMS', ctypes.c_uint32),   # Current lap time in milliseconds
+        ('m_sector1TimeInMS', ctypes.c_uint16),      # Sector 1 time in milliseconds
+        ('m_sector2TimeInMS', ctypes.c_uint16),      # Sector 2 time in milliseconds
+        ('m_lapDistance', ctypes.c_float),            # Distance around lap in metres
+        ('m_totalDistance', ctypes.c_float),          # Total distance in metres
+        ('m_safetyCarDelta', ctypes.c_float),        # Safety car delta in seconds
+        ('m_carPosition', ctypes.c_uint8),           # Car race position
+        ('m_currentLapNum', ctypes.c_uint8),         # Current lap number
+        ('m_pitStatus', ctypes.c_uint8),             # 0=none, 1=pitting, 2=in pit area
+        ('m_numPitStops', ctypes.c_uint8),           # Number of pit stops taken
+        ('m_sector', ctypes.c_uint8),                # 0=sector1, 1=sector2, 2=sector3
+        ('m_currentLapInvalid', ctypes.c_uint8),     # Current lap invalid - 0=valid, 1=invalid
+        ('m_penalties', ctypes.c_uint8),             # Accumulated time penalties in seconds
+        ('m_warnings', ctypes.c_uint8),              # Accumulated number of warnings
+        ('m_numUnservedDriveThroughPens', ctypes.c_uint8),
+        ('m_numUnservedStopGoPens', ctypes.c_uint8),
+        ('m_gridPosition', ctypes.c_uint8),          # Grid position
+        ('m_driverStatus', ctypes.c_uint8),          # 0=garage, 1=flying lap, 2=in lap, 3=out lap, 4=on track
+        ('m_resultStatus', ctypes.c_uint8),          # Result status
+        ('m_pitLaneTimerActive', ctypes.c_uint8),    # Pit lane timer active
+        ('m_pitLaneTimeInLaneInMS', ctypes.c_uint16),
+        ('m_pitStopTimerInMS', ctypes.c_uint16),
+        ('m_pitStopShouldServePen', ctypes.c_uint8),
+    ]
+
+class F1Monitor(GameMonitor):
+    """Monitor for EA Sports F1 games (F1 23/24/25) via UDP telemetry on port 20777"""
+    game_name = "EA Sports F1"
+
+    def __init__(self):
+        super().__init__()
+        self.udp_socket = None
+        self.last_lap_num = 0
+        self.last_session_uid = 0
+        self.last_packet_time = 0
+
+    def connect_to_game(self):
+        """Bind UDP socket on port 20777 and wait for first valid packet"""
+        try:
+            if self.udp_socket:
+                self.cleanup_socket()
+
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(('', 20777))
+            sock.settimeout(5.0)
+
+            print("\n=== EA Sports F1: Listening on UDP port 20777 ===")
+            print("Waiting for telemetry data (enable UDP telemetry in F1 game settings)...")
+
+            # Wait for first valid packet to confirm game is running
+            try:
+                data, addr = sock.recvfrom(4096)
+                if len(data) >= ctypes.sizeof(F1PacketHeader):
+                    header = F1PacketHeader()
+                    ctypes.memmove(ctypes.byref(header), data, ctypes.sizeof(F1PacketHeader))
+                    print(f"Connected! Receiving telemetry from {addr[0]} (format: {header.m_packetFormat})")
+                    self.udp_socket = sock
+                    self.last_packet_time = time.time()
+                    self.last_session_uid = header.m_sessionUID
+                    self.last_lap_num = 0  # Will be set on first lap data packet
+                    return True, None
+                else:
+                    print(f"Received invalid packet (size: {len(data)})")
+                    sock.close()
+                    return False, None
+            except socket.timeout:
+                sock.close()
+                return False, None
+
+        except OSError as e:
+            print(f"Failed to bind UDP port 20777: {e}")
+            if self.udp_socket:
+                self.cleanup_socket()
+            return False, None
+
+    def read_lap_time(self, _):
+        """Parse F1 UDP telemetry for lap completions.
+
+        Returns:
+            (True, lap_time_seconds) - Valid lap completed
+            (False, 0) - No new lap
+            (False, -1) - Disconnection detected
+        """
+        try:
+            if not self.udp_socket:
+                return False, -1
+
+            self.udp_socket.settimeout(0.1)
+
+            try:
+                data, addr = self.udp_socket.recvfrom(4096)
+            except socket.timeout:
+                # Check for disconnect (no packets for 5 seconds)
+                if time.time() - self.last_packet_time > 5.0:
+                    print("EA Sports F1: No telemetry received for 5 seconds - game disconnected?")
+                    return False, -1
+                return False, 0
+
+            self.last_packet_time = time.time()
+
+            if len(data) < ctypes.sizeof(F1PacketHeader):
+                return False, 0
+
+            # Parse header
+            header = F1PacketHeader()
+            ctypes.memmove(ctypes.byref(header), data, ctypes.sizeof(F1PacketHeader))
+
+            # Detect new session (reset lap counter)
+            if header.m_sessionUID != self.last_session_uid:
+                print(f"EA Sports F1: New session detected (UID: {header.m_sessionUID})")
+                self.last_session_uid = header.m_sessionUID
+                self.last_lap_num = 0
+
+            # Only process Lap Data packets (Packet ID 2)
+            if header.m_packetId != 2:
+                return False, 0
+
+            # Calculate offset to player's car lap data
+            header_size = ctypes.sizeof(F1PacketHeader)
+            lap_data_size = ctypes.sizeof(F1LapData)
+            player_offset = header_size + (header.m_playerCarIndex * lap_data_size)
+
+            if len(data) < player_offset + lap_data_size:
+                return False, 0
+
+            # Parse player's lap data
+            lap_data = F1LapData()
+            ctypes.memmove(
+                ctypes.byref(lap_data),
+                data[player_offset:player_offset + lap_data_size],
+                lap_data_size
+            )
+
+            current_lap = lap_data.m_currentLapNum
+
+            # Detect lap completion: lap number increased
+            if self.last_lap_num > 0 and current_lap > self.last_lap_num:
+                self.last_lap_num = current_lap
+
+                last_time_ms = lap_data.m_lastLapTimeInMS
+                if last_time_ms == 0:
+                    return False, 0
+
+                last_time_sec = last_time_ms / 1000.0
+
+                print(f"\n=== EA Sports F1 Lap Completed ===")
+                print(f"Lap: {current_lap - 1}")
+                print(f"Time: {format_time_ms(last_time_ms)} ({last_time_sec:.3f}s)")
+                print(f"Position: P{lap_data.m_carPosition}")
+                print(f"Pit Status: {lap_data.m_pitStatus}")
+                print(f"Valid: {'Yes' if lap_data.m_currentLapInvalid == 0 else 'No'}")
+                print(f"Driver Status: {lap_data.m_driverStatus}")
+
+                # Validate racing context
+                if not is_valid_racing_context(lap_data, None, "EA Sports F1"):
+                    return False, 0
+
+                # Validate lap time range
+                if validate_lap_time(last_time_sec, "EA Sports F1"):
+                    print(f"[OK] Valid lap time recorded: {last_time_sec:.3f}s")
+                    return True, last_time_sec
+                else:
+                    print(f"Invalid lap time rejected: {last_time_sec:.3f}s")
+                    return False, 0
+            else:
+                # Update lap number tracking (first packet or no change)
+                if self.last_lap_num == 0 and current_lap > 0:
+                    self.last_lap_num = current_lap
+                    print(f"EA Sports F1: Tracking from lap {current_lap}")
+                elif current_lap > self.last_lap_num:
+                    self.last_lap_num = current_lap
+
+            return False, 0
+
+        except (OSError, ConnectionError) as e:
+            print(f"EA Sports F1 socket error: {e}")
+            return False, -1
+        except Exception as e:
+            print(f"EA Sports F1 error reading telemetry: {e}")
+            return False, 0
+
+    def cleanup_socket(self):
+        """Safely close the UDP socket"""
+        try:
+            if hasattr(self, 'udp_socket') and self.udp_socket:
+                try:
+                    self.udp_socket.close()
+                    print("[OK] F1 UDP socket closed")
+                except (OSError, Exception) as e:
+                    print(f"F1 UDP socket already closed: {e}")
+                finally:
+                    self.udp_socket = None
+        except Exception as e:
+            print(f"Error during F1 cleanup: {e}")
+
+    def stop(self):
+        """Clean up EA Sports F1 UDP socket"""
+        print(f"\n=== Stopping {self.game_name} Monitor ===")
+        self.running = False
+        self.cleanup_socket()
+        self.wait()
+
 class State:
     ir_connected = False
 
@@ -5121,6 +6315,7 @@ class LapTimeSenderWindow(QMainWindow):
         "Assetto Corsa": AssettoCorsaMonitor,
         "iRacing": iRacingMonitor,
         "BeamNG.drive": BeamNGMonitor,
+        "EA Sports F1": F1Monitor,
     }
     
     def __init__(self):
@@ -5190,16 +6385,63 @@ class LapTimeSenderWindow(QMainWindow):
         
         # Start monitoring the initially selected game
         self.start_monitor(self.game_selector.currentText())
-        
+
+        # Load saved settings (video paths, background, etc.)
+        self._load_saved_settings()
+
         # Show waiting overlay on startup
         self.show_waiting_screen()
-        
+
+    def _load_saved_settings(self):
+        """Load and apply saved application settings"""
+        settings = load_app_settings()
+
+        # Restore pre-session video path
+        if settings.get('pre_session_video_path'):
+            path = settings['pre_session_video_path']
+            if os.path.exists(path):
+                self.video_path_input.setText(path)
+                self.pre_session_video_path = path
+
+        # Restore waiting screen media path
+        if settings.get('waiting_media_path'):
+            path = settings['waiting_media_path']
+            if os.path.exists(path):
+                self.waiting_media_path.setText(path)
+
+        # Restore background image path
+        if settings.get('background_image_path'):
+            path = settings['background_image_path']
+            if os.path.exists(path):
+                self.background_image_path.setText(path)
+
+        # Restore pre-session video toggle state
+        if 'pre_session_video_required' in settings:
+            self.video_required_toggle.setChecked(settings['pre_session_video_required'])
+            self.pre_session_video_required = settings['pre_session_video_required']
+
+        # Restore rotation mode
+        if settings.get('rotation_mode'):
+            index = self.rotation_mode_selector.findText(settings['rotation_mode'])
+            if index >= 0:
+                self.rotation_mode_selector.setCurrentIndex(index)
+
+        # Restore rotation time
+        if settings.get('rotation_time'):
+            index = self.rotation_time_selector.findText(settings['rotation_time'])
+            if index >= 0:
+                self.rotation_time_selector.setCurrentIndex(index)
+
+        # Restore rotation laps
+        if settings.get('rotation_laps') and hasattr(self, 'lap_target_input'):
+            self.lap_target_input.setText(str(settings['rotation_laps']))
+
     def setup_ui(self):
         # Main window settings
         self.setWindowTitle("Lap Time Sender - Racing Leaderboard Interface")
         self.setMinimumSize(940, 720)  # Wider but shorter - compact multi-column layout
         self.resize(980, 760)  # Optimized for modern displays
-        self.setWindowIcon(QIcon("resources/icon.png"))
+        self.setWindowIcon(QIcon(os.path.join(get_resources_dir(), 'icon.png')))
         self.setStyleSheet("""
             QMainWindow {
                 background-color: #1e1e1e;
@@ -7508,7 +8750,19 @@ class LapTimeSenderWindow(QMainWindow):
             details.append("Pre-session video ON")
         if details:
             message += f" ({', '.join(details)})"
-        
+
+        # Save all settings to persist across restarts
+        settings = {
+            'pre_session_video_path': self.video_path_input.text(),
+            'waiting_media_path': self.waiting_media_path.text(),
+            'background_image_path': self.background_image_path.text(),
+            'pre_session_video_required': self.video_required_toggle.isChecked(),
+            'rotation_mode': self.rotation_mode_selector.currentText(),
+            'rotation_time': self.time_target_input.text() if hasattr(self, 'time_target_input') else '5',
+            'rotation_laps': self.lap_target_input.text() if hasattr(self, 'lap_target_input') else '10'
+        }
+        save_app_settings(settings)
+
         self.show_success(message)
 
     def on_server_url_changed(self):
