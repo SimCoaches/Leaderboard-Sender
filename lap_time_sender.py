@@ -6427,10 +6427,8 @@ class LapTimeSenderWindow(QMainWindow):
                 self.rotation_mode_selector.setCurrentIndex(index)
 
         # Restore rotation time
-        if settings.get('rotation_time'):
-            index = self.rotation_time_selector.findText(settings['rotation_time'])
-            if index >= 0:
-                self.rotation_time_selector.setCurrentIndex(index)
+        if settings.get('rotation_time') and hasattr(self, 'time_target_input'):
+            self.time_target_input.setText(str(settings['rotation_time']))
 
         # Restore rotation laps
         if settings.get('rotation_laps') and hasattr(self, 'lap_target_input'):
