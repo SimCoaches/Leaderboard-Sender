@@ -65,8 +65,8 @@ def find_resource_file(filename):
     return None, safe_name
 
 def get_default_web_background():
-    """Return no default image so mobile pages use a plain black backdrop."""
-    return None
+    """Return the branded default background for the mobile registration pages."""
+    return 'iPad Events Background (Sim Coaches Branded).png'
 
 def format_time_ms(milliseconds):
     """Format milliseconds into a readable time string (mm:ss.xxx)"""
@@ -198,15 +198,58 @@ def get_local_ip():
     
     return '127.0.0.1'  # Final fallback
 
-def configure_firewall():
+PREFERRED_WEB_INTERFACE_PORT = 5001
+WEB_INTERFACE_FALLBACK_PORTS = [5101, 5102, 5103, 5104, 5105]
+WEB_INTERFACE_PORT = PREFERRED_WEB_INTERFACE_PORT
+
+def is_tcp_port_available(port):
+    """Return True when the web interface can bind the requested TCP port."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(('0.0.0.0', int(port)))
+            return True
+    except OSError:
+        return False
+
+def select_web_interface_port():
+    """Pick the mobile web port, falling back when another app owns 5001."""
+    global WEB_INTERFACE_PORT
+
+    for port in [PREFERRED_WEB_INTERFACE_PORT] + WEB_INTERFACE_FALLBACK_PORTS:
+        if is_tcp_port_available(port):
+            WEB_INTERFACE_PORT = port
+            if port != PREFERRED_WEB_INTERFACE_PORT:
+                print(
+                    f"[Web] Port {PREFERRED_WEB_INTERFACE_PORT} is already in use; "
+                    f"using {port} for the Sender mobile page"
+                )
+            return port
+
+    WEB_INTERFACE_PORT = PREFERRED_WEB_INTERFACE_PORT
+    print(f"[Web] WARNING: No fallback web ports are available; trying {WEB_INTERFACE_PORT}")
+    return WEB_INTERFACE_PORT
+
+def get_web_interface_port():
+    return WEB_INTERFACE_PORT
+
+def get_simulator_probe_ports():
+    return [PREFERRED_WEB_INTERFACE_PORT] + WEB_INTERFACE_FALLBACK_PORTS
+
+def configure_firewall(web_port=None):
     """Add Windows Firewall rules to allow inbound connections.
-    - Port 5001 TCP: Web interface for iPads and other simulators
+    - Web TCP port: Web interface for iPads and other simulators
     - Port 5003 UDP: Simulator discovery broadcast
     """
     import subprocess
+    web_port = int(web_port or get_web_interface_port())
+    web_rule_name = (
+        "Lap Time Sender - Web Interface"
+        if web_port == PREFERRED_WEB_INTERFACE_PORT
+        else f"Lap Time Sender - Web Interface {web_port}"
+    )
     
     rules = [
-        ("Lap Time Sender - Web Interface", "TCP", "5001"),
+        (web_rule_name, "TCP", str(web_port)),
         ("Lap Time Sender - Discovery", "UDP", "5003"),
         ("Lap Time Sender - F1 Telemetry", "UDP", "20777"),
     ]
@@ -2257,6 +2300,7 @@ ADMIN_HTML_CONTENT = r"""
 
             const sim = discoveredSimulators.find(s => s.ip === simIp);
             const simName = sim ? sim.simulator_name : `Sim at ${simIp}`;
+            const simPort = sim ? (sim.port || 5001) : 5001;
 
             try {
                 // Step 1: Assign guest to simulator
@@ -2277,7 +2321,7 @@ ADMIN_HTML_CONTENT = r"""
                 }
 
                 // Step 2: Start session on that simulator
-                const startResponse = await fetch(`http://${simIp}:5001/api/session/start_remote`, {
+                const startResponse = await fetch(`http://${simIp}:${simPort}/api/session/start_remote`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
@@ -2309,7 +2353,9 @@ ADMIN_HTML_CONTENT = r"""
 
         async function endSessionOnSim(simIp) {
             try {
-                const response = await fetch(`http://${simIp}:5001/api/session/force_end`, {
+                const sim = discoveredSimulators.find(s => s.ip === simIp);
+                const simPort = sim ? (sim.port || 5001) : 5001;
+                const response = await fetch(`http://${simIp}:${simPort}/api/session/force_end`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' }
                 });
@@ -4137,7 +4183,7 @@ def simulator_info():
             'game': main_window.game_selector.currentText(),
             'current_driver': main_window.driver_name.text() or None,
             'ip': get_local_ip(),
-            'port': 5001,
+            'port': get_web_interface_port(),
             'timer_active': timer_active,
             'timer_seconds_left': timer_seconds_left,
             'laps_active': laps_active,
@@ -4149,7 +4195,7 @@ def simulator_info():
         'game': 'Unknown',
         'current_driver': None,
         'ip': get_local_ip(),
-        'port': 5001,
+        'port': get_web_interface_port(),
         'timer_active': False,
         'timer_seconds_left': 0,
         'laps_active': False,
@@ -4167,7 +4213,7 @@ def discover_simulators():
         'game': 'Unknown',
         'current_driver': None,
         'ip': current_ip,
-        'port': 5001,
+        'port': get_web_interface_port(),
         'is_current': True
     }
     
@@ -4195,7 +4241,7 @@ def discover_simulators():
             'game': main_window.game_selector.currentText(),
             'current_driver': main_window.driver_name.text() or None,
             'ip': current_ip,
-            'port': 5001,
+            'port': get_web_interface_port(),
             'is_current': True,
             'timer_active': timer_active,
             'timer_seconds_left': timer_seconds_left,
@@ -4257,19 +4303,21 @@ def remove_known_simulator_api(ip):
 @app.route('/api/test_simulator/<ip>', methods=['GET'])
 def test_simulator_connection(ip):
     """Test connection to a specific simulator"""
-    try:
-        response = requests.get(
-            f'http://{ip}:5001/api/simulator_info',
-            timeout=2.0
-        )
-        if response.ok:
-            data = response.json()
-            return jsonify({
-                'reachable': True,
-                'simulator_info': data
-            })
-    except Exception as e:
-        pass
+    for port in get_simulator_probe_ports():
+        try:
+            response = requests.get(
+                f'http://{ip}:{port}/api/simulator_info',
+                timeout=2.0
+            )
+            if response.ok:
+                data = response.json()
+                data['port'] = data.get('port', port)
+                return jsonify({
+                    'reachable': True,
+                    'simulator_info': data
+                })
+        except Exception:
+            pass
     return jsonify({'reachable': False, 'error': 'Could not connect'})
 
 @app.route('/api/beamng_lap', methods=['POST'])
@@ -4369,12 +4417,19 @@ def manual_lap():
 
 def run_flask():
     """Run Flask with Waitress production WSGI server for multi-threaded handling"""
-    from waitress import serve
+    web_port = get_web_interface_port()
 
     # Start heartbeat thread for connection monitoring
     start_heartbeat_thread()
 
-    print("[Flask] Starting production server with Waitress (8 threads)...")
+    try:
+        from waitress import serve
+    except ImportError:
+        print(f"[Flask] Waitress not available; starting Flask threaded server on port {web_port}")
+        app.run(host='0.0.0.0', port=web_port, threaded=True, use_reloader=False)
+        return
+
+    print(f"[Flask] Starting production server with Waitress on port {web_port} (8 threads)...")
     print("[Flask] Enterprise features enabled:")
     print("[Flask]   - Correlation IDs for request tracing")
     print("[Flask]   - Slow request detection (>2s)")
@@ -4383,7 +4438,7 @@ def run_flask():
     print("[Flask]   - Heartbeat monitoring (10s interval)")
     print("[Flask]   - SSE for real-time updates")
 
-    serve(app, host='0.0.0.0', port=5001, threads=8,
+    serve(app, host='0.0.0.0', port=web_port, threads=8,
           connection_limit=100, channel_timeout=30)
 
 def run_beamng_udp_listener():
@@ -4541,19 +4596,20 @@ class SimulatorDiscovery:
     @staticmethod
     def probe_host(ip, timeout=1.0):
         """Probe a single host for simulator"""
-        try:
-            response = requests.get(
-                f'http://{ip}:5001/api/simulator_info',
-                timeout=timeout
-            )
-            if response.ok:
-                data = response.json()
-                data['ip'] = ip
-                data['port'] = data.get('port', 5001)
-                data['reachable'] = True
-                return data
-        except:
-            pass
+        for port in get_simulator_probe_ports():
+            try:
+                response = requests.get(
+                    f'http://{ip}:{port}/api/simulator_info',
+                    timeout=timeout
+                )
+                if response.ok:
+                    data = response.json()
+                    data['ip'] = ip
+                    data['port'] = data.get('port', port)
+                    data['reachable'] = True
+                    return data
+            except:
+                pass
         return None
     
     @staticmethod
@@ -5096,7 +5152,7 @@ def broadcast_simulator_presence():
             'simulator_name': 'Sim 1',
             'game': 'Unknown',
             'current_driver': None,
-            'port': 5001
+            'port': get_web_interface_port()
         }
         
         if main_window:
@@ -6322,6 +6378,7 @@ class LapTimeSenderWindow(QMainWindow):
         super().__init__()
         self.current_monitor = None
         self.local_ip = get_local_ip()
+        self.web_port = select_web_interface_port()
         self.failed_lap_times = []  # Store failed lap times for retry
         self.retry_timer = None
         self.current_server_url = f"http://{self.local_ip}:5000"  # Store current working URL
@@ -6336,8 +6393,8 @@ class LapTimeSenderWindow(QMainWindow):
         # Start with no monitor active
         self.current_monitor = None
         
-        # Configure Windows Firewall to allow connections on port 5001
-        configure_firewall()
+        # Configure Windows Firewall to allow connections on the selected web port
+        configure_firewall(self.web_port)
 
         # Start mDNS service for easy mobile access (sim1.local, sim2.local, etc.)
         self.mdns_hostname = None
@@ -6419,6 +6476,10 @@ class LapTimeSenderWindow(QMainWindow):
         if 'pre_session_video_required' in settings:
             self.video_required_toggle.setChecked(settings['pre_session_video_required'])
             self.pre_session_video_required = settings['pre_session_video_required']
+
+        # Restore Lead Gen contact requirement
+        if 'lead_gen_enabled' in settings and hasattr(self, 'email_field_enabled'):
+            self.email_field_enabled.setChecked(bool(settings['lead_gen_enabled']))
 
         # Restore rotation mode
         if settings.get('rotation_mode'):
@@ -6614,7 +6675,7 @@ class LapTimeSenderWindow(QMainWindow):
         info_text_layout.setSpacing(2)
         
         # URL info label - stored as instance variable for dynamic updates
-        self.url_info_label = QLabel(f"📱 Mobile Interface: http://{get_local_ip()}:5001")
+        self.url_info_label = QLabel(f"📱 Mobile Interface: http://{get_local_ip()}:{self.web_port}")
         self.url_info_label.setStyleSheet("""
             QLabel {
                 color: #cccccc;
@@ -6658,7 +6719,7 @@ class LapTimeSenderWindow(QMainWindow):
         mobile_layout.addLayout(info_text_layout, stretch=1)
 
         # QR code - stored as instance variable for dynamic updates
-        qr_code = self.generate_qr_code(f"http://{get_local_ip()}:5001")
+        qr_code = self.generate_qr_code(f"http://{get_local_ip()}:{self.web_port}")
         self.qr_label = QLabel()
         self.qr_label.setPixmap(qr_code)
         self.qr_label.setFixedSize(170, 170)  # Fixed size for consistent display
@@ -8091,7 +8152,7 @@ class LapTimeSenderWindow(QMainWindow):
         """Start or restart the mDNS service with current simulator ID."""
         try:
             sim_id = int(self.simulator_id.currentText()) if hasattr(self, 'simulator_id') else 1
-            self.mdns_hostname = mdns_service.start(sim_id, 5001)
+            self.mdns_hostname = mdns_service.start(sim_id, self.web_port)
             if self.mdns_hostname:
                 self._update_mobile_url_display()
         except Exception as e:
@@ -8116,13 +8177,13 @@ class LapTimeSenderWindow(QMainWindow):
     def _update_mobile_url_display(self):
         """Update the mobile interface URL display with current IP and mDNS name."""
         if hasattr(self, 'url_info_label'):
-            ip_url = f"http://{self.local_ip}:5001"
+            ip_url = f"http://{self.local_ip}:{self.web_port}"
             if self.mdns_hostname:
                 # Show both mDNS and IP address
                 self.url_info_label.setText(
                     f"📱 Mobile Interface:\n"
-                    f"   {self.mdns_hostname}:5001  (easy)\n"
-                    f"   {self.local_ip}:5001  (IP)"
+                    f"   {self.mdns_hostname}:{self.web_port}  (easy)\n"
+                    f"   {self.local_ip}:{self.web_port}  (IP)"
                 )
             else:
                 self.url_info_label.setText(f"📱 Mobile Interface: {ip_url}")
@@ -8130,7 +8191,7 @@ class LapTimeSenderWindow(QMainWindow):
     def _update_qr_code(self):
         """Update the QR code with current IP."""
         if hasattr(self, 'qr_label'):
-            qr_code = self.generate_qr_code(f"http://{self.local_ip}:5001")
+            qr_code = self.generate_qr_code(f"http://{self.local_ip}:{self.web_port}")
             if qr_code:
                 self.qr_label.setPixmap(qr_code)
 
@@ -8139,7 +8200,7 @@ class LapTimeSenderWindow(QMainWindow):
         try:
             sim_id = int(new_id)
             # Update mDNS service with new simulator ID
-            self.mdns_hostname = mdns_service.update_simulator_id(sim_id, 5001)
+            self.mdns_hostname = mdns_service.update_simulator_id(sim_id, self.web_port)
             self._update_mobile_url_display()
         except Exception as e:
             print(f"[mDNS] Error updating simulator ID: {e}")
@@ -8755,6 +8816,7 @@ class LapTimeSenderWindow(QMainWindow):
             'waiting_media_path': self.waiting_media_path.text(),
             'background_image_path': self.background_image_path.text(),
             'pre_session_video_required': self.video_required_toggle.isChecked(),
+            'lead_gen_enabled': lead_gen_enabled,
             'rotation_mode': self.rotation_mode_selector.currentText(),
             'rotation_time': self.time_target_input.text() if hasattr(self, 'time_target_input') else '5',
             'rotation_laps': self.lap_target_input.text() if hasattr(self, 'lap_target_input') else '10'
