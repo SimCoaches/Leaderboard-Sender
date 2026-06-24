@@ -27,6 +27,50 @@ import qrcode
 from io import BytesIO
 import os
 
+DEFAULT_BRANDED_BACKGROUND = 'iPad Events Background (Sim Coaches Branded).png'
+
+def get_runtime_base_path():
+    """Return the bundled app base path when frozen, otherwise the source folder."""
+    if getattr(sys, 'frozen', False):
+        return Path(getattr(sys, '_MEIPASS', Path(sys.executable).parent))
+    return Path(__file__).resolve().parent
+
+def get_app_install_path():
+    """Return the executable/source folder used for writable adjacent resources."""
+    if getattr(sys, 'frozen', False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+def get_resource_directories():
+    """Return resource directories in lookup order for web assets."""
+    candidates = [
+        get_app_install_path() / 'resources',
+        Path.cwd() / 'resources',
+        get_runtime_base_path() / 'resources',
+    ]
+    unique = []
+    seen = set()
+    for directory in candidates:
+        resolved = directory.resolve()
+        if resolved not in seen:
+            seen.add(resolved)
+            unique.append(resolved)
+    return unique
+
+def find_resource_file(filename):
+    """Find a resource file in external or bundled resource folders."""
+    safe_name = os.path.basename(filename)
+    for directory in get_resource_directories():
+        candidate = directory / safe_name
+        if candidate.is_file():
+            return directory, safe_name
+    return None, safe_name
+
+def get_default_web_background():
+    """Return the bundled branded iPad background filename when available."""
+    directory, safe_name = find_resource_file(DEFAULT_BRANDED_BACKGROUND)
+    return safe_name if directory else None
+
 def format_time_ms(milliseconds):
     """Format milliseconds into a readable time string (mm:ss.xxx)"""
     if milliseconds is None:
@@ -2870,7 +2914,7 @@ def get_settings():
             'lead_gen_enabled': False,
             'require_email': False,
             'require_phone': False,
-            'background_image': None,
+            'background_image': get_default_web_background(),
             'timer_active': False,
             'timer_seconds_left': 0,
             'rotation_mode': 'Time',
@@ -2885,8 +2929,8 @@ def get_settings():
     # Lead Gen requires both email and phone before a driver can continue.
     lead_gen_enabled = is_lead_gen_enabled()
     
-    # Get background image
-    background_image = os.path.basename(main_window.background_image_path.text()) if main_window.background_image_path.text() else None
+    # Get selected background image, falling back to the bundled Sim Coaches branded page.
+    background_image = os.path.basename(main_window.background_image_path.text()) if main_window.background_image_path.text() else get_default_web_background()
     
     # Check timer - only show as active if it has actually started (after video ends)
     timer_active = (hasattr(main_window, 'rotation_mode_selector') and 
@@ -2923,12 +2967,17 @@ def get_settings():
 
 @app.route('/backgrounds/<filename>')
 def background_file(filename):
-    return send_from_directory('resources', filename)
+    directory, safe_name = find_resource_file(filename)
+    if not directory:
+        return ("Background not found", 404)
+    return send_from_directory(str(directory), safe_name)
 
 @app.route('/logo')
 def serve_logo():
-    # Serve the logo.png file from the resources directory
-    return send_from_directory('resources', 'logo.png')
+    directory, safe_name = find_resource_file('logo.png')
+    if not directory:
+        return ("Logo not found", 404)
+    return send_from_directory(str(directory), safe_name)
 
 @app.route('/api/get_receiver_url', methods=['GET'])
 def get_receiver_url():
