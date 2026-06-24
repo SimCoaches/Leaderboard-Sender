@@ -65,8 +65,12 @@ def find_resource_file(filename):
     return None, safe_name
 
 def get_default_web_background():
-    """Return the branded default background for the mobile registration pages."""
-    return 'iPad Events Background (Sim Coaches Branded).png'
+    """Return the default mobile page background image.
+
+    Empty means the mobile registration pages use the plain black CSS backdrop.
+    The Sim Coaches logo is shown inside the registration panel instead.
+    """
+    return ''
 
 def format_time_ms(milliseconds):
     """Format milliseconds into a readable time string (mm:ss.xxx)"""
@@ -6496,7 +6500,9 @@ class LapTimeSenderWindow(QMainWindow):
         # Restore background image path
         if settings.get('background_image_path'):
             path = settings['background_image_path']
-            if os.path.exists(path):
+            if os.path.basename(path) == 'iPad Events Background (Sim Coaches Branded).png':
+                self.background_image_path.clear()
+            elif os.path.exists(path):
                 self.background_image_path.setText(path)
 
         # Restore pre-session video toggle state
