@@ -16,9 +16,11 @@ from abc import ABC, abstractmethod
 from flask import Flask, request, jsonify, send_from_directory, g
 from flask_cors import CORS
 from zeroconf import ServiceInfo, Zeroconf
-from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
-                            QHBoxLayout, QLabel, QLineEdit, QPushButton, 
-                            QMessageBox, QFormLayout, QComboBox, QGridLayout, QFrame)
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
+                            QHBoxLayout, QLabel, QLineEdit, QPushButton,
+                            QMessageBox, QFormLayout, QComboBox, QGridLayout, QFrame,
+                            QCheckBox, QTableWidget, QTableWidgetItem, QDialog,
+                            QAbstractItemView, QHeaderView)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QObject, QUrl
 from PyQt6.QtGui import QImage, QPixmap, QIcon, QFont
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
@@ -26,6 +28,7 @@ from PyQt6.QtMultimediaWidgets import QVideoWidget
 import qrcode
 from io import BytesIO
 import os
+import csv
 
 def get_runtime_base_path():
     """Return the bundled app base path when frozen, otherwise the source folder."""
@@ -363,6 +366,195 @@ def save_app_settings(settings):
         return True
     except Exception as e:
         print(f"WARNING: Could not save settings: {e}")
+        return False
+
+def get_sector_config_path():
+    """Get the path to the custom sector challenge config file."""
+    if getattr(sys, 'frozen', False):
+        base_path = Path(sys.executable).parent
+    else:
+        base_path = Path(__file__).parent
+    return base_path / 'sector_config.json'
+
+def normalize_sector_config(config):
+    """Validate and normalize a sector challenge config.
+
+    Sectors are kept sorted by start_pct; the first sector always starts at 0.
+    Returns a clean config dict, or None if the sector list is unusable.
+    """
+    try:
+        sectors = []
+        for s in config.get('sectors', []):
+            start_pct = float(s['start_pct'])
+            target_time = float(s['target_time'])
+            if not (0 <= start_pct < 100) or target_time <= 0:
+                return None
+            sectors.append({'start_pct': start_pct, 'target_time': target_time})
+        if not sectors:
+            return None
+        sectors.sort(key=lambda s: s['start_pct'])
+        # Boundaries must be distinct or sector spans collapse to zero length
+        starts = [s['start_pct'] for s in sectors]
+        if len(set(starts)) != len(starts):
+            return None
+        sectors[0]['start_pct'] = 0.0
+        return {'enabled': bool(config.get('enabled', False)), 'sectors': sectors}
+    except (KeyError, TypeError, ValueError):
+        return None
+
+def load_sector_config():
+    """Load the custom sector challenge config from file."""
+    config_path = get_sector_config_path()
+    if config_path.exists():
+        try:
+            with open(config_path, 'r') as f:
+                config = normalize_sector_config(json.load(f))
+                if config:
+                    print(f"[Sectors] Loaded {len(config['sectors'])} sectors from {config_path}")
+                    return config
+        except Exception as e:
+            print(f"WARNING: Could not load sector config: {e}")
+    return {'enabled': False, 'sectors': [{'start_pct': 0.0, 'target_time': 60.0}]}
+
+def save_sector_config(config):
+    """Save the custom sector challenge config to file."""
+    config_path = get_sector_config_path()
+    try:
+        with open(config_path, 'w') as f:
+            json.dump(config, f, indent=2)
+        print(f"[Sectors] Saved to {config_path}")
+        return True
+    except Exception as e:
+        print(f"WARNING: Could not save sector config: {e}")
+        return False
+
+def parse_time_to_seconds(text):
+    """Parse a sector target time like '75', '1:15' or '1:15.500' into seconds.
+
+    Returns None if the text is not a valid positive time.
+    """
+    try:
+        text = str(text).strip()
+        if ':' in text:
+            minutes, seconds = text.split(':', 1)
+            value = int(minutes) * 60 + float(seconds)
+        else:
+            value = float(text)
+        return value if value > 0 else None
+    except (ValueError, TypeError):
+        return None
+
+def get_lead_questions_path():
+    """Get the path to the lead-gen survey questions config file."""
+    if getattr(sys, 'frozen', False):
+        base_path = Path(sys.executable).parent
+    else:
+        base_path = Path(__file__).parent
+    return base_path / 'lead_questions.json'
+
+def normalize_lead_questions(config):
+    """Keep only well-formed questions: a prompt plus at least 2 options."""
+    questions = []
+    for q in (config or {}).get('questions', []):
+        try:
+            prompt = str(q.get('prompt', '')).strip()
+            options = [str(o).strip() for o in q.get('options', []) if str(o).strip()]
+        except AttributeError:
+            continue
+        if prompt and len(options) >= 2:
+            questions.append({'prompt': prompt, 'options': options})
+    return {'questions': questions}
+
+def load_lead_questions():
+    """Load the lead-gen survey questions from file."""
+    config_path = get_lead_questions_path()
+    if config_path.exists():
+        try:
+            with open(config_path, 'r', encoding='utf-8') as f:
+                config = normalize_lead_questions(json.load(f))
+                print(f"[Leads] Loaded {len(config['questions'])} survey questions")
+                return config
+        except Exception as e:
+            print(f"WARNING: Could not load lead questions: {e}")
+    return {'questions': []}
+
+def save_lead_questions(config):
+    """Save the lead-gen survey questions to file."""
+    config_path = get_lead_questions_path()
+    try:
+        with open(config_path, 'w', encoding='utf-8') as f:
+            json.dump(config, f, indent=2)
+        print(f"[Leads] Saved survey questions to {config_path}")
+        return True
+    except Exception as e:
+        print(f"WARNING: Could not save lead questions: {e}")
+        return False
+
+def get_leads_csv_path():
+    """Get the path to the captured leads CSV file."""
+    if getattr(sys, 'frozen', False):
+        base_path = Path(sys.executable).parent
+    else:
+        base_path = Path(__file__).parent
+    return base_path / 'leads.csv'
+
+# The mobile page retries timed-out registration POSTs, so remember the last
+# appended lead to avoid duplicate rows from the same submission.
+_last_lead_row = {'key': None, 'time': 0.0}
+
+def append_lead_to_csv(driver_name, email, phone, answers_by_prompt):
+    """Append a lead-gen registration to leads.csv.
+
+    Columns are timestamp, driver_name, email, phone, then one column per
+    configured survey question. If the questions have changed since the file
+    was created, the old file is rotated to a dated backup so columns and
+    answers always line up.
+    """
+    global _last_lead_row
+    try:
+        if main_window is not None and hasattr(main_window, 'lead_questions'):
+            questions = main_window.lead_questions.get('questions', [])
+        else:
+            questions = load_lead_questions().get('questions', [])
+        prompts = [q['prompt'] for q in questions]
+        fieldnames = ['timestamp', 'driver_name', 'email', 'phone'] + prompts
+
+        row_key = (driver_name, email, phone, tuple(sorted(answers_by_prompt.items())))
+        now = time.time()
+        if _last_lead_row['key'] == row_key and now - _last_lead_row['time'] < 120:
+            print(f"[Leads] Skipping duplicate lead row for {driver_name}")
+            return True
+
+        path = get_leads_csv_path()
+        if path.exists():
+            with open(path, 'r', newline='', encoding='utf-8') as f:
+                header = next(csv.reader(f), None)
+            if header != fieldnames:
+                backup = path.with_name(f"leads_backup_{time.strftime('%Y%m%d_%H%M%S')}.csv")
+                path.rename(backup)
+                print(f"[Leads] Question columns changed - previous leads moved to {backup.name}")
+
+        write_header = not path.exists()
+        row = {
+            'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'driver_name': driver_name,
+            'email': email,
+            'phone': phone,
+        }
+        for prompt in prompts:
+            row[prompt] = answers_by_prompt.get(prompt, '')
+
+        with open(path, 'a', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            if write_header:
+                writer.writeheader()
+            writer.writerow(row)
+
+        _last_lead_row = {'key': row_key, 'time': now}
+        print(f"[Leads] Saved lead for {driver_name} to {path.name}")
+        return True
+    except Exception as e:
+        print(f"WARNING: Could not save lead to CSV: {e}")
         return False
 
 def add_known_simulator(ip, name=None):
@@ -1166,6 +1358,25 @@ HTML_CONTENT = r"""
         #connectionStatus.connecting { color: #ce9178; border-color: #ce9178; animation: pulse 1.5s infinite; }
         #connectionStatus.disconnected { color: #f48771; border-color: #f48771; }
         button:disabled { background-color: #555; cursor: not-allowed; opacity: 0.7; }
+        /* Lead-gen survey wizard (one question per page) */
+        .survey-question { margin-bottom: 18px; }
+        .survey-question > label { font-size: 18px; color: #cccccc; margin-bottom: 12px; }
+        .survey-option {
+            display: block; background-color: #2d2d30; border: 1px solid #3e3e42;
+            border-radius: 4px; padding: 13px 12px; margin-bottom: 8px;
+            color: #cccccc; font-size: 16px; cursor: pointer;
+        }
+        .survey-option input[type="radio"] { margin-right: 10px; transform: scale(1.3); accent-color: #007acc; }
+        .survey-option:hover { border-color: #007acc; }
+        .survey-option:has(input:checked) { border-color: #007acc; background-color: #1e1e1e; }
+        .wizard-step { display: none; }
+        .wizard-step.active { display: block; animation: stepSlideIn 0.25s ease; }
+        @keyframes stepSlideIn { from { opacity: 0; transform: translateX(45px); } to { opacity: 1; transform: none; } }
+        .wizard-progress { text-align: center; color: #9d9d9d; font-size: 13px; margin-bottom: 12px; }
+        .wizard-nav { display: flex; gap: 10px; }
+        #backBtn { flex: 0 0 auto; width: 70px; background-color: #3e3e42; }
+        #backBtn:hover { background-color: #4e4e52; }
+        #nextBtn { flex: 1; }
     </style>
 </head>
 <body>
@@ -1184,22 +1395,29 @@ HTML_CONTENT = r"""
             <div style="font-size: 0.8em; color: #9d9d9d;">Ready for racing!</div>
         </div>
 
-        <div class="input-group">
-            <label for="driverName">👤 Driver Name:</label>
-            <input type="text" id="driverName" placeholder="Enter your name" required>
-            <small style="color: #6e6e6e; font-style: italic;">This will appear on the leaderboard</small>
+        <div class="wizard-step active" id="stepContact">
+            <div class="input-group">
+                <label for="driverName">👤 Driver Name:</label>
+                <input type="text" id="driverName" placeholder="Enter your name" required>
+                <small style="color: #6e6e6e; font-style: italic;">This will appear on the leaderboard</small>
+            </div>
+            <div class="input-group" id="emailGroup" style="display: none;">
+                <label for="driverEmail">📧 Email Address: <span style="color: #f48771;">*</span></label>
+                <input type="email" id="driverEmail" placeholder="Enter email address (required)" required>
+                <small style="color: #6e6e6e; font-style: italic;">Required for driver communication</small>
+            </div>
+            <div class="input-group">
+                <label for="driverPhone">📱 Phone Number:</label>
+                <input type="tel" id="driverPhone" placeholder="Enter phone number (optional)">
+                <small id="driverPhoneHelp" style="color: #6e6e6e; font-style: italic;">Optional for partner race result integrations</small>
+            </div>
         </div>
-        <div class="input-group" id="emailGroup" style="display: none;">
-            <label for="driverEmail">📧 Email Address: <span style="color: #f48771;">*</span></label>
-            <input type="email" id="driverEmail" placeholder="Enter email address (required)" required>
-            <small style="color: #6e6e6e; font-style: italic;">Required for driver communication</small>
+        <div id="surveySteps"></div>
+        <div class="wizard-progress" id="wizardProgress" style="display: none;"></div>
+        <div class="wizard-nav">
+            <button type="button" id="backBtn" onclick="wizardBack()" style="display: none;">←</button>
+            <button type="button" id="nextBtn" onclick="wizardNext()">🏁 Register as Active Driver</button>
         </div>
-        <div class="input-group" id="phoneGroup" style="display: none;">
-            <label for="driverPhone">📱 Phone Number: <span style="color: #f48771;">*</span></label>
-            <input type="tel" id="driverPhone" placeholder="Enter phone number (required)">
-            <small id="driverPhoneHelp" style="color: #6e6e6e; font-style: italic;">Required for race result delivery</small>
-        </div>
-        <button onclick="updateDriver()">🏁 Register as Active Driver</button>
         <div id="status" class="status" style="display: none;"></div>
         <div id="timerStatus" style="display: none; margin-top: 15px;"></div>
 
@@ -1218,6 +1436,120 @@ HTML_CONTENT = r"""
         let pollInterval = 1000;
         const maxPollInterval = 10000;
         let pendingSubmission = null;
+
+        // Lead-gen survey wizard: contact info first, then one question per
+        // page. Questions cannot be skipped - Next requires an answer.
+        let surveyQuestions = [];
+        let lastSurveyJson = '';
+        let surveyActive = false;
+        let currentStep = 0;   // 0 = contact info, 1..N = survey questions
+
+        function escapeHtml(s) {
+            return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+        }
+
+        function totalSteps() { return surveyActive ? 1 + surveyQuestions.length : 1; }
+
+        function renderSurvey() {
+            const host = document.getElementById('surveySteps');
+            let html = '';
+            for (const q of surveyQuestions) {
+                html += '<div class="wizard-step survey-step" id="stepQ' + q.id + '">' +
+                        '<div class="survey-question"><label>' + escapeHtml(q.prompt) + '</label>';
+                for (const opt of q.options) {
+                    html += '<label class="survey-option"><input type="radio" name="survey_q' + q.id +
+                            '" value="' + escapeHtml(opt) + '">' + escapeHtml(opt) + '</label>';
+                }
+                html += '</div></div>';
+            }
+            host.innerHTML = html;
+            currentStep = 0;
+            updateWizard();
+        }
+
+        function updateWizard() {
+            document.getElementById('stepContact').classList.toggle('active', currentStep === 0);
+            surveyQuestions.forEach((q, i) => {
+                const el = document.getElementById('stepQ' + q.id);
+                if (el) el.classList.toggle('active', surveyActive && currentStep === i + 1);
+            });
+            const progress = document.getElementById('wizardProgress');
+            if (surveyActive && currentStep > 0) {
+                progress.textContent = 'Question ' + currentStep + ' of ' + surveyQuestions.length;
+                progress.style.display = 'block';
+            } else {
+                progress.style.display = 'none';
+            }
+            document.getElementById('backBtn').style.display = currentStep > 0 ? 'block' : 'none';
+            if (isConnected) {
+                document.getElementById('nextBtn').textContent =
+                    (currentStep === totalSteps() - 1) ? '🏁 Register as Active Driver' : 'Next →';
+            }
+        }
+
+        function hideStatus() {
+            document.getElementById('status').style.display = 'none';
+        }
+
+        function showStepError(message) {
+            const statusDiv = document.getElementById('status');
+            statusDiv.textContent = message;
+            statusDiv.className = 'status error';
+            statusDiv.style.display = 'block';
+        }
+
+        function validateContactStep() {
+            const driverName = document.getElementById('driverName').value.trim();
+            const driverEmail = document.getElementById('driverEmail')?.value?.trim() || '';
+            const driverPhone = document.getElementById('driverPhone')?.value?.trim() || '';
+            const emailInput = document.getElementById('driverEmail');
+            const leadGenEnabled = document.getElementById('emailGroup').style.display !== 'none';
+            if (!driverName) return 'Please enter your name';
+            if (leadGenEnabled && !driverEmail) return 'Please enter your email address';
+            if (leadGenEnabled && emailInput && !emailInput.checkValidity()) return 'Please enter a valid email address';
+            if (leadGenEnabled && !driverPhone) return 'Please enter your phone number';
+            return null;
+        }
+
+        function wizardBack() {
+            if (currentStep > 0) {
+                currentStep--;
+                updateWizard();
+                hideStatus();
+            }
+        }
+
+        async function wizardNext() {
+            if (currentStep === 0) {
+                const err = validateContactStep();
+                if (err) { showStepError(err); return; }
+            } else {
+                const q = surveyQuestions[currentStep - 1];
+                if (!q || !document.querySelector('input[name="survey_q' + q.id + '"]:checked')) {
+                    showStepError('Please select an answer to continue');
+                    return;
+                }
+            }
+            hideStatus();
+            if (currentStep === totalSteps() - 1) {
+                await updateDriver();
+            } else {
+                currentStep++;
+                updateWizard();
+            }
+        }
+
+        function collectSurveyAnswers() {
+            // Returns {answers} or {missing: prompt} for the first unanswered question
+            const answers = {};
+            if (!surveyActive) return { answers };
+            for (const q of surveyQuestions) {
+                const sel = document.querySelector('input[name="survey_q' + q.id + '"]:checked');
+                if (!sel) return { missing: q.prompt };
+                answers[q.id] = sel.value;
+            }
+            return { answers };
+        }
 
         // Enterprise-grade submission with timeout and retry
         const REQUEST_TIMEOUT_MS = 5000;  // 5 second timeout per attempt
@@ -1263,19 +1595,19 @@ HTML_CONTENT = r"""
 
         function updateConnectionStatus(connected, message) {
             const indicator = document.getElementById('connectionStatus');
-            const submitBtn = document.querySelector('button');
+            const nextBtn = document.getElementById('nextBtn');
             isConnected = connected;
 
             if (connected) {
                 indicator.textContent = '🟢 Connected';
                 indicator.className = 'connected';
-                submitBtn.disabled = false;
-                submitBtn.textContent = '🏁 Register as Active Driver';
+                nextBtn.disabled = false;
+                updateWizard();  // restores the Next/Register label for the current step
             } else {
                 indicator.textContent = message || '🔴 Reconnecting...';
                 indicator.className = message ? 'connecting' : 'disconnected';
-                submitBtn.disabled = true;
-                submitBtn.textContent = 'Waiting for server...';
+                nextBtn.disabled = true;
+                nextBtn.textContent = 'Waiting for server...';
             }
         }
 
@@ -1342,12 +1674,21 @@ HTML_CONTENT = r"""
                 return;
             }
 
+            const survey = collectSurveyAnswers();
+            if (survey.missing) {
+                statusDiv.textContent = 'Please answer: ' + survey.missing;
+                statusDiv.className = 'status error';
+                statusDiv.style.display = 'block';
+                return;
+            }
+            const surveyAnswers = survey.answers;
+
             // Check connection first
             if (!isConnected) {
                 statusDiv.textContent = '⏳ Waiting for server connection...';
                 statusDiv.className = 'status error';
                 statusDiv.style.display = 'block';
-                pendingSubmission = { driver_name: driverName, driver_email: submitEmail, driver_phone: submitPhone };
+                pendingSubmission = { driver_name: driverName, driver_email: submitEmail, driver_phone: submitPhone, survey_answers: surveyAnswers };
                 return;
             }
 
@@ -1356,7 +1697,7 @@ HTML_CONTENT = r"""
                 const data = await submitWithRetry('/set_driver', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ driver_name: driverName, driver_email: submitEmail, driver_phone: submitPhone })
+                    body: JSON.stringify({ driver_name: driverName, driver_email: submitEmail, driver_phone: submitPhone, survey_answers: surveyAnswers })
                 }, 3);
 
                 if (data.success) {
@@ -1365,6 +1706,13 @@ HTML_CONTENT = r"""
                     document.getElementById('currentDriverName').textContent = driverName;
                     document.getElementById('currentDriverBox').style.display = 'flex';
                     pendingSubmission = null;
+                    // Reset the wizard for the next customer
+                    document.getElementById('driverName').value = '';
+                    if (document.getElementById('driverEmail')) document.getElementById('driverEmail').value = '';
+                    if (document.getElementById('driverPhone')) document.getElementById('driverPhone').value = '';
+                    document.querySelectorAll('#surveySteps input[type="radio"]').forEach(r => { r.checked = false; });
+                    currentStep = 0;
+                    updateWizard();
                 } else {
                     statusDiv.textContent = data.error ? '❌ ' + data.error : '❌ Failed to register';
                     statusDiv.className = 'status error';
@@ -1374,7 +1722,7 @@ HTML_CONTENT = r"""
                 statusDiv.textContent = '⏳ Queued - will retry when connected...';
                 statusDiv.className = 'status error';
                 statusDiv.style.display = 'block';
-                pendingSubmission = { driver_name: driverName, driver_email: submitEmail, driver_phone: submitPhone };
+                pendingSubmission = { driver_name: driverName, driver_email: submitEmail, driver_phone: submitPhone, survey_answers: surveyAnswers };
                 updateConnectionStatus(false);
             }
         }
@@ -1389,6 +1737,13 @@ HTML_CONTENT = r"""
                 }
                 if (pendingSubmission.driver_phone) {
                     document.getElementById('driverPhone').value = pendingSubmission.driver_phone;
+                }
+                if (pendingSubmission.survey_answers) {
+                    for (const [qid, val] of Object.entries(pendingSubmission.survey_answers)) {
+                        document.querySelectorAll('input[name="survey_q' + qid + '"]').forEach(r => {
+                            if (r.value === val) r.checked = true;
+                        });
+                    }
                 }
                 await updateDriver();
             }
@@ -1439,6 +1794,21 @@ HTML_CONTENT = r"""
                     if (!leadGenEnabled) {
                         if (emailInput) emailInput.value = '';
                         if (phoneInput) phoneInput.value = '';
+                    }
+                    // Survey questions: only re-render when the config changes so
+                    // polling never wipes a half-answered wizard
+                    const sq = Array.isArray(data.survey_questions) ? data.survey_questions : [];
+                    const sqJson = JSON.stringify(sq);
+                    const nowActive = leadGenEnabled && sq.length > 0;
+                    if (sqJson !== lastSurveyJson) {
+                        lastSurveyJson = sqJson;
+                        surveyQuestions = sq;
+                        surveyActive = nowActive;
+                        renderSurvey();
+                    } else if (nowActive !== surveyActive) {
+                        surveyActive = nowActive;
+                        currentStep = 0;
+                        updateWizard();
                     }
                     // Background
                     if (data.background_image) {
@@ -3802,11 +4172,30 @@ def set_driver():
             driver_email = ""
             driver_phone = ""
 
+        # Lead-gen survey: every configured question must be answered with one
+        # of its own options (answers keyed by question index from /get_settings)
+        survey_answers_raw = data.get('survey_answers') or {}
+        answers_by_prompt = {}
+        questions = []
+        if main_window is not None and hasattr(main_window, 'lead_questions'):
+            questions = main_window.lead_questions.get('questions', [])
+        if is_lead_gen_enabled() and questions:
+            for idx, q in enumerate(questions):
+                answer = str(survey_answers_raw.get(str(idx), survey_answers_raw.get(idx, '')) or '').strip()
+                if answer not in q['options']:
+                    return jsonify({'success': False, 'error': f"Please answer: {q['prompt']}"}), 400
+                answers_by_prompt[q['prompt']] = answer
+
         if main_window:
             # Store contact fields before changing the driver so session-start
             # notifications and partner events carry the right data.
             main_window.last_driver_email = driver_email or ""
             main_window.last_driver_phone = driver_phone or ""
+            main_window.last_survey_answers = answers_by_prompt
+
+            # Persist the lead (name/email/phone + survey answers) to leads.csv
+            if is_lead_gen_enabled():
+                append_lead_to_csv(driver_name, driver_email, driver_phone, answers_by_prompt)
 
             # Emit signal to UI thread to update driver and start video
             try:
@@ -3842,7 +4231,8 @@ def get_settings():
                 'started': False,
                 'count': 0,
                 'target': 0
-            }
+            },
+            'survey_questions': []
         })
     
     # Lead Gen requires both email and phone before a driver can continue.
@@ -3872,6 +4262,13 @@ def get_settings():
         'target': int(getattr(main_window, 'lap_rotation_target', 0)),
     }
     
+    # Survey questions for the registration page (id = index, used as the
+    # answer key in /set_driver)
+    survey_questions = [
+        {'id': idx, 'prompt': q['prompt'], 'options': q['options']}
+        for idx, q in enumerate(getattr(main_window, 'lead_questions', {}).get('questions', []))
+    ]
+
     return jsonify({
         'lead_gen_enabled': lead_gen_enabled,
         'require_email': lead_gen_enabled,
@@ -3881,7 +4278,8 @@ def get_settings():
         'timer_seconds_left': timer_seconds_left,
         'rotation_mode': rotation_mode,
         'laps_active': laps_active,
-        'laps_progress': laps_progress
+        'laps_progress': laps_progress,
+        'survey_questions': survey_questions
     })
 
 @app.route('/backgrounds/<filename>')
@@ -4539,6 +4937,7 @@ class GameMonitor(QThread):
         self.running = True
         self.last_lap_time = 0
         self.is_connected = False
+        self.poll_interval_ms = 100  # Subclasses may tighten this (sector challenge needs finer sampling)
     
     def get_current_driver(self):
         """Get the current driver name from main window"""
@@ -4587,7 +4986,7 @@ class GameMonitor(QThread):
                         driver = self.get_current_driver()
                         self.lap_completed.emit(lap_time, driver)
 
-                    self.msleep(100)  # Check every 100ms
+                    self.msleep(self.poll_interval_ms)
 
                 except Exception as e:
                     if self.is_connected:
@@ -5331,12 +5730,156 @@ class AssettoCorsaGraphicsData(ctypes.Structure):
 
 class AssettoCorsaMonitor(GameMonitor):
     game_name = "Assetto Corsa"
-    
+
+    # Custom sector challenge signals
+    sector_result = pyqtSignal(int, float, float, bool)  # sector_index, sector_time_s, target_s, passed
+    challenge_failed = pyqtSignal(int, float, float)     # sector_index, distance_pct, elapsed_s
+
     def __init__(self):
         super().__init__()
         self.last_completed_laps = 0
         self.physics_handle = None
         self.graphics_handle = None
+        self.challenge_config = None
+        self._chal_reset()
+
+    def set_challenge_config(self, config):
+        """Apply a sector challenge config (dict with 'enabled' and 'sectors').
+
+        Called from the UI thread; the reference swap is atomic so the monitor
+        thread always sees a complete config.
+        """
+        self.challenge_config = normalize_sector_config(config) if config else None
+        enabled = bool(self.challenge_config and self.challenge_config.get('enabled'))
+        # Sector boundary/expiry detection needs finer sampling than lap detection
+        self.poll_interval_ms = 20 if enabled else 100
+        self._chal_reset()
+        if enabled:
+            print(f"[Sectors] Challenge active with {len(self.challenge_config['sectors'])} sectors")
+
+    def _challenge_enabled(self):
+        cfg = self.challenge_config
+        return bool(cfg and cfg.get('enabled') and cfg.get('sectors'))
+
+    def _chal_reset(self):
+        self._chal_state = 'idle'      # 'idle' | 'running' | 'failed'
+        self._chal_sector = 0
+        self._chal_sector_anchor_ms = 0
+        self._chal_run_anchor_ms = 0
+        self._chal_prev_pos = None
+        self._chal_prev_ms = None
+        self._chal_lap_ok_latch = False
+
+    def _chal_consume_lap_ok(self):
+        """Read-and-clear the 'run passed all sectors' verdict.
+
+        Latched because completedLaps can tick one poll after the spline
+        position wraps, so the verdict and AC's lap event may not land on the
+        same 20ms sample.
+        """
+        ok = self._chal_lap_ok_latch
+        self._chal_lap_ok_latch = False
+        return ok
+
+    def _chal_begin_run(self, anchor_ms):
+        self._chal_state = 'running'
+        self._chal_sector = 0
+        self._chal_sector_anchor_ms = anchor_ms
+        self._chal_run_anchor_ms = anchor_ms
+
+    def _chal_fail(self, sector_index, pos, lap_ms):
+        self._chal_state = 'failed'
+        distance_pct = max(0.0, min(pos, 1.0)) * 100.0
+        elapsed_s = max(0, lap_ms - self._chal_run_anchor_ms) / 1000.0
+        print(f"[Sectors] FAILED sector {sector_index + 1} at {distance_pct:.2f}% (elapsed {elapsed_s:.3f}s)")
+        self.challenge_failed.emit(sector_index, distance_pct, elapsed_s)
+
+    def _challenge_update(self, graphics):
+        """Judge the current run against the configured sector targets.
+
+        Returns True only on the poll where the car crosses the finish line
+        having met every sector target (that lap may go to the leaderboard).
+        """
+        sectors = self.challenge_config['sectors']
+        pos = float(graphics.normalizedCarPosition)
+        lap_ms = int(graphics.iCurrentTime)
+        prev_pos = self._chal_prev_pos
+        prev_ms = self._chal_prev_ms
+        self._chal_prev_pos = pos
+        self._chal_prev_ms = lap_ms
+
+        if prev_pos is None:
+            return False
+
+        # iCurrentTime is INT32_MAX while AC has no live lap running
+        timer_valid = 0 <= lap_ms < 86400000
+        prev_timer_valid = prev_ms is not None and 0 <= prev_ms < 86400000
+        line_crossed = prev_pos > 0.9 and pos < 0.1
+        timer_reset = timer_valid and prev_timer_valid and lap_ms + 500 < prev_ms
+        teleported = (prev_pos - pos) > 0.05 and not line_crossed
+
+        if self._chal_state == 'running':
+            if line_crossed:
+                lap_ok = False
+                if self._chal_sector == len(sectors) - 1:
+                    # Judge the final sector using the last time before the timer reset
+                    final_target = sectors[self._chal_sector]['target_time']
+                    elapsed_s = max(0, prev_ms - self._chal_sector_anchor_ms) / 1000.0 if prev_timer_valid else 0.0
+                    passed = elapsed_s <= final_target
+                    self.sector_result.emit(self._chal_sector, elapsed_s, final_target, passed)
+                    if passed:
+                        print(f"[Sectors] Run COMPLETE - all {len(sectors)} sectors passed")
+                        lap_ok = True
+                    else:
+                        self._chal_fail(self._chal_sector, prev_pos, prev_ms)
+                else:
+                    print(f"[Sectors] Line crossed in sector {self._chal_sector + 1} - run not scored")
+                self._chal_lap_ok_latch = lap_ok
+                if self._chal_state != 'failed':
+                    # The next run starts immediately at the line (lap timer restarts at ~0)
+                    self._chal_begin_run(0)
+                return lap_ok
+
+            if timer_reset or teleported or not timer_valid:
+                # Session restarted or car reset mid-run - abandon without scoring
+                print("[Sectors] Run abandoned (session restart or car reset)")
+                self._chal_state = 'idle'
+                return False
+
+            i = self._chal_sector
+            target_ms = sectors[i]['target_time'] * 1000.0
+            elapsed_ms = lap_ms - self._chal_sector_anchor_ms
+            if i < len(sectors) - 1 and pos >= sectors[i + 1]['start_pct'] / 100.0:
+                passed = elapsed_ms <= target_ms
+                self.sector_result.emit(i, elapsed_ms / 1000.0, sectors[i]['target_time'], passed)
+                if passed:
+                    print(f"[Sectors] Sector {i + 1} passed: {elapsed_ms / 1000.0:.3f}s (target {sectors[i]['target_time']:.3f}s)")
+                    self._chal_sector = i + 1
+                    self._chal_sector_anchor_ms = lap_ms
+                else:
+                    self._chal_fail(i, pos, lap_ms)
+            elif elapsed_ms > target_ms:
+                # Time expired mid-sector: instant fail, don't wait for the boundary
+                self.sector_result.emit(i, elapsed_ms / 1000.0, sectors[i]['target_time'], False)
+                self._chal_fail(i, pos, lap_ms)
+            return False
+
+        if self._chal_state == 'failed':
+            # Hold until the session restarts or the car is back at the line.
+            # A line crossing also resets the lap timer, so check it first.
+            if line_crossed:
+                self._chal_begin_run(0)
+            elif timer_reset or teleported:
+                self._chal_state = 'idle'
+            return False
+
+        # idle: arm on a line crossing, or on a lap timer freshly counting up
+        # (covers session restarts where the car rolls from the pit/start box)
+        if line_crossed:
+            self._chal_begin_run(0)
+        elif timer_valid and prev_timer_valid and 0 < lap_ms < 3000 and prev_ms < lap_ms:
+            self._chal_begin_run(lap_ms)
+        return False
     
     def connect_to_game(self):
         """Attempt to connect to Assetto Corsa via shared memory"""
@@ -5415,6 +5958,11 @@ class AssettoCorsaMonitor(GameMonitor):
             self.physics_handle.seek(0)
             ctypes.memmove(ctypes.byref(physics), raw_data, ctypes.sizeof(AssettoCorsaData))
 
+            # Judge custom sectors while a challenge is configured (only on live laps)
+            challenge_on = self._challenge_enabled()
+            if challenge_on and graphics.status == 2:
+                self._challenge_update(graphics)
+
             # Debug info only when lap completed (reduce spam)
             if graphics.completedLaps > self.last_completed_laps:
                 print(f"\n=== Lap Completed ===")
@@ -5426,6 +5974,11 @@ class AssettoCorsaMonitor(GameMonitor):
             # Check if we've completed a new lap
             if graphics.completedLaps > self.last_completed_laps:
                 self.last_completed_laps = graphics.completedLaps
+
+                # In challenge mode only laps that beat every sector target count
+                if challenge_on and not self._chal_consume_lap_ok():
+                    print("[Sectors] Lap not scored (sector targets not all met)")
+                    return False, 0
 
                 # Validate racing context first
                 if not is_valid_racing_context(graphics, physics, "Assetto Corsa"):
@@ -6135,6 +6688,183 @@ class F1Monitor(GameMonitor):
 class State:
     ir_connected = False
 
+class SurveyQuestionsDialog(QDialog):
+    """Editor for the lead-gen survey questions shown on the registration page."""
+
+    def __init__(self, config, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Lead Gen Survey Questions")
+        self.resize(760, 480)
+        self.result_config = None
+        self.setStyleSheet("""
+            QDialog { background-color: #252526; }
+            QLabel { color: #9d9d9d; font-size: 12px; }
+            QPushButton {
+                background-color: #3e3e42; color: #e0e0e0; border: none;
+                border-radius: 4px; padding: 8px 14px; font-size: 12px;
+            }
+            QPushButton:hover { background-color: #4e4e52; }
+            QPushButton#saveBtn {
+                background-color: #007acc; color: white; font-weight: bold;
+            }
+            QPushButton#saveBtn:hover { background-color: #0098ff; }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+
+        title = QLabel("📋 Survey Questions")
+        title.setStyleSheet("font-size: 16px; font-weight: bold; color: #e0e0e0;")
+        layout.addWidget(title)
+
+        help_label = QLabel(
+            "Drivers answer these one at a time (as multiple-choice pages) when they sign up on the tablet. "
+            "They can't skip a question, and every answer is saved to leads.csv for export.\n"
+            "Click a cell to type. Separate answer options with commas — at least 2 per question."
+        )
+        help_label.setWordWrap(True)
+        layout.addWidget(help_label)
+
+        example_label = QLabel(
+            "Example  —  Question: How much money does your company manage?    "
+            "Answer options: 1-5M, 10-25M, 50-100M, 250M+"
+        )
+        example_label.setWordWrap(True)
+        example_label.setStyleSheet("color: #6e6e6e; font-style: italic; font-size: 11px;")
+        layout.addWidget(example_label)
+
+        self.table = QTableWidget(0, 2)
+        self.table.setHorizontalHeaderLabels(["Question", "Answer options (comma-separated)"])
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.table.verticalHeader().setDefaultSectionSize(34)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.AllEditTriggers)
+        self.table.setStyleSheet("""
+            QTableWidget {
+                background-color: #1e1e1e; color: #e0e0e0;
+                border: 1px solid #3e3e42; font-size: 12px;
+            }
+            QTableWidget::item { padding: 4px; }
+            QTableWidget::item:selected { background-color: #094771; }
+            QHeaderView::section {
+                background-color: #2d2d30; color: #9d9d9d;
+                border: none; padding: 6px; font-size: 11px; font-weight: bold;
+            }
+        """)
+        layout.addWidget(self.table)
+        for q in config.get('questions', []):
+            self._add_row(q['prompt'], ", ".join(q['options']))
+
+        saved_note = QLabel(
+            "💾 Saved questions are remembered permanently — they load automatically at your next event."
+        )
+        saved_note.setStyleSheet("color: #4ec9b0; font-size: 11px;")
+        layout.addWidget(saved_note)
+
+        btn_row = QHBoxLayout()
+        add_btn = QPushButton("➕ Add Question")
+        add_btn.clicked.connect(self.on_add_row)
+        remove_btn = QPushButton("➖ Remove Selected")
+        remove_btn.clicked.connect(self.on_remove_row)
+        btn_row.addWidget(add_btn)
+        btn_row.addWidget(remove_btn)
+        btn_row.addStretch()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        save_btn = QPushButton("💾 Save Questions")
+        save_btn.setObjectName("saveBtn")
+        save_btn.clicked.connect(self.on_save)
+        btn_row.addWidget(cancel_btn)
+        btn_row.addWidget(save_btn)
+        layout.addLayout(btn_row)
+
+    def on_add_row(self):
+        self._add_row("", "")
+        # Put the cursor straight into the new question cell so typing can start
+        row = self.table.rowCount() - 1
+        self.table.setCurrentCell(row, 0)
+        self.table.editItem(self.table.item(row, 0))
+
+    def _add_row(self, prompt, options_text):
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        self.table.setItem(row, 0, QTableWidgetItem(prompt))
+        self.table.setItem(row, 1, QTableWidgetItem(options_text))
+
+    def on_remove_row(self):
+        rows = sorted({index.row() for index in self.table.selectedIndexes()}, reverse=True)
+        for row in rows:
+            self.table.removeRow(row)
+
+    def on_save(self):
+        questions = []
+        for row in range(self.table.rowCount()):
+            prompt_item = self.table.item(row, 0)
+            options_item = self.table.item(row, 1)
+            prompt = prompt_item.text().strip() if prompt_item else ''
+            options_text = options_item.text().strip() if options_item else ''
+            if not prompt and not options_text:
+                continue
+            options = [o.strip() for o in options_text.split(',') if o.strip()]
+            if not prompt or len(options) < 2:
+                QMessageBox.warning(self, "Invalid Question",
+                                    f"Row {row + 1}: needs a question and at least 2 comma-separated answer options.")
+                return
+            questions.append({'prompt': prompt, 'options': options})
+        self.result_config = {'questions': questions}
+        self.accept()
+
+class SectorFlashOverlay(QWidget):
+    """Brief pass/fail banner shown at the top of the screen when a custom
+    sector is judged. Never takes focus so game input is not interrupted."""
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint |
+            Qt.WindowType.WindowStaysOnTopHint |
+            Qt.WindowType.Tool
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.label = QLabel()
+        self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.label)
+
+        self._hide_timer = QTimer(self)
+        self._hide_timer.setSingleShot(True)
+        self._hide_timer.timeout.connect(self.hide)
+
+    def show_result(self, sector_number, sector_time, target_time, passed):
+        delta = sector_time - target_time
+        time_text = format_time_ms(int(sector_time * 1000))
+        if passed:
+            text = f"SECTOR {sector_number}  ✔  {time_text}  ({delta:+.3f}s)"
+            color = "#16a34a"
+        else:
+            text = f"SECTOR {sector_number}  ✘  {time_text}  ({delta:+.3f}s)"
+            color = "#dc2626"
+        self.label.setText(text)
+        self.label.setStyleSheet(f"""
+            QLabel {{
+                background-color: {color};
+                color: white;
+                font-size: 42px;
+                font-weight: bold;
+                padding: 18px 40px;
+                border-radius: 12px;
+            }}
+        """)
+        self.adjustSize()
+        screen = QApplication.primaryScreen().geometry()
+        self.move(screen.x() + (screen.width() - self.width()) // 2, screen.y() + 60)
+        self.show()
+        self._hide_timer.start(2500)
+
 class WaitingOverlay(QWidget):
     """Full-screen overlay that shows custom image or looping video until a driver signs up"""
     
@@ -6419,6 +7149,9 @@ class LapTimeSenderWindow(QMainWindow):
         self.lap_rotation_target = 0
         self.lap_rotation_count = 0
         self.lap_count_started = False
+        self.sector_config = load_sector_config()
+        self.lead_questions = load_lead_questions()
+        self.last_survey_answers = {}
         self.setup_ui()
         
         # Start with no monitor active
@@ -6527,6 +7260,10 @@ class LapTimeSenderWindow(QMainWindow):
         # Restore rotation laps
         if settings.get('rotation_laps') and hasattr(self, 'lap_target_input'):
             self.lap_target_input.setText(str(settings['rotation_laps']))
+
+        # Restore Lead Gen toggle
+        if 'lead_gen_enabled' in settings:
+            self.email_field_enabled.setChecked(bool(settings['lead_gen_enabled']))
 
     def setup_ui(self):
         # Main window settings
@@ -7106,7 +7843,90 @@ class LapTimeSenderWindow(QMainWindow):
         self.simulator_refresh_timer = QTimer(self)
         self.simulator_refresh_timer.timeout.connect(self.refresh_network_simulators_ui)
         self.simulator_refresh_timer.start(5000)  # 5 seconds (reduced from 10)
-        
+
+        # Custom Sectors section (Assetto Corsa sector challenge)
+        sector_section = QWidget()
+        sector_section.setObjectName("sectorSection")
+        sector_section.setStyleSheet("""
+            #sectorSection {
+                background-color: #2d2d30;
+                border-radius: 6px;
+                border: 1px solid #3e3e42;
+            }
+        """)
+        sector_layout = QVBoxLayout(sector_section)
+        sector_layout.setContentsMargins(10, 6, 10, 6)
+        sector_layout.setSpacing(4)
+
+        sector_header_row = QHBoxLayout()
+        sector_title = QLabel("🏁 Custom Sectors (Assetto Corsa)")
+        sector_title.setStyleSheet("font-size: 12px; font-weight: bold; color: #e0e0e0;")
+        sector_header_row.addWidget(sector_title)
+        sector_header_row.addStretch()
+        self.sector_challenge_enabled = QCheckBox("Enable Sector Challenge")
+        self.sector_challenge_enabled.setStyleSheet("font-size: 11px; color: #e0e0e0;")
+        self.sector_challenge_enabled.setChecked(bool(self.sector_config.get('enabled')))
+        self.sector_challenge_enabled.toggled.connect(self.on_sector_challenge_toggled)
+        sector_header_row.addWidget(self.sector_challenge_enabled)
+        sector_layout.addLayout(sector_header_row)
+
+        sector_help = QLabel(
+            "Each sector starts at a % of the track and must be completed within its target time. "
+            "Miss a target and the run ends: the waiting screen comes up and the session restarts for the next driver. "
+            "Times accept M:SS.mmm or plain seconds."
+        )
+        sector_help.setWordWrap(True)
+        sector_help.setStyleSheet("font-size: 10px; color: #9d9d9d;")
+        sector_layout.addWidget(sector_help)
+
+        self.sector_table = QTableWidget(0, 2)
+        self.sector_table.setHorizontalHeaderLabels(["Sector Start %", "Target Time"])
+        self.sector_table.horizontalHeader().setStretchLastSection(True)
+        self.sector_table.verticalHeader().setDefaultSectionSize(24)
+        self.sector_table.setMaximumHeight(160)
+        self.sector_table.setStyleSheet("""
+            QTableWidget {
+                background-color: #1e1e1e;
+                color: #e0e0e0;
+                border: 1px solid #3e3e42;
+                font-size: 11px;
+            }
+            QHeaderView::section {
+                background-color: #2d2d30;
+                color: #9d9d9d;
+                border: none;
+                padding: 3px;
+                font-size: 10px;
+            }
+        """)
+        sector_layout.addWidget(self.sector_table)
+
+        sector_btn_row = QHBoxLayout()
+        add_sector_btn = QPushButton("➕ Add Sector")
+        add_sector_btn.clicked.connect(self.on_add_sector_row)
+        remove_sector_btn = QPushButton("➖ Remove Selected")
+        remove_sector_btn.clicked.connect(self.on_remove_sector_row)
+        save_sectors_btn = QPushButton("💾 Save Sectors")
+        save_sectors_btn.clicked.connect(self.on_save_sectors)
+        for btn in (add_sector_btn, remove_sector_btn, save_sectors_btn):
+            btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #3e3e42;
+                    color: #e0e0e0;
+                    border: none;
+                    border-radius: 4px;
+                    padding: 4px 10px;
+                    font-size: 11px;
+                }
+                QPushButton:hover { background-color: #4e4e52; }
+            """)
+            sector_btn_row.addWidget(btn)
+        sector_btn_row.addStretch()
+        sector_layout.addLayout(sector_btn_row)
+
+        card_layout.addWidget(sector_section)
+        self._populate_sector_table()
+
         # Mobile Interface Settings box - Compact
         ipad_box = QWidget()
         ipad_box.setObjectName("ipadBox")
@@ -7289,9 +8109,35 @@ class LapTimeSenderWindow(QMainWindow):
                 border: 1px solid #007acc;
             }
         """)
-        self.email_field_enabled.toggled.connect(lambda checked: self.email_field_enabled.setText("On" if checked else "Off"))
+        self.email_field_enabled.toggled.connect(self._on_lead_gen_toggled)
         self.email_field_enabled.setText("Off")
-        grid_layout.addWidget(self.email_field_enabled, 1, 1)
+
+        # Lead Gen toggle + survey questions editor share the grid cell
+        self.survey_questions_btn = QPushButton("📋 Questions")
+        self.survey_questions_btn.setToolTip("Edit the survey questions shown on the registration page (saved to leads.csv)")
+        self.survey_questions_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #37373d;
+                color: #cccccc;
+                border: 1px solid #3e3e42;
+                padding: 4px 6px;
+                border-radius: 4px;
+                font-weight: 600;
+                font-size: 10px;
+                font-family: 'Segoe UI', 'Arial', sans-serif;
+            }
+            QPushButton:hover {
+                border: 1px solid #007acc;
+            }
+        """)
+        self.survey_questions_btn.clicked.connect(self.on_edit_survey_questions)
+        lead_gen_cell = QWidget()
+        lead_gen_cell_layout = QHBoxLayout(lead_gen_cell)
+        lead_gen_cell_layout.setContentsMargins(0, 0, 0, 0)
+        lead_gen_cell_layout.setSpacing(4)
+        lead_gen_cell_layout.addWidget(self.email_field_enabled)
+        lead_gen_cell_layout.addWidget(self.survey_questions_btn)
+        grid_layout.addWidget(lead_gen_cell, 1, 1)
         
         # Hidden timer widgets for backwards compatibility
         self.timer_label = QLabel()
@@ -7626,6 +8472,7 @@ class LapTimeSenderWindow(QMainWindow):
         
         # Overlay system
         self.waiting_overlay = WaitingOverlay()
+        self.sector_flash = SectorFlashOverlay()
         self.session_active = False  # Track if someone is actively racing
         self.timer_started = False  # Track if session timer has actually started
         self.session_start_timestamp = 0  # Unix timestamp when session started (for queue wait time estimates)
@@ -7682,7 +8529,13 @@ class LapTimeSenderWindow(QMainWindow):
                     print("Connecting monitor signals")
                     self.current_monitor.connection_status.connect(self.update_game_status)
                     self.current_monitor.lap_completed.connect(self.on_lap_completed)
-                    
+
+                    # Wire up the custom sector challenge (Assetto Corsa only)
+                    if hasattr(self.current_monitor, 'set_challenge_config'):
+                        self.current_monitor.sector_result.connect(self.on_sector_result)
+                        self.current_monitor.challenge_failed.connect(self.on_challenge_failed)
+                        self.current_monitor.set_challenge_config(self.sector_config)
+
                     # Start the monitor
                     print(f"Starting {game_name} monitor")
                     self.current_monitor.start()
@@ -7824,8 +8677,12 @@ class LapTimeSenderWindow(QMainWindow):
             QMessageBox.warning(self, "Installation Error", f"Failed to install BeamNG mod:\n{e}")
         
     def on_lap_completed(self, lap_time, driver_name=""):
-        # Automatically send the lap time with the driver who completed it
-        self.send_lap_time(lap_time, from_game=True, override_driver=driver_name)
+        # Automatically send the lap time with the driver who completed it.
+        # In sector challenge mode a completed lap means 100% distance.
+        challenge_on = bool(self.sector_config.get('enabled')) and \
+            self.current_monitor is not None and hasattr(self.current_monitor, 'set_challenge_config')
+        self.send_lap_time(lap_time, from_game=True, override_driver=driver_name,
+                           distance_pct=100.0 if challenge_on else None)
         
         # Check if session should end (time or lap limits reached)
         session_ended = False
@@ -7874,22 +8731,31 @@ class LapTimeSenderWindow(QMainWindow):
         if self.failed_lap_times:
             print(f"\nAttempting to resend {len(self.failed_lap_times)} failed lap times...")
             
-            # Try to send each failed lap time
+            # Retry against every configured receiver (comma-separated), same
+            # as send_lap_time; success on any receiver clears the lap.
+            server_url_str = self.current_server_url or self.server_url.text().strip()
+            server_urls = [u.strip() for u in str(server_url_str).split(',') if u.strip()]
+
             successful_sends = []
             for lap_data in self.failed_lap_times:
-                try:
-                    headers = {'Content-Type': 'application/json'}
-                    response = requests.post(
-                        self.server_url.text().strip(),
-                        json=lap_data,
-                        headers=headers,
-                        timeout=5
-                    )
-                    
-                    if response.status_code == 200:
-                        successful_sends.append(lap_data)
-                        print(f"Successfully resent lap time: {lap_data['lap_time']:.3f}s")
-                except:
+                sent = False
+                for server_url in server_urls:
+                    try:
+                        headers = {'Content-Type': 'application/json'}
+                        response = requests.post(
+                            server_url,
+                            json=lap_data,
+                            headers=headers,
+                            timeout=5
+                        )
+                        if response.status_code == 200:
+                            sent = True
+                    except:
+                        pass
+                if sent:
+                    successful_sends.append(lap_data)
+                    print(f"Successfully resent lap time: {lap_data['lap_time']:.3f}s")
+                else:
                     print(f"Failed to resend lap time: {lap_data['lap_time']:.3f}s")
             
             # Remove successfully sent lap times from the queue
@@ -7906,13 +8772,17 @@ class LapTimeSenderWindow(QMainWindow):
         # Restart the timer
         self.start_retry_timer()
 
-    def send_lap_time(self, lap_time=None, from_game=True, override_driver=""):
+    def send_lap_time(self, lap_time=None, from_game=True, override_driver="",
+                      distance_pct=None, challenge_fail=False):
         """Send the lap time to the server
-        
+
         Args:
             lap_time: The lap time in seconds
             from_game: Whether this came from game telemetry
             override_driver: If provided, use this driver name instead of current
+            distance_pct: Distance traveled (0-100) for sector challenge runs
+            challenge_fail: True for a failed challenge run (elapsed time, not a
+                full lap, so the normal lap time range check doesn't apply)
         """
         try:
             print(f"\n=== send_lap_time called ===")
@@ -7943,8 +8813,9 @@ class LapTimeSenderWindow(QMainWindow):
                 self.show_error("No valid lap time to send!")
                 return False
             
-            # Additional validation for manual entries
-            if lap_time is not None and not validate_lap_time(lap_time, "Manual Entry"):
+            # Additional validation for manual entries (failed challenge runs
+            # carry an elapsed time that can legitimately fall outside lap range)
+            if lap_time is not None and not challenge_fail and not validate_lap_time(lap_time, "Manual Entry"):
                 print(f"FAILED: Invalid lap time {lap_time}")
                 self.show_error(f"Invalid lap time: {lap_time:.3f}s. Must be between 5s and 60 minutes.")
                 return False
@@ -7984,6 +8855,16 @@ class LapTimeSenderWindow(QMainWindow):
             # Include phone if a future registration/queue flow provides it.
             if hasattr(self, 'last_driver_phone') and self.last_driver_phone:
                 data["phone"] = self.last_driver_phone
+
+            # Sector challenge: distance traveled ranks ahead of time on the
+            # receiver when its distance ranking mode is enabled.
+            if distance_pct is not None:
+                data["distance_pct"] = float(round(max(0.0, min(distance_pct, 100.0)), 2))
+
+            # Lead-gen survey answers (question prompt -> chosen option) so
+            # partner receivers can collect the full registration record.
+            if getattr(self, 'last_survey_answers', None):
+                data["survey_answers"] = dict(self.last_survey_answers)
                 
             # Get the server URL from the saved value, not from the UI
             server_url_str = self.current_server_url
@@ -8573,6 +9454,143 @@ class LapTimeSenderWindow(QMainWindow):
         if hasattr(self, 'toggle_waiting_screen_btn'):
             self.toggle_waiting_screen_btn.setText("Hide Waiting Screen")
 
+    # --- Custom sector challenge (Assetto Corsa) ---
+
+    def _populate_sector_table(self):
+        sectors = self.sector_config.get('sectors', [])
+        self.sector_table.setRowCount(len(sectors))
+        for row, s in enumerate(sectors):
+            self.sector_table.setItem(row, 0, QTableWidgetItem(f"{s['start_pct']:g}"))
+            self.sector_table.setItem(row, 1, QTableWidgetItem(format_time_ms(int(s['target_time'] * 1000))))
+
+    def on_add_sector_row(self):
+        row = self.sector_table.rowCount()
+        self.sector_table.insertRow(row)
+        self.sector_table.setItem(row, 0, QTableWidgetItem(""))
+        self.sector_table.setItem(row, 1, QTableWidgetItem(""))
+
+    def on_remove_sector_row(self):
+        rows = sorted({index.row() for index in self.sector_table.selectedIndexes()}, reverse=True)
+        for row in rows:
+            self.sector_table.removeRow(row)
+
+    def on_sector_challenge_toggled(self, checked):
+        self.sector_config['enabled'] = bool(checked)
+        save_sector_config(self.sector_config)
+        self._apply_sector_config_to_monitor()
+
+    def on_save_sectors(self):
+        sectors = []
+        for row in range(self.sector_table.rowCount()):
+            pct_item = self.sector_table.item(row, 0)
+            time_item = self.sector_table.item(row, 1)
+            pct_text = pct_item.text().strip() if pct_item else ''
+            time_text = time_item.text().strip() if time_item else ''
+            if not pct_text and not time_text:
+                continue
+            try:
+                start_pct = float(pct_text.replace('%', ''))
+            except ValueError:
+                self.show_error(f"Sector row {row + 1}: invalid start % '{pct_text}'")
+                return
+            target_time = parse_time_to_seconds(time_text)
+            if target_time is None:
+                self.show_error(f"Sector row {row + 1}: invalid target time '{time_text}' (use M:SS.mmm or seconds)")
+                return
+            sectors.append({'start_pct': start_pct, 'target_time': target_time})
+
+        config = normalize_sector_config({
+            'enabled': self.sector_challenge_enabled.isChecked(),
+            'sectors': sectors,
+        })
+        if not config:
+            self.show_error("Invalid sectors: need at least one, start % between 0 and 99.9, no duplicate start %, times above 0.")
+            return
+
+        self.sector_config = config
+        save_sector_config(config)
+        self._populate_sector_table()
+        self._apply_sector_config_to_monitor()
+        self.show_success(f"✅ Saved {len(config['sectors'])} custom sectors")
+
+    def _apply_sector_config_to_monitor(self):
+        if self.current_monitor and hasattr(self.current_monitor, 'set_challenge_config'):
+            self.current_monitor.set_challenge_config(self.sector_config)
+
+    def on_sector_result(self, sector_index, sector_time, target_time, passed):
+        self.sector_flash.show_result(sector_index + 1, sector_time, target_time, passed)
+
+    def on_challenge_failed(self, sector_index, distance_pct, elapsed_s):
+        """A driver missed a sector target: score the partial run, restart AC,
+        and bring up the waiting screen for the next driver."""
+        print(f"[Sectors] Run over in sector {sector_index + 1}: {distance_pct:.2f}% of track in {elapsed_s:.3f}s")
+
+        driver = self.driver_name.text().strip() if hasattr(self.driver_name, 'text') else ''
+        if driver:
+            self.send_lap_time(elapsed_s, from_game=True, override_driver=driver,
+                               distance_pct=distance_pct, challenge_fail=True)
+
+        # Restart AC first (while the game still has keyboard focus), then the
+        # waiting flow; end_session also clears the driver for the next person.
+        QTimer.singleShot(600, self.restart_ac_session)
+        QTimer.singleShot(1500, self.end_session)
+
+    def restart_ac_session(self):
+        """Send Assetto Corsa its default 'Restart session' hotkey (Ctrl+O) so
+        the car teleports back to the start for the next driver."""
+        try:
+            user32 = ctypes.windll.user32
+            hwnd = user32.FindWindowW(None, "Assetto Corsa")
+            if not hwnd:
+                matches = []
+
+                @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+                def enum_proc(handle, _):
+                    buf = ctypes.create_unicode_buffer(256)
+                    user32.GetWindowTextW(handle, buf, 256)
+                    if "assetto corsa" in buf.value.lower():
+                        matches.append(handle)
+                    return True
+
+                user32.EnumWindows(enum_proc, None)
+                hwnd = matches[0] if matches else None
+
+            if not hwnd:
+                print("[Sectors] Assetto Corsa window not found - cannot auto-restart")
+                return
+
+            if user32.GetForegroundWindow() != hwnd:
+                user32.SetForegroundWindow(hwnd)
+                time.sleep(0.15)
+
+            VK_CONTROL, VK_O = 0x11, 0x4F
+            KEYEVENTF_KEYUP = 0x0002
+            user32.keybd_event(VK_CONTROL, 0, 0, 0)
+            user32.keybd_event(VK_O, 0, 0, 0)
+            time.sleep(0.05)
+            user32.keybd_event(VK_O, 0, KEYEVENTF_KEYUP, 0)
+            user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
+            print("[Sectors] Sent Ctrl+O restart to Assetto Corsa")
+        except Exception as e:
+            print(f"[Sectors] Could not restart AC session: {e}")
+
+    def _on_lead_gen_toggled(self, checked):
+        """Persist the Lead Gen toggle immediately so the next event starts
+        with the same setup (no Apply Settings click needed)."""
+        self.email_field_enabled.setText("On" if checked else "Off")
+        settings = load_app_settings()
+        settings['lead_gen_enabled'] = bool(checked)
+        save_app_settings(settings)
+
+    def on_edit_survey_questions(self):
+        """Open the lead-gen survey questions editor."""
+        dialog = SurveyQuestionsDialog(self.lead_questions, self)
+        if dialog.exec() and dialog.result_config is not None:
+            self.lead_questions = dialog.result_config
+            save_lead_questions(self.lead_questions)
+            count = len(self.lead_questions['questions'])
+            self.show_success(f"✅ Saved {count} survey question{'s' if count != 1 else ''}")
+
     def play_pre_session_video(self, path):
         # Hide waiting screen first
         self.waiting_overlay.hide()
@@ -8667,15 +9685,24 @@ class LapTimeSenderWindow(QMainWindow):
                     'queue_id': queue_id or '',
                     'session_id': getattr(self, 'current_session_id', ''),
                     'email': getattr(self, 'last_driver_email', ''),
-                    'phone': getattr(self, 'last_driver_phone', '')
+                    'phone': getattr(self, 'last_driver_phone', ''),
+                    'survey_answers': dict(getattr(self, 'last_survey_answers', {}) or {})
                 }
-                response = requests.post(
-                    f"{self.current_server_url}/api/session/started",
-                    json=data,
-                    timeout=2.0
-                )
-                if response.ok:
-                    print(f"[QUEUE] Session start reported to receiver")
+                # current_server_url may hold several comma-separated receivers
+                any_ok = False
+                for server_url in [u.strip() for u in str(self.current_server_url).split(',') if u.strip()]:
+                    try:
+                        response = requests.post(
+                            f"{server_url}/api/session/started",
+                            json=data,
+                            timeout=2.0
+                        )
+                        if response.ok:
+                            any_ok = True
+                    except Exception as e:
+                        print(f"[QUEUE] Could not notify {server_url} of session start: {e}")
+                if any_ok:
+                    print(f"[QUEUE] Session start reported to receiver(s)")
                     # Clear assigned queue ID after session starts
                     self.assigned_queue_id = None
         except Exception as e:
@@ -8694,13 +9721,18 @@ class LapTimeSenderWindow(QMainWindow):
                     'simulator_ip': get_local_ip(),
                     'duration_seconds': duration
                 }
-                response = requests.post(
-                    f"{self.current_server_url}/api/session/ended",
-                    json=data,
-                    timeout=2.0
-                )
-                if response.ok:
-                    print(f"[QUEUE] Session end reported to receiver (duration: {duration}s)")
+                # current_server_url may hold several comma-separated receivers
+                for server_url in [u.strip() for u in str(self.current_server_url).split(',') if u.strip()]:
+                    try:
+                        response = requests.post(
+                            f"{server_url}/api/session/ended",
+                            json=data,
+                            timeout=2.0
+                        )
+                        if response.ok:
+                            print(f"[QUEUE] Session end reported to {server_url} (duration: {duration}s)")
+                    except Exception as e:
+                        print(f"[QUEUE] Could not notify {server_url} of session end: {e}")
         except Exception as e:
             print(f"[QUEUE] Could not notify receiver of session end: {e}")
 
@@ -8852,7 +9884,8 @@ class LapTimeSenderWindow(QMainWindow):
             'lead_gen_enabled': lead_gen_enabled,
             'rotation_mode': self.rotation_mode_selector.currentText(),
             'rotation_time': self.time_target_input.text() if hasattr(self, 'time_target_input') else '5',
-            'rotation_laps': self.lap_target_input.text() if hasattr(self, 'lap_target_input') else '10'
+            'rotation_laps': self.lap_target_input.text() if hasattr(self, 'lap_target_input') else '10',
+            'lead_gen_enabled': self.email_field_enabled.isChecked()
         }
         save_app_settings(settings)
 

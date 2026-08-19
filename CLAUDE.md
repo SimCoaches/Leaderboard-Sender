@@ -58,6 +58,23 @@ Lua extension for BeamNG.drive that sends lap times via UDP:
 - `lua/ge/extensions/leaderboardSender.lua`: Hooks into game events (`onRaceWaypointReached`, `onMissionAttemptAggregated`)
 - Sends UDP packets in format: `LAP|time|vehicle|track|valid|timestamp`
 
+### Custom Sector Challenge (Assetto Corsa)
+
+Event mode where the track is divided into any number of custom sectors (defined
+as track-position percentages in `sector_config.json`), each with a target time.
+Runs are judged live in `AssettoCorsaMonitor` using `normalizedCarPosition` +
+`iCurrentTime` from shared memory (20ms polling while enabled):
+
+- Beat a sector target → keep driving (green flash via `SectorFlashOverlay`)
+- Time expires mid-sector → instant fail: partial run is submitted with its
+  `distance_pct`, AC is restarted via a simulated Ctrl+O (AC's default
+  "Restart session" hotkey must be unchanged), and the waiting screen comes up
+- Complete all sectors → lap submitted normally with `distance_pct: 100`
+
+The Receiver's `ranking_mode: "distance"` config ranks these runs by distance
+traveled descending, lap/elapsed time as tiebreaker. Configured in the
+"Custom Sectors" section of the main window.
+
 ### Data Flow
 
 1. Game monitor reads telemetry (shared memory/SDK/UDP)
