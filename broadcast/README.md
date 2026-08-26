@@ -80,14 +80,16 @@ Texture dropdown:
 
 | Texture                  | View                                              |
 |--------------------------|---------------------------------------------------|
-| `Camera: Chase`          | Third-person chase camera behind the car (default)|
-| `Camera: Track camera`   | AC's trackside TV cameras, auto-switching         |
+| `Camera: Track camera`   | TV-style broadcast: AC's trackside cameras panning with the car and cutting automatically (default) |
 | `Camera: Track camera 2…`| Additional TV camera sets, where the track has them|
+| `Camera: Chase`          | Third-person chase camera behind the car          |
 | `Camera: Above`          | Overhead view                                     |
 | `Basic: Clean view`      | Driver's view without HUD (for streaming/recording)|
 
-The Nürburgring layouts ship with proper TV camera sets, so
-`Camera: Track camera` gives a real broadcast feel there.
+The Nürburgring layouts ship with proper TV camera sets, so the default
+gives a real broadcast feel there. Note the TV cameras come from the
+track's data, so on mod tracks without camera sets fall back to
+`Camera: Chase`.
 
 ## Performance notes
 
