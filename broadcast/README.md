@@ -29,7 +29,10 @@ Run `LapTimeSenderSetup.exe` — the tasks page handles the whole rig:
   collection, and suppresses OBS's first-run wizard.
 - **"Start the broadcast screen automatically with Windows"** (sub-option):
   adds OBS minimized-to-tray to the user's Startup folder, so the 4th screen
-  comes up on its own after boot.
+  comes up on its own after boot. The launcher also clears OBS's
+  unclean-shutdown marker first, so a power-cycled rig never gets stuck on
+  OBS's "start in Safe Mode?" dialog (OBS 30+ shows one, and OBS 32 removed
+  the command-line flag that used to suppress it).
 
 Logs land in `broadcast\setup_broadcast.<stage>.log` and
 `ac_app\install_ac_app.log` in the install folder. Afterwards run
