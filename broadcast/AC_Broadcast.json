@@ -1,0 +1,123 @@
+{
+    "current_program_scene": "AC Broadcast",
+    "current_scene": "AC Broadcast",
+    "current_transition": "Cut",
+    "groups": [],
+    "modules": {},
+    "name": "AC Broadcast",
+    "preview_locked": false,
+    "quick_transitions": [],
+    "saved_projectors": [
+        {
+            "alwaysOnTop": true,
+            "geometry": "",
+            "monitor": 3,
+            "name": "AC Broadcast",
+            "type": "Scene"
+        }
+    ],
+    "scaling_enabled": false,
+    "scene_order": [
+        {
+            "name": "AC Broadcast"
+        }
+    ],
+    "sources": [
+        {
+            "balance": 0.5,
+            "deinterlace_field_order": 0,
+            "deinterlace_mode": 0,
+            "enabled": true,
+            "flags": 0,
+            "hotkeys": {},
+            "id": "scene",
+            "mixers": 0,
+            "monitoring_type": 0,
+            "muted": false,
+            "name": "AC Broadcast",
+            "prev_ver": 503316484,
+            "private_settings": {},
+            "push-to-mute": false,
+            "push-to-mute-delay": 0,
+            "push-to-talk": false,
+            "push-to-talk-delay": 0,
+            "settings": {
+                "custom_size": false,
+                "id_counter": 1,
+                "items": [
+                    {
+                        "align": 5,
+                        "blend_method": "default",
+                        "blend_type": "normal",
+                        "bounds": {
+                            "x": 1920.0,
+                            "y": 1080.0
+                        },
+                        "bounds_align": 0,
+                        "bounds_type": 2,
+                        "crop_bottom": 0,
+                        "crop_left": 0,
+                        "crop_right": 0,
+                        "crop_top": 0,
+                        "group_item_backup": false,
+                        "hide_transition": {
+                            "duration": 0
+                        },
+                        "id": 1,
+                        "locked": false,
+                        "name": "AC External Camera",
+                        "pos": {
+                            "x": 0.0,
+                            "y": 0.0
+                        },
+                        "private_settings": {},
+                        "rot": 0.0,
+                        "scale": {
+                            "x": 1.0,
+                            "y": 1.0
+                        },
+                        "scale_filter": "disable",
+                        "show_transition": {
+                            "duration": 0
+                        },
+                        "visible": true
+                    }
+                ]
+            },
+            "sync": 0,
+            "versioned_id": "scene",
+            "volume": 1.0
+        },
+        {
+            "balance": 0.5,
+            "deinterlace_field_order": 0,
+            "deinterlace_mode": 0,
+            "enabled": true,
+            "flags": 0,
+            "hotkeys": {},
+            "id": "accsp_capture",
+            "mixers": 0,
+            "monitoring_type": 0,
+            "muted": false,
+            "name": "AC External Camera",
+            "prev_ver": 503316484,
+            "private_settings": {},
+            "push-to-mute": false,
+            "push-to-mute-delay": 0,
+            "push-to-talk": false,
+            "push-to-talk-delay": 0,
+            "settings": {
+                "brightness": 100,
+                "height": 1080,
+                "name": "Camera: Chase",
+                "skip": 1,
+                "width": 1920
+            },
+            "sync": 0,
+            "versioned_id": "accsp_capture",
+            "volume": 1.0
+        }
+    ],
+    "transition_duration": 300,
+    "transitions": []
+}

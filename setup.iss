@@ -36,6 +36,8 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 Source: "dist\Lap Time Sender\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 ; CSP companion app for Assetto Corsa (user copies it into AC's apps\lua folder)
 Source: "ac_app\*"; DestDir: "{app}\ac_app"; Flags: ignoreversion recursesubdirs createallsubdirs
+; Broadcast screen setup (OBS + CSP plugin, 4th-monitor exterior camera)
+Source: "broadcast\*"; DestDir: "{app}\broadcast"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"

@@ -86,6 +86,16 @@ The Receiver's `ranking_mode: "distance"` config ranks these runs by distance
 traveled descending, lap/elapsed time as tiebreaker. Configured in the
 "Custom Sectors" section of the main window.
 
+### Broadcast Screen (`broadcast/`)
+
+Optional 4th-monitor exterior camera view (chase cam or AC's trackside TV
+cameras) for venues, using CSP's official OBS plugin: CSP renders an extra
+camera inside the same AC process, the plugin (`accsp_capture` OBS source)
+hands the texture to OBS, and OBS fullscreen-projects it on the extra monitor.
+Single PC / single AC instance; no Sender code involved. `setup_broadcast.ps1`
+automates the rig setup (install plugin DLL, import the `AC_Broadcast` scene
+collection, save projector monitor); see `broadcast/README.md`.
+
 ### Data Flow
 
 1. Game monitor reads telemetry (shared memory/SDK/UDP)
