@@ -31,3 +31,4 @@ vc_redist.x64.exe
 
 # Broadcast setup runtime logs
 broadcast/*.log
+ac_app/*.log

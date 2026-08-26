@@ -19,12 +19,24 @@ monitor. The driver's screens are unaffected.
 
 ## Easiest: via the Lap Time Sender installer
 
-Run `LapTimeSenderSetup.exe` and tick **"Set up 4th-screen broadcast
-camera"** on the tasks page. The installer then installs OBS (via winget, if
-missing) and the CSP plugin — one UAC prompt — and imports the scene
-collection into the logged-in user's OBS profile. Logs are written to
-`broadcast\setup_broadcast.<stage>.log` in the install folder. The two
-one-time steps below still apply.
+Run `LapTimeSenderSetup.exe` — the tasks page handles the whole rig:
+
+- **"Install Assetto Corsa companion app"** (on by default): copies the
+  sector-challenge teleport app into AC and enables CSP's OBS integration
+  flag automatically.
+- **"Set up 4th-screen broadcast camera"**: installs OBS (via winget, if
+  missing) and the CSP plugin — one UAC prompt — imports the scene
+  collection, and suppresses OBS's first-run wizard.
+- **"Start the broadcast screen automatically with Windows"** (sub-option):
+  adds OBS minimized-to-tray to the user's Startup folder, so the 4th screen
+  comes up on its own after boot.
+
+Logs land in `broadcast\setup_broadcast.<stage>.log` and
+`ac_app\install_ac_app.log` in the install folder. Afterwards run
+**Start Menu → Lap Time Sender → Rig Health Check** for a PASS/FAIL report
+on the whole chain. The only things the installer cannot do are installing
+CSP itself (done once via Content Manager) and the first-use projector
+check below.
 
 ## Automated setup (standalone script)
 

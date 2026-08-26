@@ -21,6 +21,9 @@
 #   -NonInteractive                no prompts; auto-installs OBS if missing
 #   -ProjectorMonitor <index>      monitor for the broadcast view (0 = first,
 #                                  default 3 = the 4th monitor)
+#   -AutoStart                     add OBS (minimized to tray) to the user's
+#                                  Windows Startup so the broadcast screen
+#                                  comes up on its own after boot
 #
 # A transcript is written next to this script (setup_broadcast.log).
 
@@ -28,7 +31,8 @@ param(
     [ValidateSet('plugin', 'userconfig', 'all')]
     [string]$Stage = 'all',
     [switch]$NonInteractive,
-    [int]$ProjectorMonitor = 3
+    [int]$ProjectorMonitor = 3,
+    [switch]$AutoStart
 )
 
 $ErrorActionPreference = 'Stop'
@@ -155,34 +159,58 @@ function Install-UserConfigStage {
         Set-IniValue $ini 'Basic' 'SceneCollection' 'AC Broadcast'
         Set-IniValue $ini 'Basic' 'SceneCollectionFile' 'AC_Broadcast'
         Set-IniValue $ini 'BasicWindow' 'SaveProjectors' 'true'
+        # Skip the first-launch auto-config wizard - it would fight our config
+        Set-IniValue $ini 'General' 'FirstRun' 'true'
         Write-Host "Updated $ini"
+    }
+
+    # CSP only publishes broadcast cameras when this Small Tweaks flag is set
+    # (also done by install_ac_app.ps1; both are idempotent)
+    Step "Enabling CSP OBS integration (Small Tweaks: [OBS] DIRECT_PASS)"
+    $cspCfgDir = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'Assetto Corsa\cfg\extension'
+    New-Item -ItemType Directory -Force $cspCfgDir | Out-Null
+    Set-IniValue (Join-Path $cspCfgDir 'small_tweaks.ini') 'OBS' 'DIRECT_PASS' '1'
+    Write-Host "Updated $cspCfgDir\small_tweaks.ini"
+
+    if ($AutoStart) {
+        Step "Adding OBS to Windows Startup (minimized to tray)"
+        $obsRoot = Find-Obs
+        if (-not $obsRoot) {
+            Write-Host "OBS not found yet - skipping startup shortcut (re-run after the plugin stage)."
+        } else {
+            $startupDir = [Environment]::GetFolderPath('Startup')
+            $shell = New-Object -ComObject WScript.Shell
+            $shortcut = $shell.CreateShortcut((Join-Path $startupDir 'AC Broadcast (OBS).lnk'))
+            $shortcut.TargetPath = Join-Path $obsRoot 'bin\64bit\obs64.exe'
+            $shortcut.Arguments = '--minimize-to-tray --disable-shutdown-check'
+            # OBS requires its own bin folder as working directory to find its modules
+            $shortcut.WorkingDirectory = Join-Path $obsRoot 'bin\64bit'
+            $shortcut.Description = 'Starts the leaderboard broadcast screen (OBS) with Windows'
+            $shortcut.Save()
+            Write-Host "Created startup shortcut -> $startupDir\AC Broadcast (OBS).lnk"
+        }
     }
 }
 
 if ($Stage -in @('plugin', 'all')) { Install-PluginStage }
 if ($Stage -in @('userconfig', 'all')) { Install-UserConfigStage }
 
-Step "Done. Two one-time steps remain:"
+Step "Done. One verification pass on first use:"
 Write-Host @"
 
-1. ENABLE CSP OBS INTEGRATION (once per rig):
-   Content Manager -> Settings -> Custom Shaders Patch -> Small Tweaks
-   -> enable 'OBS integration'. (Requires CSP v0.1.80 or newer.)
+Start Assetto Corsa into a session, then start OBS.
+The 'AC Broadcast' scene should show the chase camera.
+If the broadcast view is not already filling the 4th screen:
+right-click the scene -> 'Fullscreen Projector (Scene)' -> pick the
+4th monitor. With 'Save projectors on exit' enabled (this script set
+it), OBS reopens it there automatically from then on.
 
-2. VERIFY THE PROJECTOR (once):
-   Start Assetto Corsa into a session, then start OBS.
-   The 'AC Broadcast' scene should show the chase camera.
-   If the broadcast view is not already filling the 4th screen:
-   right-click the scene -> 'Fullscreen Projector (Scene)' -> pick the
-   4th monitor. With 'Save projectors on exit' enabled (this script set
-   it), OBS reopens it there automatically from then on.
+To use AC's trackside TV cameras instead of the chase camera:
+double-click the 'AC External Camera' source and pick
+'Camera: Track camera' from the Texture dropdown.
 
-   To use AC's trackside TV cameras instead of the chase camera:
-   double-click the 'AC External Camera' source and pick
-   'Camera: Track camera' from the Texture dropdown.
-
-Tip: add OBS to Windows startup (obs64.exe --minimize-to-tray) so the
-broadcast screen comes up on its own when the rig boots.
+(CSP's OBS integration flag and the OBS scene were configured
+automatically; CSP v0.1.80+ must be installed via Content Manager.)
 "@
 
 if (-not $NonInteractive) { Read-Host "Press Enter to close" | Out-Null }

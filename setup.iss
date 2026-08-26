@@ -30,7 +30,9 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
-Name: "broadcast"; Description: "Set up 4th-screen broadcast camera (installs OBS Studio + CSP plugin; needs internet and one admin prompt)"; GroupDescription: "Broadcast screen:"; Flags: unchecked
+Name: "acapp"; Description: "Install Assetto Corsa companion app (sector-challenge teleport + CSP OBS integration)"; GroupDescription: "Assetto Corsa integration:"
+Name: "broadcast"; Description: "Set up 4th-screen broadcast camera (installs OBS Studio + CSP plugin; needs internet and one admin prompt)"; GroupDescription: "Assetto Corsa integration:"; Flags: unchecked
+Name: "broadcast\autostart"; Description: "Start the broadcast screen automatically with Windows"
 
 [Files]
 ; Main executable and all files in the dist folder
@@ -42,16 +44,21 @@ Source: "broadcast\*"; DestDir: "{app}\broadcast"; Flags: ignoreversion recurses
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
+Name: "{group}\Rig Health Check"; Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\broadcast\check_rig.ps1"""; IconFilename: "{app}\{#MyAppExeName}"
 Name: "{group}\{cm:UninstallProgram,{#MyAppName}}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
 [Run]
+; AC companion app: copies LeaderboardSector into AC's apps\lua and enables
+; CSP's OBS integration flag. Steam's folder is user-writable, so no elevation.
+Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\ac_app\install_ac_app.ps1"" -NonInteractive"; Flags: waituntilterminated runhidden; Tasks: acapp; StatusMsg: "Installing Assetto Corsa companion app..."
 ; Broadcast setup runs in two stages: the machine-wide part (OBS install +
 ; plugin DLL into Program Files) elevated via a UAC prompt, then the per-user
 ; OBS scene/config as the logged-in user so it lands in their profile.
 Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\broadcast\setup_broadcast.ps1"" -NonInteractive -Stage plugin"; Verb: "runas"; Flags: shellexec waituntilterminated; Tasks: broadcast; StatusMsg: "Setting up broadcast screen: OBS Studio + CSP plugin..."
-Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\broadcast\setup_broadcast.ps1"" -NonInteractive -Stage userconfig"; Flags: waituntilterminated runhidden; Tasks: broadcast; StatusMsg: "Setting up broadcast screen: OBS scene..."
-Filename: "notepad.exe"; Parameters: """{app}\broadcast\README.md"""; Description: "View broadcast screen setup notes (CSP toggle + projector check)"; Flags: postinstall skipifsilent unchecked; Tasks: broadcast
+Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\broadcast\setup_broadcast.ps1"" -NonInteractive -Stage userconfig"; Flags: waituntilterminated runhidden; Tasks: broadcast and not broadcast\autostart; StatusMsg: "Setting up broadcast screen: OBS scene..."
+Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\broadcast\setup_broadcast.ps1"" -NonInteractive -Stage userconfig -AutoStart"; Flags: waituntilterminated runhidden; Tasks: broadcast\autostart; StatusMsg: "Setting up broadcast screen: OBS scene + auto-start..."
+Filename: "notepad.exe"; Parameters: """{app}\broadcast\README.md"""; Description: "View broadcast screen setup notes (first-use projector check)"; Flags: postinstall skipifsilent unchecked; Tasks: broadcast
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
 
 [Code]
