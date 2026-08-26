@@ -17,7 +17,16 @@ monitor. The driver's screens are unaffected.
 - Enough GPU headroom to render the scene twice (the broadcast view is capped
   at 1920×1080 and half refresh rate by default to keep the driver's FPS safe)
 
-## Automated setup (recommended)
+## Easiest: via the Lap Time Sender installer
+
+Run `LapTimeSenderSetup.exe` and tick **"Set up 4th-screen broadcast
+camera"** on the tasks page. The installer then installs OBS (via winget, if
+missing) and the CSP plugin — one UAC prompt — and imports the scene
+collection into the logged-in user's OBS profile. Logs are written to
+`broadcast\setup_broadcast.<stage>.log` in the install folder. The two
+one-time steps below still apply.
+
+## Automated setup (standalone script)
 
 On the customer rig, right-click PowerShell → Run as Administrator, then:
 

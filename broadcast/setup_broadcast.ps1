@@ -1,27 +1,47 @@
 # Broadcast screen setup for the SimRacing Leaderboard system.
 #
 # Sets up the 4th-screen "outside the car" camera view for Assetto Corsa:
-#   1. Verifies OBS Studio is installed (offers winget install if not)
-#   2. Downloads the official CSP OBS plugin (v1.0.0.1) from GitHub and
-#      installs it into OBS's plugin folder
-#   3. Installs the preconfigured "AC Broadcast" OBS scene collection
-#      (chase camera source, fullscreen projector on the chosen monitor)
-#   4. Prints the remaining one-time manual steps (CSP toggle, projector)
+#   - Verifies OBS Studio is installed (installs it via winget if missing)
+#   - Downloads the official CSP OBS plugin (v1.0.0.1) from GitHub and
+#     installs it into OBS's plugin folder
+#   - Installs the preconfigured "AC Broadcast" OBS scene collection
+#     (chase camera source, fullscreen projector on the chosen monitor)
 #
-# Run as Administrator (needed to copy the plugin into Program Files):
+# Standalone use (run as Administrator):
 #   powershell -ExecutionPolicy Bypass -File setup_broadcast.ps1
 #
-# Optional: -ProjectorMonitor <index> picks which monitor the broadcast view
-# fills (0 = first). Default 3 = the 4th monitor.
+# Installer use: the Lap Time Sender installer runs this in two stages so the
+# machine-wide part gets elevation while per-user OBS config lands in the
+# operator's own profile:
+#   -Stage plugin      elevated: OBS check/install + plugin DLL
+#   -Stage userconfig  as the logged-in user: scene collection + OBS ini
+#
+# Params:
+#   -Stage plugin|userconfig|all   (default all)
+#   -NonInteractive                no prompts; auto-installs OBS if missing
+#   -ProjectorMonitor <index>      monitor for the broadcast view (0 = first,
+#                                  default 3 = the 4th monitor)
+#
+# A transcript is written next to this script (setup_broadcast.log).
 
 param(
+    [ValidateSet('plugin', 'userconfig', 'all')]
+    [string]$Stage = 'all',
+    [switch]$NonInteractive,
     [int]$ProjectorMonitor = 3
 )
 
 $ErrorActionPreference = 'Stop'
 $PluginUrl = 'https://github.com/ac-custom-shaders-patch/acc-obs-plugin/releases/download/v1.0.0.1/acc-obs-plugin.zip'
 
-function Fail($msg) { Write-Host "ERROR: $msg" -ForegroundColor Red; exit 1 }
+try { Start-Transcript -Path (Join-Path $PSScriptRoot "setup_broadcast.$Stage.log") -Force | Out-Null } catch {}
+
+function Fail($msg) {
+    Write-Host "ERROR: $msg" -ForegroundColor Red
+    if (-not $NonInteractive) { Read-Host "Press Enter to close" | Out-Null }
+    try { Stop-Transcript | Out-Null } catch {}
+    exit 1
+}
 function Step($msg) { Write-Host "`n== $msg" -ForegroundColor Cyan }
 
 # UTF-8 WITHOUT BOM: OBS's JSON/ini parsers choke on a BOM, and PowerShell
@@ -31,67 +51,56 @@ function Write-TextFile([string]$path, [string]$content) {
     [System.IO.File]::WriteAllText($path, $content, $Utf8NoBom)
 }
 
-# --- 1. Locate OBS Studio ----------------------------------------------------
-Step "Looking for OBS Studio"
-$obsRoot = $null
-foreach ($candidate in @("$env:ProgramFiles\obs-studio", "${env:ProgramFiles(x86)}\obs-studio")) {
-    if (Test-Path "$candidate\bin\64bit\obs64.exe") { $obsRoot = $candidate; break }
-}
-if (-not $obsRoot) {
+function Find-Obs {
+    foreach ($candidate in @("$env:ProgramFiles\obs-studio", "${env:ProgramFiles(x86)}\obs-studio")) {
+        if (Test-Path "$candidate\bin\64bit\obs64.exe") { return $candidate }
+    }
     $reg = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\OBS Studio' -ErrorAction SilentlyContinue
     if ($reg -and $reg.InstallLocation -and (Test-Path "$($reg.InstallLocation)\bin\64bit\obs64.exe")) {
-        $obsRoot = $reg.InstallLocation
+        return $reg.InstallLocation
     }
-}
-if (-not $obsRoot) {
-    Write-Host "OBS Studio is not installed."
-    $answer = Read-Host "Install OBS Studio now via winget? (y/n)"
-    if ($answer -eq 'y') {
-        winget install --id OBSProject.OBSStudio --accept-package-agreements --accept-source-agreements
-        if ($LASTEXITCODE -ne 0) { Fail "winget install failed - install OBS manually from https://obsproject.com and re-run this script." }
-        $obsRoot = "$env:ProgramFiles\obs-studio"
-        if (-not (Test-Path "$obsRoot\bin\64bit\obs64.exe")) { Fail "OBS still not found after install - re-run this script." }
-    } else {
-        Fail "Install OBS Studio from https://obsproject.com and re-run this script."
-    }
-}
-Write-Host "Found OBS at: $obsRoot"
-
-# --- 2. Install the CSP OBS plugin -------------------------------------------
-Step "Installing CSP OBS plugin (official, from ac-custom-shaders-patch GitHub)"
-$pluginDir = Join-Path $obsRoot 'obs-plugins\64bit'
-if (-not (Test-Path $pluginDir)) { Fail "OBS plugin folder not found: $pluginDir" }
-
-$tmp = Join-Path $env:TEMP 'acc-obs-plugin-setup'
-if (Test-Path $tmp) { Remove-Item $tmp -Recurse -Force -Confirm:$false }
-New-Item -ItemType Directory -Force $tmp | Out-Null
-$zipPath = Join-Path $tmp 'acc-obs-plugin.zip'
-Invoke-WebRequest -Uri $PluginUrl -OutFile $zipPath
-Expand-Archive -Path $zipPath -DestinationPath $tmp -Force
-$dlls = Get-ChildItem $tmp -Recurse -Filter '*.dll'
-if (-not $dlls) { Fail "No DLL found inside the plugin zip - the release layout may have changed." }
-foreach ($dll in $dlls) {
-    try {
-        Copy-Item $dll.FullName $pluginDir -Force
-    } catch {
-        Fail "Could not copy $($dll.Name) into $pluginDir - run this script as Administrator."
-    }
-    Write-Host "Installed $($dll.Name) -> $pluginDir"
+    return $null
 }
 
-# --- 3. Install the OBS scene collection -------------------------------------
-Step "Installing 'AC Broadcast' scene collection"
-$sceneSrc = Join-Path $PSScriptRoot 'AC_Broadcast.json'
-if (-not (Test-Path $sceneSrc)) { Fail "AC_Broadcast.json not found next to this script." }
-$scenesDir = Join-Path $env:APPDATA 'obs-studio\basic\scenes'
-New-Item -ItemType Directory -Force $scenesDir | Out-Null
+function Install-PluginStage {
+    Step "Looking for OBS Studio"
+    $obsRoot = Find-Obs
+    if (-not $obsRoot) {
+        Write-Host "OBS Studio is not installed."
+        $doInstall = $NonInteractive
+        if (-not $NonInteractive) {
+            $doInstall = (Read-Host "Install OBS Studio now via winget? (y/n)") -eq 'y'
+        }
+        if (-not $doInstall) { Fail "Install OBS Studio from https://obsproject.com and re-run this script." }
+        winget install --id OBSProject.OBSStudio --accept-package-agreements --accept-source-agreements --silent
+        if ($LASTEXITCODE -ne 0) { Fail "winget install failed - install OBS manually from https://obsproject.com and re-run this script (or re-run the Lap Time Sender installer with the broadcast option)." }
+        $obsRoot = Find-Obs
+        if (-not $obsRoot) { Fail "OBS still not found after install - re-run this script." }
+    }
+    Write-Host "Found OBS at: $obsRoot"
 
-# Point the saved fullscreen projector at the requested monitor
-$sceneJson = Get-Content $sceneSrc -Raw
-$sceneJson = $sceneJson -replace '"monitor":\s*\d+', ('"monitor": {0}' -f $ProjectorMonitor)
-$sceneDest = Join-Path $scenesDir 'AC_Broadcast.json'
-Write-TextFile $sceneDest $sceneJson
-Write-Host "Installed scene collection -> $sceneDest (projector on monitor index $ProjectorMonitor)"
+    Step "Installing CSP OBS plugin (official, from ac-custom-shaders-patch GitHub)"
+    $pluginDir = Join-Path $obsRoot 'obs-plugins\64bit'
+    if (-not (Test-Path $pluginDir)) { Fail "OBS plugin folder not found: $pluginDir" }
+
+    $tmp = Join-Path $env:TEMP 'acc-obs-plugin-setup'
+    if (Test-Path $tmp) { Remove-Item $tmp -Recurse -Force -Confirm:$false }
+    New-Item -ItemType Directory -Force $tmp | Out-Null
+    $zipPath = Join-Path $tmp 'acc-obs-plugin.zip'
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    Invoke-WebRequest -Uri $PluginUrl -OutFile $zipPath
+    Expand-Archive -Path $zipPath -DestinationPath $tmp -Force
+    $dlls = Get-ChildItem $tmp -Recurse -Filter '*.dll'
+    if (-not $dlls) { Fail "No DLL found inside the plugin zip - the release layout may have changed." }
+    foreach ($dll in $dlls) {
+        try {
+            Copy-Item $dll.FullName $pluginDir -Force
+        } catch {
+            Fail "Could not copy $($dll.Name) into $pluginDir - run this script as Administrator."
+        }
+        Write-Host "Installed $($dll.Name) -> $pluginDir"
+    }
+}
 
 # Make it the active collection and keep projectors across restarts.
 # OBS 31+ uses user.ini; older versions use global.ini. Update whichever exists
@@ -124,18 +133,35 @@ function Set-IniValue([string]$path, [string]$section, [string]$key, [string]$va
     Write-TextFile $path (($lines -join "`r`n") + "`r`n")
 }
 
-$obsCfgDir = Join-Path $env:APPDATA 'obs-studio'
-New-Item -ItemType Directory -Force $obsCfgDir | Out-Null
-$iniTargets = @('user.ini', 'global.ini') | ForEach-Object { Join-Path $obsCfgDir $_ } | Where-Object { Test-Path $_ }
-if (-not $iniTargets) { $iniTargets = @(Join-Path $obsCfgDir 'user.ini') }
-foreach ($ini in $iniTargets) {
-    Set-IniValue $ini 'Basic' 'SceneCollection' 'AC Broadcast'
-    Set-IniValue $ini 'Basic' 'SceneCollectionFile' 'AC_Broadcast'
-    Set-IniValue $ini 'BasicWindow' 'SaveProjectors' 'true'
-    Write-Host "Updated $ini"
+function Install-UserConfigStage {
+    Step "Installing 'AC Broadcast' scene collection"
+    $sceneSrc = Join-Path $PSScriptRoot 'AC_Broadcast.json'
+    if (-not (Test-Path $sceneSrc)) { Fail "AC_Broadcast.json not found next to this script." }
+    $scenesDir = Join-Path $env:APPDATA 'obs-studio\basic\scenes'
+    New-Item -ItemType Directory -Force $scenesDir | Out-Null
+
+    # Point the saved fullscreen projector at the requested monitor
+    $sceneJson = Get-Content $sceneSrc -Raw
+    $sceneJson = $sceneJson -replace '"monitor":\s*\d+', ('"monitor": {0}' -f $ProjectorMonitor)
+    $sceneDest = Join-Path $scenesDir 'AC_Broadcast.json'
+    Write-TextFile $sceneDest $sceneJson
+    Write-Host "Installed scene collection -> $sceneDest (projector on monitor index $ProjectorMonitor)"
+
+    $obsCfgDir = Join-Path $env:APPDATA 'obs-studio'
+    New-Item -ItemType Directory -Force $obsCfgDir | Out-Null
+    $iniTargets = @('user.ini', 'global.ini') | ForEach-Object { Join-Path $obsCfgDir $_ } | Where-Object { Test-Path $_ }
+    if (-not $iniTargets) { $iniTargets = @(Join-Path $obsCfgDir 'user.ini') }
+    foreach ($ini in $iniTargets) {
+        Set-IniValue $ini 'Basic' 'SceneCollection' 'AC Broadcast'
+        Set-IniValue $ini 'Basic' 'SceneCollectionFile' 'AC_Broadcast'
+        Set-IniValue $ini 'BasicWindow' 'SaveProjectors' 'true'
+        Write-Host "Updated $ini"
+    }
 }
 
-# --- 4. Remaining manual steps -----------------------------------------------
+if ($Stage -in @('plugin', 'all')) { Install-PluginStage }
+if ($Stage -in @('userconfig', 'all')) { Install-UserConfigStage }
+
 Step "Done. Two one-time steps remain:"
 Write-Host @"
 
@@ -158,3 +184,7 @@ Write-Host @"
 Tip: add OBS to Windows startup (obs64.exe --minimize-to-tray) so the
 broadcast screen comes up on its own when the rig boots.
 "@
+
+if (-not $NonInteractive) { Read-Host "Press Enter to close" | Out-Null }
+try { Stop-Transcript | Out-Null } catch {}
+exit 0

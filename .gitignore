@@ -28,3 +28,6 @@ Thumbs.db
 # Large binaries
 *.zip
 vc_redist.x64.exe
+
+# Broadcast setup runtime logs
+broadcast/*.log
