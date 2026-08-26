@@ -398,7 +398,13 @@ def normalize_sector_config(config):
         if len(set(starts)) != len(starts):
             return None
         sectors[0]['start_pct'] = 0.0
-        return {'enabled': bool(config.get('enabled', False)), 'sectors': sectors}
+        # Spawn set the CSP companion app teleports to after a failed run.
+        # HOTLAP_START puts the car just before the start/finish line.
+        spawn = str(config.get('teleport_spawn', 'HOTLAP_START')).upper()
+        if spawn not in ('HOTLAP_START', 'START', 'PIT', 'TIME_ATTACK'):
+            spawn = 'HOTLAP_START'
+        return {'enabled': bool(config.get('enabled', False)), 'sectors': sectors,
+                'teleport_spawn': spawn}
     except (KeyError, TypeError, ValueError):
         return None
 
@@ -414,7 +420,8 @@ def load_sector_config():
                     return config
         except Exception as e:
             print(f"WARNING: Could not load sector config: {e}")
-    return {'enabled': False, 'sectors': [{'start_pct': 0.0, 'target_time': 60.0}]}
+    return {'enabled': False, 'sectors': [{'start_pct': 0.0, 'target_time': 60.0}],
+            'teleport_spawn': 'HOTLAP_START'}
 
 def save_sector_config(config):
     """Save the custom sector challenge config to file."""
@@ -3982,6 +3989,45 @@ ui_bridge = None
 # Receiver URL cache
 receiver_url_cache = None
 
+# --- CSP companion app command channel ---------------------------------------
+# The LeaderboardSector CSP Lua app (ac_app/) polls /api/ac/command a few times
+# a second while Assetto Corsa is running. Commands are one-shot: the Qt side
+# issues one, the route serves it until the app acks it (or it expires).
+ac_app_lock = threading.Lock()
+ac_app_state = {
+    'last_poll': 0.0,   # time.time() of the app's most recent poll
+    'command': None,    # {'id', 'action', 'spawn', 'issued'}
+    'next_id': 1,
+    'acked_id': 0,
+    'ack_ok': False,
+}
+
+def ac_app_alive():
+    """True if the CSP companion app has polled within the last 3 seconds."""
+    with ac_app_lock:
+        return (time.time() - ac_app_state['last_poll']) < 3.0
+
+def ac_app_issue_teleport(spawn):
+    """Queue a teleport command for the CSP app; returns the command id."""
+    with ac_app_lock:
+        cmd_id = ac_app_state['next_id']
+        ac_app_state['next_id'] += 1
+        ac_app_state['command'] = {'id': cmd_id, 'action': 'teleport',
+                                   'spawn': spawn, 'issued': time.time()}
+        return cmd_id
+
+def ac_app_command_done(cmd_id):
+    """True once the CSP app acked the command as executed successfully."""
+    with ac_app_lock:
+        return ac_app_state['acked_id'] >= cmd_id and ac_app_state['ack_ok']
+
+def ac_app_clear_command(cmd_id):
+    """Withdraw a still-pending command (used before falling back to Ctrl+O)."""
+    with ac_app_lock:
+        cmd = ac_app_state['command']
+        if cmd and cmd['id'] == cmd_id:
+            ac_app_state['command'] = None
+
 @app.route('/')
 def index():
     return HTML_CONTENT
@@ -4795,6 +4841,37 @@ def receive_beamng_lap():
     except Exception as e:
         print(f"Error receiving BeamNG lap: {e}")
         return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/ac/command', methods=['GET'])
+def ac_app_poll_command():
+    """Polled by the LeaderboardSector CSP Lua app. Plain-text protocol so the
+    Lua side needs no JSON parsing: 'none' or 'teleport|<id>|<spawn_set>'."""
+    with ac_app_lock:
+        ac_app_state['last_poll'] = time.time()
+        cmd = ac_app_state['command']
+        if cmd and (time.time() - cmd['issued']) > 10.0:
+            # Nobody executed it in time; drop it so a late-starting app
+            # doesn't teleport the next driver out of nowhere
+            ac_app_state['command'] = None
+            cmd = None
+        if cmd:
+            return (f"{cmd['action']}|{cmd['id']}|{cmd['spawn']}", 200,
+                    {'Content-Type': 'text/plain'})
+    return 'none', 200, {'Content-Type': 'text/plain'}
+
+@app.route('/api/ac/ack', methods=['GET'])
+def ac_app_ack_command():
+    """Ack from the CSP app after it executed (or failed to execute) a command."""
+    cmd_id = request.args.get('id', type=int) or 0
+    status = request.args.get('status', 'ok')
+    with ac_app_lock:
+        cmd = ac_app_state['command']
+        if cmd and cmd['id'] == cmd_id:
+            ac_app_state['command'] = None
+        ac_app_state['acked_id'] = max(ac_app_state['acked_id'], cmd_id)
+        ac_app_state['ack_ok'] = (status == 'ok')
+    print(f"[Sectors] CSP app ack for command {cmd_id}: {status}")
+    return 'ok', 200, {'Content-Type': 'text/plain'}
 
 @app.route('/api/manual_lap', methods=['POST'])
 def manual_lap():
@@ -5769,6 +5846,12 @@ class AssettoCorsaMonitor(GameMonitor):
         self._chal_prev_pos = None
         self._chal_prev_ms = None
         self._chal_lap_ok_latch = False
+        self._chal_reset_requested = False
+
+    def request_challenge_reset(self):
+        """Thread-safe request (e.g. after a CSP teleport) to re-arm the
+        challenge state machine; consumed by the monitor's poll loop."""
+        self._chal_reset_requested = True
 
     def _chal_consume_lap_ok(self):
         """Read-and-clear the 'run passed all sectors' verdict.
@@ -5800,6 +5883,11 @@ class AssettoCorsaMonitor(GameMonitor):
         Returns True only on the poll where the car crosses the finish line
         having met every sector target (that lap may go to the leaderboard).
         """
+        if self._chal_reset_requested:
+            # A teleport back to start/finish just happened: drop any stale
+            # run state so the next driver's run arms fresh at the line
+            self._chal_reset()
+
         sectors = self.challenge_config['sectors']
         pos = float(graphics.normalizedCarPosition)
         lap_ms = int(graphics.iCurrentTime)
@@ -7872,7 +7960,9 @@ class LapTimeSenderWindow(QMainWindow):
 
         sector_help = QLabel(
             "Each sector starts at a % of the track and must be completed within its target time. "
-            "Miss a target and the run ends: the waiting screen comes up and the session restarts for the next driver. "
+            "Miss a target and the run ends: the car is teleported back to start/finish and the waiting "
+            "screen comes up for the next driver. Install the LeaderboardSector CSP app (see ac_app folder) "
+            "for a clean in-game teleport; without it the session is restarted via AC's Ctrl+O hotkey. "
             "Times accept M:SS.mmm or plain seconds."
         )
         sector_help.setWordWrap(True)
@@ -9502,6 +9592,7 @@ class LapTimeSenderWindow(QMainWindow):
         config = normalize_sector_config({
             'enabled': self.sector_challenge_enabled.isChecked(),
             'sectors': sectors,
+            'teleport_spawn': self.sector_config.get('teleport_spawn', 'HOTLAP_START'),
         })
         if not config:
             self.show_error("Invalid sectors: need at least one, start % between 0 and 99.9, no duplicate start %, times above 0.")
@@ -9521,8 +9612,10 @@ class LapTimeSenderWindow(QMainWindow):
         self.sector_flash.show_result(sector_index + 1, sector_time, target_time, passed)
 
     def on_challenge_failed(self, sector_index, distance_pct, elapsed_s):
-        """A driver missed a sector target: score the partial run, restart AC,
-        and bring up the waiting screen for the next driver."""
+        """A driver missed a sector target: score the partial run, put the car
+        back at start/finish, and bring up the waiting screen for the next
+        driver. Prefers the CSP companion app (clean in-game teleport, no
+        keyboard focus games); falls back to AC's Ctrl+O session restart."""
         print(f"[Sectors] Run over in sector {sector_index + 1}: {distance_pct:.2f}% of track in {elapsed_s:.3f}s")
 
         driver = self.driver_name.text().strip() if hasattr(self.driver_name, 'text') else ''
@@ -9530,10 +9623,26 @@ class LapTimeSenderWindow(QMainWindow):
             self.send_lap_time(elapsed_s, from_game=True, override_driver=driver,
                                distance_pct=distance_pct, challenge_fail=True)
 
-        # Restart AC first (while the game still has keyboard focus), then the
-        # waiting flow; end_session also clears the driver for the next person.
-        QTimer.singleShot(600, self.restart_ac_session)
+        if ac_app_alive():
+            spawn = self.sector_config.get('teleport_spawn', 'HOTLAP_START')
+            cmd_id = ac_app_issue_teleport(spawn)
+            print(f"[Sectors] Teleport command {cmd_id} sent to CSP app (spawn set {spawn})")
+            QTimer.singleShot(2500, lambda: self._verify_ac_teleport(cmd_id))
+        else:
+            # No CSP app polling: restart AC via hotkey (needs keyboard focus)
+            QTimer.singleShot(600, self.restart_ac_session)
         QTimer.singleShot(1500, self.end_session)
+
+    def _verify_ac_teleport(self, cmd_id):
+        """Confirm the CSP app executed the teleport; fall back to Ctrl+O if not."""
+        if ac_app_command_done(cmd_id):
+            print("[Sectors] CSP teleport confirmed")
+            if self.current_monitor and hasattr(self.current_monitor, 'request_challenge_reset'):
+                self.current_monitor.request_challenge_reset()
+        else:
+            print("[Sectors] No CSP teleport ack - falling back to Ctrl+O restart")
+            ac_app_clear_command(cmd_id)
+            self.restart_ac_session()
 
     def restart_ac_session(self):
         """Send Assetto Corsa its default 'Restart session' hotkey (Ctrl+O) so

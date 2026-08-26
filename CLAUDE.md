@@ -67,9 +67,20 @@ Runs are judged live in `AssettoCorsaMonitor` using `normalizedCarPosition` +
 
 - Beat a sector target → keep driving (green flash via `SectorFlashOverlay`)
 - Time expires mid-sector → instant fail: partial run is submitted with its
-  `distance_pct`, AC is restarted via a simulated Ctrl+O (AC's default
-  "Restart session" hotkey must be unchanged), and the waiting screen comes up
+  `distance_pct`, the car is put back at start/finish, and the waiting screen
+  comes up
 - Complete all sectors → lap submitted normally with `distance_pct: 100`
+
+Putting the car back uses the `LeaderboardSector` CSP companion app (`ac_app/`)
+when it is installed in AC: the app polls `GET /api/ac/command` on the local
+Flask server (plain text `teleport|<id>|<spawn_set>`, acked via
+`GET /api/ac/ack`; every poll is a heartbeat) and calls
+`physics.teleportCarTo(0, spawn_set)` — default spawn `HOTLAP_START`
+(configurable as `teleport_spawn` in `sector_config.json`). After a confirmed
+teleport the monitor's challenge state machine is re-armed via
+`request_challenge_reset()`. If the app is not polling (or doesn't ack within
+2.5s), the Sender falls back to a simulated Ctrl+O session restart (AC's
+default "Restart session" hotkey must be unchanged).
 
 The Receiver's `ranking_mode: "distance"` config ranks these runs by distance
 traveled descending, lap/elapsed time as tiebreaker. Configured in the

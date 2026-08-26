@@ -34,6 +34,8 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 [Files]
 ; Main executable and all files in the dist folder
 Source: "dist\Lap Time Sender\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+; CSP companion app for Assetto Corsa (user copies it into AC's apps\lua folder)
+Source: "ac_app\*"; DestDir: "{app}\ac_app"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
