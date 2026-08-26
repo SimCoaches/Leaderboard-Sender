@@ -6953,6 +6953,175 @@ class SectorFlashOverlay(QWidget):
         self.show()
         self._hide_timer.start(2500)
 
+
+try:
+    import websocket as obs_websocket_lib  # websocket-client, for OBS control
+    OBS_WEBSOCKET_AVAILABLE = True
+except ImportError:
+    OBS_WEBSOCKET_AVAILABLE = False
+
+
+class BroadcastDirector(threading.Thread):
+    """Keeps the 4th-screen OBS broadcast in sync with the simulator state.
+
+    Consumes cues from the Qt side through a queue and drives OBS Studio's
+    built-in WebSocket server (v5 protocol) on localhost:
+
+      'live'    -> TV camera scene (driver is in the cockpit)
+      'waiting' -> in 'waiting' mode: branded Waiting scene
+                   in 'replay' mode: save OBS's replay buffer and loop the
+                   clip on the Replay scene until the next 'live' cue
+
+    Connection details are read from OBS's own obs-websocket config file
+    (provisioned by broadcast/setup_broadcast.ps1). Everything fails soft:
+    no OBS, no plugin, no config -> cues are dropped with a log line and
+    the simulator is never blocked or slowed.
+    """
+
+    SCENE_LIVE = 'AC Broadcast'
+    SCENE_WAITING = 'Waiting'
+    SCENE_REPLAY = 'Replay'
+    REPLAY_INPUT = 'Replay Media'
+
+    def __init__(self, mode_getter):
+        super().__init__(daemon=True)
+        self._cues = queue_module.Queue()
+        self._mode_getter = mode_getter  # returns 'off' | 'waiting' | 'replay'
+        self._ws = None
+        self._req_id = 0
+        self._last_cue = None
+        self._last_replay_path = None
+        self._warned_no_obs = False
+
+    def cue(self, name):
+        """Queue a scene cue; call from any thread. No-op when mode is off."""
+        try:
+            if self._mode_getter() == 'off' or not OBS_WEBSOCKET_AVAILABLE:
+                return
+            if name == self._last_cue:
+                return
+            self._last_cue = name
+            self._cues.put(name)
+        except Exception:
+            pass
+
+    def run(self):
+        while True:
+            cue = self._cues.get()
+            try:
+                self._handle(cue)
+                self._warned_no_obs = False
+            except Exception as e:
+                self._disconnect()
+                # Allow the same cue to be retried once OBS comes back
+                self._last_cue = None
+                if not self._warned_no_obs:
+                    print(f"[Broadcast] OBS not reachable ({e}) - 4th screen cue '{cue}' dropped")
+                    self._warned_no_obs = True
+
+    # --- OBS WebSocket v5 plumbing -------------------------------------------
+
+    def _config(self):
+        cfg_path = Path(os.environ.get('APPDATA', '')) / 'obs-studio' / 'plugin_config' / 'obs-websocket' / 'config.json'
+        with open(cfg_path, 'r') as f:
+            cfg = json.load(f)
+        return int(cfg.get('server_port', 4455)), cfg.get('server_password', '')
+
+    def _disconnect(self):
+        if self._ws is not None:
+            try:
+                self._ws.close()
+            except Exception:
+                pass
+            self._ws = None
+
+    def _connect(self):
+        if self._ws is not None:
+            return
+        port, password = self._config()
+        ws = obs_websocket_lib.create_connection(f"ws://127.0.0.1:{port}", timeout=4)
+        hello = json.loads(ws.recv())
+        identify = {'op': 1, 'd': {'rpcVersion': 1, 'eventSubscriptions': 0}}
+        auth = hello.get('d', {}).get('authentication')
+        if auth:
+            import base64, hashlib
+            secret = base64.b64encode(hashlib.sha256((password + auth['salt']).encode()).digest())
+            token = base64.b64encode(hashlib.sha256(secret + auth['challenge'].encode()).digest()).decode()
+            identify['d']['authentication'] = token
+        ws.send(json.dumps(identify))
+        identified = json.loads(ws.recv())
+        if identified.get('op') != 2:
+            ws.close()
+            raise RuntimeError(f"OBS identify failed: {identified}")
+        self._ws = ws
+
+    def _request(self, request_type, request_data=None):
+        """Send one request; returns responseData dict on success, None on
+        a request-level failure (e.g. replay buffer not active)."""
+        self._connect()
+        self._req_id += 1
+        req_id = f"lts-{self._req_id}"
+        self._ws.send(json.dumps({'op': 6, 'd': {
+            'requestType': request_type,
+            'requestId': req_id,
+            'requestData': request_data or {},
+        }}))
+        while True:
+            msg = json.loads(self._ws.recv())
+            if msg.get('op') == 7 and msg['d'].get('requestId') == req_id:
+                if msg['d'].get('requestStatus', {}).get('result'):
+                    return msg['d'].get('responseData', {})
+                return None
+
+    # --- Cue handling ---------------------------------------------------------
+
+    def _switch(self, scene):
+        self._request('SetCurrentProgramScene', {'sceneName': scene})
+        print(f"[Broadcast] 4th screen -> {scene}")
+
+    def _handle(self, cue):
+        mode = self._mode_getter()
+        if mode == 'off':
+            return
+        if cue == 'live':
+            self._switch(self.SCENE_LIVE)
+            if mode == 'replay':
+                # Keep the buffer rolling so the fail moment is captured
+                self._request('StartReplayBuffer')
+            return
+        if cue == 'waiting':
+            if mode == 'replay' and self._cue_replay():
+                return
+            self._switch(self.SCENE_WAITING)
+
+    def _cue_replay(self):
+        """Save the replay buffer and put it on the Replay scene, looping.
+        Returns False to fall back to the Waiting scene."""
+        # Save while the program scene is still the live camera
+        if self._request('SaveReplayBuffer') is None:
+            self._request('StartReplayBuffer')  # arm it for the next run
+            return False
+        path = None
+        for _ in range(12):
+            time.sleep(0.4)
+            resp = self._request('GetLastReplayBufferReplay')
+            candidate = (resp or {}).get('savedReplayPath')
+            if candidate and candidate != self._last_replay_path:
+                path = candidate
+                break
+        if not path:
+            return False
+        self._last_replay_path = path
+        if self._request('SetInputSettings', {
+            'inputName': self.REPLAY_INPUT,
+            'inputSettings': {'local_file': path, 'looping': True},
+            'overlay': True,
+        }) is None:
+            return False
+        self._switch(self.SCENE_REPLAY)
+        return True
+
+
 class WaitingOverlay(QWidget):
     """Full-screen overlay that shows custom image or looping video until a driver signs up"""
     
@@ -7240,6 +7409,14 @@ class LapTimeSenderWindow(QMainWindow):
         self.sector_config = load_sector_config()
         self.lead_questions = load_lead_questions()
         self.last_survey_answers = {}
+
+        # 4th-screen broadcast director (OBS scene switching): 'off',
+        # 'waiting' (waiting scene between drivers) or 'replay' (loop the
+        # last run's replay until the next driver is in the cockpit)
+        self.broadcast_mode = 'waiting'
+        self.broadcast_director = BroadcastDirector(lambda: getattr(self, 'broadcast_mode', 'off'))
+        self.broadcast_director.start()
+
         self.setup_ui()
         
         # Start with no monitor active
@@ -7317,6 +7494,14 @@ class LapTimeSenderWindow(QMainWindow):
             path = settings['waiting_media_path']
             if os.path.exists(path):
                 self.waiting_media_path.setText(path)
+
+        # Restore 4th-screen broadcast mode
+        mode = settings.get('broadcast_mode', 'waiting')
+        if mode not in ('off', 'waiting', 'replay'):
+            mode = 'waiting'
+        self.broadcast_mode = mode
+        if hasattr(self, 'broadcast_mode_combo'):
+            self.broadcast_mode_combo.setCurrentIndex(['off', 'waiting', 'replay'].index(mode))
 
         # Restore background image path
         if settings.get('background_image_path'):
@@ -8507,6 +8692,45 @@ class LapTimeSenderWindow(QMainWindow):
         self.select_waiting_media_button.clicked.connect(self.select_waiting_media_file)
         grid_layout.addWidget(self.select_waiting_media_button, 5, 3)
 
+        # Row 6: 4th-screen broadcast mode (Advanced) - drives OBS scenes
+        broadcast_mode_label = QLabel("4th Screen:")
+        broadcast_mode_label.setMinimumWidth(80)
+        broadcast_mode_label.setMaximumWidth(100)
+        broadcast_mode_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        broadcast_mode_label.setStyleSheet("""
+            QLabel {
+                font-size: 11px;
+                color: #cccccc;
+                font-family: 'Segoe UI', 'Arial', sans-serif;
+            }
+        """)
+        broadcast_mode_label.setToolTip("What the OBS broadcast screen shows between drivers")
+        grid_layout.addWidget(broadcast_mode_label, 6, 0)
+
+        self.broadcast_mode_combo = QComboBox()
+        self.broadcast_mode_combo.addItems([
+            "Off (always live camera)",
+            "Waiting screen between drivers",
+            "Replay of last run between drivers",
+        ])
+        self.broadcast_mode_combo.setStyleSheet("""
+            QComboBox {
+                background-color: #1e1e1e;
+                border: 1px solid #3e3e42;
+                color: #cccccc;
+                font-size: 10px;
+                font-family: 'Segoe UI', 'Arial', sans-serif;
+                padding: 4px 8px;
+            }
+        """)
+        self.broadcast_mode_combo.setToolTip(
+            "Requires the OBS broadcast screen setup (see broadcast folder). "
+            "While driving, the 4th screen always shows the live TV cameras."
+        )
+        self.broadcast_mode_combo.setCurrentIndex(1)
+        self.broadcast_mode_combo.currentIndexChanged.connect(self._on_broadcast_mode_changed)
+        grid_layout.addWidget(self.broadcast_mode_combo, 6, 1, 1, 2)
+
         # Laps input (only used in Laps mode) - on same row as minutes
         self.lap_count_label = QLabel("Laps:")
         self.lap_count_label.setMinimumWidth(40)
@@ -8576,6 +8800,7 @@ class LapTimeSenderWindow(QMainWindow):
             (bg_label, self.background_image_path, self.select_bg_button),
             (video_enable_label, self.video_required_toggle, self.video_path_input, self.select_video_button),
             (waiting_media_label, self.waiting_media_path, self.select_waiting_media_button),
+            (broadcast_mode_label, self.broadcast_mode_combo),
         ]
         self.set_advanced_visible(False)
         # Let the grid determine its own height based on contents to avoid crowding
@@ -9474,6 +9699,7 @@ class LapTimeSenderWindow(QMainWindow):
 
     def show_waiting_screen(self):
         """Show the waiting overlay covering the game"""
+        self.broadcast_director.cue('waiting')
         # Load custom media if configured
         if hasattr(self, 'waiting_media_path') and self.waiting_media_path.text().strip():
             media_path = self.waiting_media_path.text().strip()
@@ -9494,6 +9720,7 @@ class LapTimeSenderWindow(QMainWindow):
         
     def hide_waiting_screen(self):
         """Hide the waiting overlay to reveal the game"""
+        self.broadcast_director.cue('live')
         self.waiting_overlay.hide()
         self.session_active = True
         # Update button text
@@ -9503,6 +9730,11 @@ class LapTimeSenderWindow(QMainWindow):
     def end_session(self):
         """End the current session and return to waiting screen"""
         print("[END SESSION] end_session() called - showing session complete screen")
+
+        # 4th screen: waiting scene, or save + loop the run's replay.
+        # Cued here (not only in show_waiting_screen) because the replay
+        # buffer must be saved close to the moment the run ended.
+        self.broadcast_director.cue('waiting')
 
         # Notify receiver that session has ended (for queue wait time tracking)
         self._notify_session_ended()
@@ -9682,6 +9914,14 @@ class LapTimeSenderWindow(QMainWindow):
             print("[Sectors] Sent Ctrl+O restart to Assetto Corsa")
         except Exception as e:
             print(f"[Sectors] Could not restart AC session: {e}")
+
+    def _on_broadcast_mode_changed(self, index):
+        """Persist the 4th-screen broadcast mode immediately (like Lead Gen)."""
+        mode = ['off', 'waiting', 'replay'][index] if 0 <= index <= 2 else 'waiting'
+        self.broadcast_mode = mode
+        settings = load_app_settings()
+        settings['broadcast_mode'] = mode
+        save_app_settings(settings)
 
     def _on_lead_gen_toggled(self, checked):
         """Persist the Lead Gen toggle immediately so the next event starts

@@ -92,9 +92,21 @@ Optional 4th-monitor exterior camera view (chase cam or AC's trackside TV
 cameras) for venues, using CSP's official OBS plugin: CSP renders an extra
 camera inside the same AC process, the plugin (`accsp_capture` OBS source)
 hands the texture to OBS, and OBS fullscreen-projects it on the extra monitor.
-Single PC / single AC instance; no Sender code involved. `setup_broadcast.ps1`
-automates the rig setup (install plugin DLL, import the `AC_Broadcast` scene
-collection, save projector monitor); see `broadcast/README.md`.
+Single PC / single AC instance. `setup_broadcast.ps1` automates the rig setup
+(install plugin DLL, import the `AC_Broadcast` scene collection with
+Waiting/Replay scenes, enable OBS's WebSocket server with a generated
+password, install an OBS profile with the replay buffer armed); see
+`broadcast/README.md`.
+
+`BroadcastDirector` (a daemon thread in `lap_time_sender.py`) syncs the 4th
+screen to the simulator state over OBS's WebSocket (v5, localhost; auth
+details read from OBS's own obs-websocket config.json). Cues come from
+`show_waiting_screen`/`hide_waiting_screen`/`end_session`: 'live' switches to
+the TV-camera scene, 'waiting' switches to the Waiting scene or — in replay
+mode — saves OBS's replay buffer and loops the clip on the Replay scene until
+the next driver starts. Mode ('off'/'waiting'/'replay') is the "4th Screen"
+combo in Advanced settings, persisted as `broadcast_mode` in app settings.
+All OBS calls fail soft; the sim is never blocked.
 
 ### Data Flow
 

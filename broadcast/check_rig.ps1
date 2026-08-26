@@ -68,6 +68,18 @@ $null = Check "CSP OBS plugin installed" $pluginOk "Run setup_broadcast.ps1 -Sta
 $sceneOk = Test-Path (Join-Path $env:APPDATA 'obs-studio\basic\scenes\AC_Broadcast.json')
 $null = Check "AC Broadcast scene collection installed" $sceneOk "Run setup_broadcast.ps1 -Stage userconfig."
 
+# OBS WebSocket control (scene switching / replays between drivers)
+$wsCfgPath = Join-Path $env:APPDATA 'obs-studio\plugin_config\obs-websocket\config.json'
+$wsOk = $false
+if (Test-Path $wsCfgPath) {
+    try { $wsOk = [bool](Get-Content $wsCfgPath -Raw | ConvertFrom-Json).server_enabled } catch {}
+}
+$null = Check "OBS WebSocket control enabled" $wsOk "Run setup_broadcast.ps1 -Stage userconfig."
+
+# OBS broadcast profile (canvas + replay buffer)
+$profOk = Test-Path (Join-Path $env:APPDATA 'obs-studio\basic\profiles\AC_Broadcast\basic.ini')
+$null = Check "AC Broadcast OBS profile installed (replay buffer)" $profOk "Run setup_broadcast.ps1 -Stage userconfig."
+
 # OBS autostart shortcut (optional)
 $autoOk = Test-Path (Join-Path ([Environment]::GetFolderPath('Startup')) 'AC Broadcast (OBS).lnk')
 Write-Host ("[{0}] OBS auto-start shortcut (optional)" -f $(if ($autoOk) { 'PASS' } else { ' -- ' })) -ForegroundColor $(if ($autoOk) { 'Green' } else { 'DarkGray' })

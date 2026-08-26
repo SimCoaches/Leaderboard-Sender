@@ -158,11 +158,71 @@ function Install-UserConfigStage {
     foreach ($ini in $iniTargets) {
         Set-IniValue $ini 'Basic' 'SceneCollection' 'AC Broadcast'
         Set-IniValue $ini 'Basic' 'SceneCollectionFile' 'AC_Broadcast'
+        Set-IniValue $ini 'Basic' 'Profile' 'AC Broadcast'
+        Set-IniValue $ini 'Basic' 'ProfileDir' 'AC_Broadcast'
         Set-IniValue $ini 'BasicWindow' 'SaveProjectors' 'true'
         # Skip the first-launch auto-config wizard - it would fight our config
         Set-IniValue $ini 'General' 'FirstRun' 'true'
         Write-Host "Updated $ini"
     }
+
+    # OBS WebSocket server: the Lap Time Sender drives scene switching
+    # (waiting screen / replays between drivers) through it. Enable it with a
+    # generated password; the Sender reads this same config file at runtime,
+    # so nothing needs to be copied anywhere.
+    Step "Enabling OBS WebSocket control"
+    $wsDir = Join-Path $obsCfgDir 'plugin_config\obs-websocket'
+    New-Item -ItemType Directory -Force $wsDir | Out-Null
+    $wsCfgPath = Join-Path $wsDir 'config.json'
+    $wsCfg = $null
+    if (Test-Path $wsCfgPath) {
+        try { $wsCfg = Get-Content $wsCfgPath -Raw | ConvertFrom-Json } catch {}
+    }
+    $password = if ($wsCfg -and $wsCfg.server_password) { $wsCfg.server_password } else {
+        -join ((48..57) + (65..90) + (97..122) | Get-Random -Count 20 | ForEach-Object { [char]$_ })
+    }
+    $port = if ($wsCfg -and $wsCfg.server_port) { [int]$wsCfg.server_port } else { 4455 }
+    $wsJson = @{
+        alerts_enabled  = $false
+        auth_required   = $true
+        first_load      = $false
+        server_enabled  = $true
+        server_password = $password
+        server_port     = $port
+    } | ConvertTo-Json
+    Write-TextFile $wsCfgPath $wsJson
+    Write-Host "WebSocket server enabled on port $port (password stored in config.json)"
+
+    # Dedicated OBS profile: fixed 1920x1080 canvas (so the scene layout and
+    # projector are deterministic regardless of the rig's display sizes) and
+    # the replay buffer armed for Replay mode (last 60s, saved on demand).
+    Step "Installing 'AC Broadcast' OBS profile"
+    $profileDir = Join-Path $obsCfgDir 'basic\profiles\AC_Broadcast'
+    New-Item -ItemType Directory -Force $profileDir | Out-Null
+    $replayDir = Join-Path ([Environment]::GetFolderPath('MyVideos')) 'AC Broadcast'
+    New-Item -ItemType Directory -Force $replayDir | Out-Null
+    $profileIni = @(
+        '[General]',
+        'Name=AC Broadcast',
+        '',
+        '[Video]',
+        'BaseCX=1920',
+        'BaseCY=1080',
+        'OutputCX=1920',
+        'OutputCY=1080',
+        'FPSType=0',
+        'FPSCommon=30',
+        '',
+        '[Output]',
+        'Mode=Simple',
+        '',
+        '[SimpleOutput]',
+        'RecRB=true',
+        'RecRBTime=60',
+        ('FilePath={0}' -f $replayDir)
+    ) -join "`r`n"
+    Write-TextFile (Join-Path $profileDir 'basic.ini') ($profileIni + "`r`n")
+    Write-Host "Installed profile -> $profileDir (replays saved to $replayDir)"
 
     # CSP only publishes broadcast cameras when this Small Tweaks flag is set
     # (also done by install_ac_app.ps1; both are idempotent)
@@ -221,18 +281,20 @@ Step "Done. One verification pass on first use:"
 Write-Host @"
 
 Start Assetto Corsa into a session, then start OBS.
-The 'AC Broadcast' scene should show the chase camera.
-If the broadcast view is not already filling the 4th screen:
-right-click the scene -> 'Fullscreen Projector (Scene)' -> pick the
-4th monitor. With 'Save projectors on exit' enabled (this script set
-it), OBS reopens it there automatically from then on.
+The 'AC Broadcast' scene should show the TV-style track cameras
+following the car. If the broadcast view is not already filling the
+4th screen: right-click the scene -> 'Fullscreen Projector (Scene)' ->
+pick the 4th monitor. With 'Save projectors on exit' enabled (this
+script set it), OBS reopens it there automatically from then on.
 
-To use AC's trackside TV cameras instead of the chase camera:
-double-click the 'AC External Camera' source and pick
-'Camera: Track camera' from the Texture dropdown.
+Between drivers the Lap Time Sender switches the 4th screen on its own:
+pick 'Waiting screen' or 'Replay of last run' in the Sender's Advanced
+settings ('4th Screen'). Customize the Waiting scene in OBS freely
+(venue logo, colors) - only its name 'Waiting' matters.
 
-(CSP's OBS integration flag and the OBS scene were configured
-automatically; CSP v0.1.80+ must be installed via Content Manager.)
+(CSP's OBS integration flag, the WebSocket control server, the replay
+buffer, and the OBS scene were all configured automatically;
+CSP v0.1.80+ must be installed via Content Manager.)
 "@
 
 if (-not $NonInteractive) { Read-Host "Press Enter to close" | Out-Null }

@@ -73,6 +73,23 @@ If the 4th screen is not Windows display #4, pass the monitor index:
    pick the 4th monitor. OBS remembers it from then on ("Save projectors on
    exit" is enabled by the script).
 
+## Broadcast modes (what shows between drivers)
+
+While a driver is on track, the 4th screen always shows the live cameras.
+What happens when the simulator drops to its waiting screen is chosen in the
+Lap Time Sender's Advanced settings ("4th Screen"):
+
+| Mode | Between drivers, the 4th screen shows |
+|------|----------------------------------------|
+| Waiting screen | The "Waiting" OBS scene (customize it in OBS: venue logo, colors — only the scene's name matters) |
+| Replay of last run | The last ~60 seconds of the broadcast feed, saved automatically the moment the run ends and looped until the next driver is in the cockpit (a red "● REPLAY" tag is overlaid) |
+| Off | Nothing changes — live camera stays up (a parked car between drivers) |
+
+This works via OBS's built-in WebSocket server, which the setup script
+enables with a generated password; the Sender reads the same OBS config file
+at runtime, so there is nothing to pair or copy. If OBS isn't running, cues
+are simply dropped — the simulator is never blocked.
+
 ## Choosing the camera
 
 Double-click the **AC External Camera** source in OBS and pick from the
