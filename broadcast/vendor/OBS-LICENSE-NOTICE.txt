@@ -1,0 +1,4 @@
+OBS Studio 32.2.2 - official unmodified installer, bundled for offline
+rig setup. OBS Studio is free software under the GNU GPL v2;
+source code: https://github.com/obsproject/obs-studio
+Project site: https://obsproject.com

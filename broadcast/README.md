@@ -24,9 +24,18 @@ Run `LapTimeSenderSetup.exe` — the tasks page handles the whole rig:
 - **"Install Assetto Corsa companion app"** (on by default): copies the
   sector-challenge teleport app into AC and enables CSP's OBS integration
   flag automatically.
-- **"Set up 4th-screen broadcast camera"**: installs OBS (via winget, if
-  missing) and the CSP plugin — one UAC prompt — imports the scene
+- **"Set up 4th-screen broadcast camera"**: installs OBS if missing — from
+  the **bundled official installer** (offline, lands in
+  `C:\Program Files\obs-studio`), falling back to winget when no bundle is
+  present — plus the CSP plugin (one UAC prompt), imports the scene
   collection, and suppresses OBS's first-run wizard.
+
+  To produce an installer with OBS bundled, run
+  `broadcast\download_obs_offline.ps1` once before compiling `setup.iss`
+  (it fetches the signed official ~152 MB OBS installer into
+  `broadcast\vendor\`, which is gitignored). OBS Studio is GPLv2 free
+  software; the unmodified installer is redistributed with a license
+  notice, source at github.com/obsproject/obs-studio.
 - **"Start the broadcast screen automatically with Windows"** (sub-option):
   adds OBS minimized-to-tray to the user's Startup folder, so the 4th screen
   comes up on its own after boot. The launcher also clears OBS's

@@ -71,15 +71,27 @@ function Install-PluginStage {
     $obsRoot = Find-Obs
     if (-not $obsRoot) {
         Write-Host "OBS Studio is not installed."
-        $doInstall = $NonInteractive
-        if (-not $NonInteractive) {
-            $doInstall = (Read-Host "Install OBS Studio now via winget? (y/n)") -eq 'y'
+        # Prefer the bundled official installer (offline, deterministic
+        # location); fall back to winget, then to a manual instruction.
+        $bundled = Get-ChildItem (Join-Path $PSScriptRoot 'vendor') -Filter 'OBS-Studio-*-Installer.exe' -ErrorAction SilentlyContinue |
+            Sort-Object Name -Descending | Select-Object -First 1
+        if ($bundled) {
+            Write-Host "Installing bundled OBS Studio silently: $($bundled.Name)"
+            $proc = Start-Process $bundled.FullName -ArgumentList '/S' -Wait -PassThru
+            if ($proc.ExitCode -ne 0) { Fail "Bundled OBS installer exited with code $($proc.ExitCode)." }
+            $obsRoot = Find-Obs
+            if (-not $obsRoot) { Fail "OBS still not found after the bundled install." }
+        } else {
+            $doInstall = $NonInteractive
+            if (-not $NonInteractive) {
+                $doInstall = (Read-Host "Install OBS Studio now via winget? (y/n)") -eq 'y'
+            }
+            if (-not $doInstall) { Fail "Install OBS Studio from https://obsproject.com and re-run this script." }
+            winget install --id OBSProject.OBSStudio --accept-package-agreements --accept-source-agreements --silent
+            if ($LASTEXITCODE -ne 0) { Fail "winget install failed - install OBS manually from https://obsproject.com and re-run this script (or re-run the Lap Time Sender installer with the broadcast option)." }
+            $obsRoot = Find-Obs
+            if (-not $obsRoot) { Fail "OBS still not found after install - re-run this script." }
         }
-        if (-not $doInstall) { Fail "Install OBS Studio from https://obsproject.com and re-run this script." }
-        winget install --id OBSProject.OBSStudio --accept-package-agreements --accept-source-agreements --silent
-        if ($LASTEXITCODE -ne 0) { Fail "winget install failed - install OBS manually from https://obsproject.com and re-run this script (or re-run the Lap Time Sender installer with the broadcast option)." }
-        $obsRoot = Find-Obs
-        if (-not $obsRoot) { Fail "OBS still not found after install - re-run this script." }
     }
     Write-Host "Found OBS at: $obsRoot"
 

@@ -32,3 +32,6 @@ vc_redist.x64.exe
 # Broadcast setup runtime logs
 broadcast/*.log
 ac_app/*.log
+
+# Bundled OBS offline installer (fetched by broadcast/download_obs_offline.ps1)
+broadcast/vendor/*.exe
