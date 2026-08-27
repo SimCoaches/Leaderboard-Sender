@@ -14,7 +14,8 @@ keyboard focus and AC's hotkey binding to be unchanged.
 - Assetto Corsa with **Custom Shaders Patch (CSP)** installed
   (any reasonably recent build; installing via Content Manager is easiest)
 - The Lap Time Sender running on the **same PC** as Assetto Corsa
-  (the app talks to it on `http://127.0.0.1:5001`)
+  (the app finds it on `http://127.0.0.1:5001`, automatically probing the
+  Sender's fallback ports 5101-5105 if 5001 is taken by another program)
 
 ## Install
 

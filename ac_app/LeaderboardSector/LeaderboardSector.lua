@@ -10,18 +10,31 @@
 --   GET /api/ac/ack?id=<id>&status=ok|error   (sent after executing)
 -- Every poll doubles as a heartbeat so the Sender knows the app is alive.
 
-local SENDER_URL = 'http://127.0.0.1:5001'
+-- The Sender prefers port 5001 but falls back if it is taken
+-- (must match WEB_INTERFACE_FALLBACK_PORTS in lap_time_sender.py)
+local SENDER_PORTS = { 5001, 5101, 5102, 5103, 5104, 5105 }
 local POLL_PERIOD = 0.25
 
+local portIndex = 1
+local connected = false
 local lastExecutedId = 0
 local requestPending = false
 local statusText = 'Looking for Lap Time Sender...'
 local statusOk = false
 local lastTeleportText = 'No teleports yet'
 
+local function senderUrl()
+  return 'http://127.0.0.1:' .. SENDER_PORTS[portIndex]
+end
+
+local function nextPort()
+  connected = false
+  portIndex = portIndex % #SENDER_PORTS + 1
+end
+
 local function sendAck(id, ok, detail)
   local status = ok and 'ok' or 'error'
-  web.get(string.format('%s/api/ac/ack?id=%d&status=%s', SENDER_URL, id, status), function() end)
+  web.get(string.format('%s/api/ac/ack?id=%d&status=%s', senderUrl(), id, status), function() end)
   if detail then ac.log('LeaderboardSector: ' .. detail) end
 end
 
@@ -47,17 +60,23 @@ end
 setInterval(function()
   if requestPending then return end
   requestPending = true
-  web.get(SENDER_URL .. '/api/ac/command', function(err, response)
+  web.get(senderUrl() .. '/api/ac/command', function(err, response)
     requestPending = false
-    if err or not response or response.status ~= 200 then
+    local body = response and response.body or nil
+    -- Only our endpoint answers 200 with 'none'/'teleport|...' - anything
+    -- else (another app squatting the port) means: try the next port
+    local looksRight = (not err) and response and response.status == 200
+      and body and (body == 'none' or body:match('^%w+|%d+|%S+$'))
+    if not looksRight then
+      nextPort()
       statusOk = false
       statusText = 'Looking for Lap Time Sender...'
       return
     end
+    connected = true
     statusOk = true
-    statusText = 'Connected to Lap Time Sender'
-    local body = response.body
-    if body and body ~= '' and body ~= 'none' then
+    statusText = 'Connected to Lap Time Sender (port ' .. SENDER_PORTS[portIndex] .. ')'
+    if body ~= 'none' then
       runCommand(body)
     end
   end)

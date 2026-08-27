@@ -13,7 +13,7 @@ a = Analysis(
         (sip_binary, "PyQt6")
     ] + qrcode_binaries,
     datas=[('resources', 'resources')] + qrcode_datas,
-    hiddenimports=qrcode_hiddenimports,
+    hiddenimports=qrcode_hiddenimports + ['websocket'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

@@ -84,11 +84,24 @@ $null = Check "AC Broadcast OBS profile installed (replay buffer)" $profOk "Run 
 $autoOk = Test-Path (Join-Path ([Environment]::GetFolderPath('Startup')) 'AC Broadcast (OBS).lnk')
 Write-Host ("[{0}] OBS auto-start shortcut (optional)" -f $(if ($autoOk) { 'PASS' } else { ' -- ' })) -ForegroundColor $(if ($autoOk) { 'Green' } else { 'DarkGray' })
 
-# Lap Time Sender reachable (only meaningful while it is running)
-try {
-    $r = Invoke-WebRequest -Uri 'http://127.0.0.1:5001/health' -UseBasicParsing -TimeoutSec 2
-    $null = Check "Lap Time Sender running (port 5001)" ($r.StatusCode -eq 200) $null
-} catch {
+# Lap Time Sender reachable (only meaningful while it is running).
+# The Sender prefers port 5001 but falls back if it is taken - probe the same
+# list the CSP app uses, and verify the response is really our endpoint.
+$senderPort = $null
+foreach ($port in @(5001, 5101, 5102, 5103, 5104, 5105)) {
+    try {
+        $r = Invoke-WebRequest -Uri "http://127.0.0.1:$port/api/ac/command" -UseBasicParsing -TimeoutSec 2
+        if ($r.StatusCode -eq 200 -and ($r.Content -eq 'none' -or $r.Content -match '^\w+\|\d+\|\S+$')) {
+            $senderPort = $port; break
+        }
+    } catch {}
+}
+if ($senderPort) {
+    $null = Check "Lap Time Sender running (port $senderPort)" $true $null
+    if ($senderPort -ne 5001) {
+        Write-Host "       -> note: port 5001 is taken by another app; Sender fell back to $senderPort (the CSP app finds it automatically)" -ForegroundColor Yellow
+    }
+} else {
     Write-Host "[ -- ] Lap Time Sender not currently running (start it to complete the chain)" -ForegroundColor DarkGray
 }
 
