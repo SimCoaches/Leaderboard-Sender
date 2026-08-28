@@ -24,12 +24,9 @@ SolidCompression=yes
 UninstallDisplayIcon={app}\{#MyAppExeName}
 PrivilegesRequired=lowest
 WizardStyle=modern
-#ifdef SIGN
-; Signed release build (see sign_release.ps1): Inno signs the Setup exe and
-; the uninstaller with the sign tool passed on the ISCC command line.
-SignTool=signtool
-SignedUninstaller=yes
-#endif
+; Signed releases: run sign_release.ps1 instead of calling ISCC directly.
+; It signs the app exe first (Google Cloud KMS EV cert, same as TrackPro),
+; compiles this installer around it, then signs the Setup exe.
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
