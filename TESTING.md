@@ -70,10 +70,14 @@ Sender → Advanced → **4th Screen**:
      that's the documented fallback; the second run should replay.
 3. **Off**: fail a run → 4th monitor just keeps the live camera (parked car).
 
-## 5. Leaderboard flow (5 min)
+## 5. Leaderboard flow + run log (5 min)
 
 1. With the Receiver running, confirm a completed sector-challenge run
    arrives and distance-ranked partial runs slot in below full runs.
+2. Open `sector_runs.csv` in the Sender folder: every run from today
+   should be there - driver, result (COMPLETE / FAILED S#), distance %,
+   total time, each sector's time vs. target, and the questionnaire
+   answers. `leads.csv` holds the registrations.
 
 ## Notes / known one-time adjustments
 

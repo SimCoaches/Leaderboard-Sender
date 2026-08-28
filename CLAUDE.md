@@ -84,7 +84,13 @@ default "Restart session" hotkey must be unchanged).
 
 The Receiver's `ranking_mode: "distance"` config ranks these runs by distance
 traveled descending, lap/elapsed time as tiebreaker. Configured in the
-"Custom Sectors" section of the main window.
+"Custom Sectors" section of the main window; edits auto-save to
+`sector_config.json` (silently, only when the table is fully valid).
+
+Every finished run - completed or failed - is appended to `sector_runs.csv`
+(next to the exe): driver, email/phone, result, distance %, total time (raw +
+M:SS.mmm), each judged sector's time vs. target, and the driver's lead-gen
+questionnaire answers. Questionnaire registrations also land in `leads.csv`.
 
 ### Broadcast Screen (`broadcast/`)
 

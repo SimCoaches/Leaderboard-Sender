@@ -451,6 +451,55 @@ def parse_time_to_seconds(text):
     except (ValueError, TypeError):
         return None
 
+def get_sector_runs_csv_path():
+    """Path of the per-run sector log (next to the executable, like leads.csv)."""
+    if getattr(sys, 'frozen', False):
+        base_path = Path(sys.executable).parent
+    else:
+        base_path = Path(__file__).parent
+    return base_path / 'sector_runs.csv'
+
+def append_sector_run_to_csv(driver_name, email, phone, result, distance_pct,
+                             total_time_s, sector_results, survey_answers):
+    """Append one finished sector-challenge run to sector_runs.csv.
+
+    Every run is kept - completed or failed - with each judged sector's
+    time vs. target, the total time, and the driver's questionnaire answers,
+    so nothing about a run is lost when the next driver starts.
+    """
+    try:
+        sectors_text = '; '.join(
+            f"S{r['index'] + 1} {r['time']:.3f}/{r['target']:.3f} {'PASS' if r['passed'] else 'FAIL'}"
+            for r in sector_results
+        )
+        answers_text = '; '.join(f"{q}={a}" for q, a in (survey_answers or {}).items())
+        path = get_sector_runs_csv_path()
+        fieldnames = ['timestamp', 'driver_name', 'email', 'phone', 'result',
+                      'distance_pct', 'total_time', 'total_time_formatted',
+                      'sectors', 'survey_answers']
+        write_header = not path.exists()
+        with open(path, 'a', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            if write_header:
+                writer.writeheader()
+            writer.writerow({
+                'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+                'driver_name': driver_name,
+                'email': email or '',
+                'phone': phone or '',
+                'result': result,
+                'distance_pct': f"{float(distance_pct):.2f}",
+                'total_time': f"{float(total_time_s):.3f}",
+                'total_time_formatted': format_time_ms(int(float(total_time_s) * 1000)),
+                'sectors': sectors_text,
+                'survey_answers': answers_text,
+            })
+        print(f"[Sectors] Run logged to {path.name}: {driver_name} - {result}")
+        return True
+    except Exception as e:
+        print(f"WARNING: Could not log sector run: {e}")
+        return False
+
 def get_lead_questions_path():
     """Get the path to the lead-gen survey questions config file."""
     if getattr(sys, 'frozen', False):
@@ -7409,6 +7458,7 @@ class LapTimeSenderWindow(QMainWindow):
         self.sector_config = load_sector_config()
         self.lead_questions = load_lead_questions()
         self.last_survey_answers = {}
+        self._run_sector_results = []  # judged sectors of the current run
 
         # 4th-screen broadcast director (OBS scene switching): 'off',
         # 'waiting' (waiting scene between drivers) or 'replay' (loop the
@@ -9004,6 +9054,8 @@ class LapTimeSenderWindow(QMainWindow):
             self.current_monitor is not None and hasattr(self.current_monitor, 'set_challenge_config')
         self.send_lap_time(lap_time, from_game=True, override_driver=driver_name,
                            distance_pct=100.0 if challenge_on else None)
+        if challenge_on:
+            self._log_sector_run("COMPLETE", 100.0, lap_time)
         
         # Check if session should end (time or lap limits reached)
         session_ended = False
@@ -9935,6 +9987,30 @@ class LapTimeSenderWindow(QMainWindow):
 
     def on_sector_result(self, sector_index, sector_time, target_time, passed):
         self.sector_flash.show_result(sector_index + 1, sector_time, target_time, passed)
+        # Accumulate this run's sector times for the run log. A result whose
+        # index doesn't continue the sequence means a new run started (or the
+        # stream began mid-run) - drop the stale entries first.
+        if sector_index != len(self._run_sector_results):
+            self._run_sector_results = []
+        if sector_index == len(self._run_sector_results):
+            self._run_sector_results.append({
+                'index': sector_index, 'time': sector_time,
+                'target': target_time, 'passed': passed,
+            })
+
+    def _log_sector_run(self, result, distance_pct, total_time_s):
+        """Write the finished run (sectors + questionnaire) to sector_runs.csv
+        and reset the accumulator for the next driver."""
+        driver = self.driver_name.text().strip() if hasattr(self.driver_name, 'text') else ''
+        append_sector_run_to_csv(
+            driver or 'Unknown',
+            getattr(self, 'last_driver_email', ''),
+            getattr(self, 'last_driver_phone', ''),
+            result, distance_pct, total_time_s,
+            self._run_sector_results,
+            getattr(self, 'last_survey_answers', {}) or {},
+        )
+        self._run_sector_results = []
 
     def on_challenge_failed(self, sector_index, distance_pct, elapsed_s):
         """A driver missed a sector target: score the partial run, put the car
@@ -9947,6 +10023,7 @@ class LapTimeSenderWindow(QMainWindow):
         if driver:
             self.send_lap_time(elapsed_s, from_game=True, override_driver=driver,
                                distance_pct=distance_pct, challenge_fail=True)
+        self._log_sector_run(f"FAILED S{sector_index + 1}", distance_pct, elapsed_s)
 
         if ac_app_alive():
             spawn = self.sector_config.get('teleport_spawn', 'HOTLAP_START')
