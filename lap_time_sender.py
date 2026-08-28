@@ -20,7 +20,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                             QHBoxLayout, QLabel, QLineEdit, QPushButton,
                             QMessageBox, QFormLayout, QComboBox, QGridLayout, QFrame,
                             QCheckBox, QTableWidget, QTableWidgetItem, QDialog,
-                            QAbstractItemView, QHeaderView)
+                            QAbstractItemView, QHeaderView, QScrollArea)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QObject, QUrl
 from PyQt6.QtGui import QImage, QPixmap, QIcon, QFont, QColor
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
@@ -8209,7 +8209,6 @@ class LapTimeSenderWindow(QMainWindow):
         self.sector_table.setHorizontalHeaderLabels(["Sector Start %", "Target Time", "Covers"])
         self.sector_table.horizontalHeader().setStretchLastSection(True)
         self.sector_table.verticalHeader().setDefaultSectionSize(24)
-        self.sector_table.setMaximumHeight(200)
         self._sector_table_updating = False
         self.sector_table.itemChanged.connect(self._on_sector_cell_changed)
         self.sector_table.setStyleSheet("""
@@ -8865,8 +8864,32 @@ class LapTimeSenderWindow(QMainWindow):
         ipad_box_layout.addWidget(settings_grid)
 
         card_layout.addWidget(ipad_box)
-        
-        main_layout.addWidget(card)
+
+        # The page is taller than many screens once every section is present.
+        # A scroll area lets each section keep its natural height instead of
+        # Qt crushing rows into each other when the window is short.
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setStyleSheet("""
+            QScrollArea { background: transparent; border: none; }
+            QScrollBar:vertical {
+                background: #252526;
+                width: 10px;
+                border-radius: 5px;
+            }
+            QScrollBar::handle:vertical {
+                background: #4e4e52;
+                border-radius: 5px;
+                min-height: 30px;
+            }
+            QScrollBar::handle:vertical:hover { background: #007acc; }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+        """)
+        scroll.viewport().setStyleSheet("background: transparent;")
+        scroll.setWidget(card)
+        main_layout.addWidget(scroll)
         
     def start_monitor(self, game_name):
         """Start monitoring the selected game"""
@@ -9848,9 +9871,18 @@ class LapTimeSenderWindow(QMainWindow):
             self._sector_table_updating = False
         self._refresh_sector_ranges()
 
+    def _resize_sector_table(self):
+        """Size the table to show every sector row without scrolling
+        (capped so a very long list can't swallow the window)."""
+        rows = self.sector_table.rowCount()
+        header_h = self.sector_table.horizontalHeader().height() or 26
+        wanted = header_h + rows * self.sector_table.verticalHeader().defaultSectionSize() + 6
+        self.sector_table.setFixedHeight(max(60, min(wanted, 320)))
+
     def _refresh_sector_ranges(self):
         """Fill the read-only 'Covers' column: each sector runs from its own
         start % to the next sector's start %, the last one to the finish."""
+        self._resize_sector_table()
         starts = []
         for row in range(self.sector_table.rowCount()):
             item = self.sector_table.item(row, 0)
