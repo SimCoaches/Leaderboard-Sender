@@ -9827,6 +9827,43 @@ class LapTimeSenderWindow(QMainWindow):
             return
         if item.column() == 0:
             self._refresh_sector_ranges()
+        if item.column() in (0, 1):
+            self._autosave_sectors()
+
+    def _autosave_sectors(self):
+        """Persist the sector table whenever an edit leaves it fully valid, so
+        percentages and targets survive a shutdown even if nobody clicks Save.
+
+        Silent by design: an incomplete or invalid table simply isn't saved
+        yet (the previous good config stays on disk), and the Save button
+        still gives explicit validation feedback on demand. The table is not
+        repopulated here, so typing is never disturbed."""
+        sectors = []
+        for row in range(self.sector_table.rowCount()):
+            pct_item = self.sector_table.item(row, 0)
+            time_item = self.sector_table.item(row, 1)
+            pct_text = pct_item.text().strip() if pct_item else ''
+            time_text = time_item.text().strip() if time_item else ''
+            if not pct_text and not time_text:
+                continue
+            try:
+                start_pct = float(pct_text.replace('%', ''))
+            except ValueError:
+                return
+            target_time = parse_time_to_seconds(time_text)
+            if target_time is None:
+                return
+            sectors.append({'start_pct': start_pct, 'target_time': target_time})
+        config = normalize_sector_config({
+            'enabled': self.sector_challenge_enabled.isChecked(),
+            'sectors': sectors,
+            'teleport_spawn': self.sector_config.get('teleport_spawn', 'HOTLAP_START'),
+        })
+        if not config:
+            return
+        self.sector_config = config
+        save_sector_config(config)
+        self._apply_sector_config_to_monitor()
 
     def on_add_sector_row(self):
         row = self.sector_table.rowCount()
@@ -9844,6 +9881,7 @@ class LapTimeSenderWindow(QMainWindow):
         for row in rows:
             self.sector_table.removeRow(row)
         self._refresh_sector_ranges()
+        self._autosave_sectors()
 
     def on_sector_challenge_toggled(self, checked):
         self.sector_config['enabled'] = bool(checked)

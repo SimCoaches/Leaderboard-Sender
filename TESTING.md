@@ -36,7 +36,9 @@ subsystem.
 ## 3. Sector challenge + teleport (10 min)
 
 1. In the Sender: enable Sector Challenge with 2–3 sectors and generous
-   targets (e.g. sector times you can beat easily).
+   targets (e.g. sector times you can beat easily). Sector edits save
+   automatically as you type (and via Save Sectors) — restart the Sender
+   once and confirm the sectors and the enable checkbox come back.
 2. Register a driver, drive, beat all sectors.
    - Expect: green sector flashes; lap submitted; session ends normally.
 3. Register again, deliberately park until a sector time expires.
