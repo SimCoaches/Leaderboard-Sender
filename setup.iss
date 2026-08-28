@@ -24,6 +24,12 @@ SolidCompression=yes
 UninstallDisplayIcon={app}\{#MyAppExeName}
 PrivilegesRequired=lowest
 WizardStyle=modern
+#ifdef SIGN
+; Signed release build (see sign_release.ps1): Inno signs the Setup exe and
+; the uninstaller with the sign tool passed on the ISCC command line.
+SignTool=signtool
+SignedUninstaller=yes
+#endif
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
