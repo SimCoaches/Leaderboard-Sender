@@ -22,7 +22,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                             QCheckBox, QTableWidget, QTableWidgetItem, QDialog,
                             QAbstractItemView, QHeaderView)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QObject, QUrl
-from PyQt6.QtGui import QImage, QPixmap, QIcon, QFont
+from PyQt6.QtGui import QImage, QPixmap, QIcon, QFont, QColor
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PyQt6.QtMultimediaWidgets import QVideoWidget
 import qrcode
@@ -8144,21 +8144,24 @@ class LapTimeSenderWindow(QMainWindow):
         sector_layout.addLayout(sector_header_row)
 
         sector_help = QLabel(
-            "Each sector starts at a % of the track and must be completed within its target time. "
-            "Miss a target and the run ends: the car is teleported back to start/finish and the waiting "
-            "screen comes up for the next driver. Install the LeaderboardSector CSP app (see ac_app folder) "
-            "for a clean in-game teleport; without it the session is restarted via AC's Ctrl+O hotkey. "
-            "Times accept M:SS.mmm or plain seconds."
+            "Each row is one sector: where it STARTS (% of the track) and how long the driver has to "
+            "get through it. A sector runs until the next sector's start; the last sector always ends at "
+            "the finish line, so no 100% row is needed. Target times are plain seconds (30, 90, 145) or "
+            "M:SS.mmm (1:30 or 1:30.500) - both mean the same thing. Miss a target and the run ends: the "
+            "car teleports back to start/finish (LeaderboardSector CSP app; Ctrl+O fallback without it) "
+            "and the waiting screen comes up for the next driver."
         )
         sector_help.setWordWrap(True)
         sector_help.setStyleSheet("font-size: 10px; color: #9d9d9d;")
         sector_layout.addWidget(sector_help)
 
-        self.sector_table = QTableWidget(0, 2)
-        self.sector_table.setHorizontalHeaderLabels(["Sector Start %", "Target Time"])
+        self.sector_table = QTableWidget(0, 3)
+        self.sector_table.setHorizontalHeaderLabels(["Sector Start %", "Target Time", "Covers"])
         self.sector_table.horizontalHeader().setStretchLastSection(True)
         self.sector_table.verticalHeader().setDefaultSectionSize(24)
-        self.sector_table.setMaximumHeight(160)
+        self.sector_table.setMaximumHeight(200)
+        self._sector_table_updating = False
+        self.sector_table.itemChanged.connect(self._on_sector_cell_changed)
         self.sector_table.setStyleSheet("""
             QTableWidget {
                 background-color: #1e1e1e;
@@ -8198,6 +8201,9 @@ class LapTimeSenderWindow(QMainWindow):
             sector_btn_row.addWidget(btn)
         sector_btn_row.addStretch()
         sector_layout.addLayout(sector_btn_row)
+        # Pin content to the top: any extra height the card gives this section
+        # collects below the buttons instead of spreading gaps between rows
+        sector_layout.addStretch()
 
         card_layout.addWidget(sector_section)
         self._populate_sector_table()
@@ -9780,21 +9786,64 @@ class LapTimeSenderWindow(QMainWindow):
 
     def _populate_sector_table(self):
         sectors = self.sector_config.get('sectors', [])
-        self.sector_table.setRowCount(len(sectors))
-        for row, s in enumerate(sectors):
-            self.sector_table.setItem(row, 0, QTableWidgetItem(f"{s['start_pct']:g}"))
-            self.sector_table.setItem(row, 1, QTableWidgetItem(format_time_ms(int(s['target_time'] * 1000))))
+        self._sector_table_updating = True
+        try:
+            self.sector_table.setRowCount(len(sectors))
+            for row, s in enumerate(sectors):
+                self.sector_table.setItem(row, 0, QTableWidgetItem(f"{s['start_pct']:g}"))
+                self.sector_table.setItem(row, 1, QTableWidgetItem(format_time_ms(int(s['target_time'] * 1000))))
+        finally:
+            self._sector_table_updating = False
+        self._refresh_sector_ranges()
+
+    def _refresh_sector_ranges(self):
+        """Fill the read-only 'Covers' column: each sector runs from its own
+        start % to the next sector's start %, the last one to the finish."""
+        starts = []
+        for row in range(self.sector_table.rowCount()):
+            item = self.sector_table.item(row, 0)
+            try:
+                starts.append(float(item.text().replace('%', '').strip()) if item else None)
+            except ValueError:
+                starts.append(None)
+        self._sector_table_updating = True
+        try:
+            for row, start in enumerate(starts):
+                if start is None:
+                    text = ""
+                else:
+                    later = [s for s in starts if s is not None and s > start]
+                    text = (f"{start:g}% → {min(later):g}%" if later
+                            else f"{start:g}% → Finish")
+                cell = QTableWidgetItem(text)
+                cell.setFlags(Qt.ItemFlag.ItemIsEnabled)  # read-only
+                cell.setForeground(QColor('#6e9e6e'))
+                self.sector_table.setItem(row, 2, cell)
+        finally:
+            self._sector_table_updating = False
+
+    def _on_sector_cell_changed(self, item):
+        if self._sector_table_updating:
+            return
+        if item.column() == 0:
+            self._refresh_sector_ranges()
 
     def on_add_sector_row(self):
         row = self.sector_table.rowCount()
         self.sector_table.insertRow(row)
-        self.sector_table.setItem(row, 0, QTableWidgetItem(""))
-        self.sector_table.setItem(row, 1, QTableWidgetItem(""))
+        self._sector_table_updating = True
+        try:
+            self.sector_table.setItem(row, 0, QTableWidgetItem(""))
+            self.sector_table.setItem(row, 1, QTableWidgetItem(""))
+        finally:
+            self._sector_table_updating = False
+        self._refresh_sector_ranges()
 
     def on_remove_sector_row(self):
         rows = sorted({index.row() for index in self.sector_table.selectedIndexes()}, reverse=True)
         for row in rows:
             self.sector_table.removeRow(row)
+        self._refresh_sector_ranges()
 
     def on_sector_challenge_toggled(self, checked):
         self.sector_config['enabled'] = bool(checked)
@@ -9814,6 +9863,12 @@ class LapTimeSenderWindow(QMainWindow):
                 start_pct = float(pct_text.replace('%', ''))
             except ValueError:
                 self.show_error(f"Sector row {row + 1}: invalid start % '{pct_text}'")
+                return
+            if start_pct >= 100:
+                self.show_error(
+                    f"Sector row {row + 1}: start % must be below 100. The last sector "
+                    "automatically runs to the finish line - no 100% row is needed."
+                )
                 return
             target_time = parse_time_to_seconds(time_text)
             if target_time is None:
