@@ -463,7 +463,8 @@ def get_sector_runs_csv_path():
     return base_path / 'sector_runs.csv'
 
 def append_sector_run_to_csv(driver_name, email, phone, result, distance_pct,
-                             total_time_s, sector_results, survey_answers):
+                             total_time_s, sector_results, survey_answers,
+                             distance_m=None, track_length_m=None):
     """Append one finished sector-challenge run to sector_runs.csv.
 
     Every run is kept - completed or failed - with each judged sector's
@@ -478,7 +479,8 @@ def append_sector_run_to_csv(driver_name, email, phone, result, distance_pct,
         answers_text = '; '.join(f"{q}={a}" for q, a in (survey_answers or {}).items())
         path = get_sector_runs_csv_path()
         fieldnames = ['timestamp', 'driver_name', 'email', 'phone', 'result',
-                      'distance_pct', 'total_time', 'total_time_formatted',
+                      'distance_pct', 'distance_m', 'track_length_m',
+                      'total_time', 'total_time_formatted',
                       'sectors', 'survey_answers']
         write_header = not path.exists()
         with open(path, 'a', newline='', encoding='utf-8') as f:
@@ -492,6 +494,8 @@ def append_sector_run_to_csv(driver_name, email, phone, result, distance_pct,
                 'phone': phone or '',
                 'result': result,
                 'distance_pct': f"{float(distance_pct):.2f}",
+                'distance_m': '' if distance_m is None else f"{float(distance_m):.1f}",
+                'track_length_m': '' if track_length_m is None else f"{float(track_length_m):.1f}",
                 'total_time': f"{float(total_time_s):.3f}",
                 'total_time_formatted': format_time_ms(int(float(total_time_s) * 1000)),
                 'sectors': sectors_text,
@@ -5885,8 +5889,61 @@ class AssettoCorsaGraphicsData(ctypes.Structure):
         ('windDirection', ctypes.c_float),       # Wind direction
     ]
 
+class AssettoCorsaStaticData(ctypes.Structure):
+    """AC's static shared page, read only for the track length so a run's
+    distance can be reported in metres as well as a percentage.
+
+    Layout follows AC's SPageFileStatic. Only the fields up to
+    trackSPlineLength matter here; the track name is read alongside it as a
+    self-check, since a plausible name means the offsets line up.
+    """
+    _pack_ = 4
+    _fields_ = [
+        ('smVersion', ctypes.c_wchar * 15),
+        ('acVersion', ctypes.c_wchar * 15),
+        ('numberOfSessions', ctypes.c_int),
+        ('numCars', ctypes.c_int),
+        ('carModel', ctypes.c_wchar * 33),
+        ('track', ctypes.c_wchar * 33),
+        ('playerName', ctypes.c_wchar * 33),
+        ('playerSurname', ctypes.c_wchar * 33),
+        ('playerNick', ctypes.c_wchar * 33),
+        ('sectorCount', ctypes.c_int),
+        ('maxTorque', ctypes.c_float),
+        ('maxPower', ctypes.c_float),
+        ('maxRpm', ctypes.c_int),
+        ('maxFuel', ctypes.c_float),
+        ('suspensionMaxTravel', ctypes.c_float * 4),
+        ('tyreRadius', ctypes.c_float * 4),
+        ('maxTurboBoost', ctypes.c_float),
+        ('deprecated_1', ctypes.c_float),
+        ('deprecated_2', ctypes.c_float),
+        ('penaltiesEnabled', ctypes.c_int),
+        ('aidFuelRate', ctypes.c_float),
+        ('aidTireRate', ctypes.c_float),
+        ('aidMechanicalDamage', ctypes.c_float),
+        ('aidAllowTyreBlankets', ctypes.c_int),
+        ('aidStability', ctypes.c_float),
+        ('aidAutoClutch', ctypes.c_int),
+        ('aidAutoBlip', ctypes.c_int),
+        ('hasDRS', ctypes.c_int),
+        ('hasERS', ctypes.c_int),
+        ('hasKERS', ctypes.c_int),
+        ('kersMaxJ', ctypes.c_float),
+        ('engineBrakeSettingsCount', ctypes.c_int),
+        ('ersPowerControllerCount', ctypes.c_int),
+        ('trackSPlineLength', ctypes.c_float),
+    ]
+
+
 class AssettoCorsaMonitor(GameMonitor):
     game_name = "Assetto Corsa"
+
+    # Track length in metres, filled in on connect. Class-level default so the
+    # distance code always has something to read, even before connecting.
+    track_length_m = None
+    last_run_distance_m = None
+    last_run_track_length_m = None
 
     # Custom sector challenge signals
     sector_result = pyqtSignal(int, float, float, bool)  # sector_index, sector_time_s, target_s, passed
@@ -5946,6 +6003,29 @@ class AssettoCorsaMonitor(GameMonitor):
         self._chal_lap_ok_latch = False
         return ok
 
+    def _read_track_length(self):
+        """Track spline length in metres from AC's static page, or None.
+
+        Validated before use: the track name must be readable and the length
+        must be plausible, so a shared-memory layout change can never turn
+        into a wrong distance on the leaderboard.
+        """
+        try:
+            with mmap.mmap(-1, ctypes.sizeof(AssettoCorsaStaticData), "Local\\acpmf_static") as handle:
+                static = AssettoCorsaStaticData()
+                ctypes.memmove(ctypes.byref(static), handle.read(ctypes.sizeof(AssettoCorsaStaticData)),
+                               ctypes.sizeof(AssettoCorsaStaticData))
+            length = float(static.trackSPlineLength)
+            track = str(static.track or '').strip()
+            # Shortest real circuits are ~1km; the Nordschleife is ~20.8km
+            if track and 500.0 <= length <= 30000.0:
+                print(f"[Sectors] Track '{track}' length {length:.1f}m - distances will be reported in metres")
+                return length
+            print(f"[Sectors] Track length unavailable (track='{track}', value={length:.1f}) - using percentage only")
+        except Exception as e:
+            print(f"[Sectors] Could not read track length ({e}) - using percentage only")
+        return None
+
     def _chal_begin_run(self, anchor_ms, await_timer_reset=False):
         self._chal_state = 'running'
         self._chal_sector = 0
@@ -5959,9 +6039,21 @@ class AssettoCorsaMonitor(GameMonitor):
 
     def _chal_fail(self, sector_index, pos, lap_ms):
         self._chal_state = 'failed'
+        # normalizedCarPosition is the fraction of the way around the track
+        # spline, so this is how far along the lap the car actually got
         distance_pct = max(0.0, min(pos, 1.0)) * 100.0
         elapsed_s = max(0, lap_ms - self._chal_run_anchor_ms) / 1000.0
-        print(f"[Sectors] FAILED sector {sector_index + 1} at {distance_pct:.2f}% (elapsed {elapsed_s:.3f}s)")
+        track_length = self.track_length_m
+        if track_length:
+            metres = distance_pct / 100.0 * track_length
+            self.last_run_distance_m = metres
+            self.last_run_track_length_m = track_length
+            print(f"[Sectors] FAILED sector {sector_index + 1} at {distance_pct:.2f}% "
+                  f"({metres:.0f}m of {track_length:.0f}m, elapsed {elapsed_s:.3f}s)")
+        else:
+            self.last_run_distance_m = None
+            self.last_run_track_length_m = None
+            print(f"[Sectors] FAILED sector {sector_index + 1} at {distance_pct:.2f}% (elapsed {elapsed_s:.3f}s)")
         self.challenge_failed.emit(sector_index, distance_pct, elapsed_s)
 
     def _challenge_update(self, graphics):
@@ -6099,6 +6191,11 @@ class AssettoCorsaMonitor(GameMonitor):
                 print(f"Failed to open shared memory: {e}")
                 self.cleanup_handles()
                 return False, None
+
+            # Track length, so a run's distance can also be reported in metres.
+            # Optional: if anything looks wrong the challenge still works, it
+            # just reports percentage only.
+            self.track_length_m = self._read_track_length()
 
             # Read initial data to verify connection
             graphics = AssettoCorsaGraphicsData()
@@ -10140,6 +10237,11 @@ class LapTimeSenderWindow(QMainWindow):
         """Write the finished run (sectors + questionnaire) to sector_runs.csv
         and reset the accumulator for the next driver."""
         driver = self.driver_name.text().strip() if hasattr(self.driver_name, 'text') else ''
+        # Distance in metres, so the percentage on the board can be checked
+        # against the real track length
+        monitor = self.current_monitor
+        track_length_m = getattr(monitor, 'track_length_m', None)
+        distance_m = (distance_pct / 100.0 * track_length_m) if track_length_m else None
         append_sector_run_to_csv(
             driver or 'Unknown',
             getattr(self, 'last_driver_email', ''),
@@ -10147,6 +10249,8 @@ class LapTimeSenderWindow(QMainWindow):
             result, distance_pct, total_time_s,
             self._run_sector_results,
             getattr(self, 'last_survey_answers', {}) or {},
+            distance_m=distance_m,
+            track_length_m=track_length_m,
         )
         self._run_sector_results = []
 
