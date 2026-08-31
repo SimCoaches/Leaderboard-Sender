@@ -5927,6 +5927,8 @@ class AssettoCorsaMonitor(GameMonitor):
         self._chal_prev_ms = None
         self._chal_lap_ok_latch = False
         self._chal_reset_requested = False
+        self._chal_await_reset = False
+        self._chal_await_polls = 0
 
     def request_challenge_reset(self):
         """Thread-safe request (e.g. after a CSP teleport) to re-arm the
@@ -5944,11 +5946,16 @@ class AssettoCorsaMonitor(GameMonitor):
         self._chal_lap_ok_latch = False
         return ok
 
-    def _chal_begin_run(self, anchor_ms):
+    def _chal_begin_run(self, anchor_ms, await_timer_reset=False):
         self._chal_state = 'running'
         self._chal_sector = 0
         self._chal_sector_anchor_ms = anchor_ms
         self._chal_run_anchor_ms = anchor_ms
+        # AC's lap timer can lag a poll or two behind the line crossing. Until
+        # it restarts, judging would measure the previous lap's time against
+        # this run's first sector target.
+        self._chal_await_reset = await_timer_reset
+        self._chal_await_polls = 0
 
     def _chal_fail(self, sector_index, pos, lap_ms):
         self._chal_state = 'failed'
@@ -6004,9 +6011,26 @@ class AssettoCorsaMonitor(GameMonitor):
                     print(f"[Sectors] Line crossed in sector {self._chal_sector + 1} - run not scored")
                 self._chal_lap_ok_latch = lap_ok
                 if self._chal_state != 'failed':
-                    # The next run starts immediately at the line (lap timer restarts at ~0)
-                    self._chal_begin_run(0)
+                    # The next run starts at the line. If AC's timer has already
+                    # restarted, anchor to it; otherwise wait for it to do so.
+                    already_reset = timer_valid and lap_ms < 3000
+                    self._chal_begin_run(lap_ms if already_reset else 0,
+                                         await_timer_reset=not already_reset)
                 return lap_ok
+
+            if self._chal_await_reset:
+                # Wait for AC's lap timer to actually restart before judging.
+                # Without this the first sample after the line measures the
+                # previous lap's time and instantly fails the run at 0%.
+                self._chal_await_polls += 1
+                timer_restarted = timer_valid and (
+                    lap_ms < 3000 or (prev_timer_valid and lap_ms + 500 < prev_ms))
+                # Safety net: never wait forever (5s at the 20ms poll rate)
+                if timer_restarted or self._chal_await_polls > 250:
+                    self._chal_sector_anchor_ms = lap_ms if timer_valid else 0
+                    self._chal_run_anchor_ms = self._chal_sector_anchor_ms
+                    self._chal_await_reset = False
+                return False
 
             if timer_reset or teleported or not timer_valid:
                 # Session restarted or car reset mid-run - abandon without scoring
@@ -6045,7 +6069,9 @@ class AssettoCorsaMonitor(GameMonitor):
         # lap timer freshly counting up, which starts timing from a pit/rolling
         # start - that makes the drive out to the line part of the run.
         if line_crossed:
-            self._chal_begin_run(0)
+            already_reset = timer_valid and lap_ms < 3000
+            self._chal_begin_run(lap_ms if already_reset else 0,
+                                 await_timer_reset=not already_reset)
         elif (not self.challenge_config.get('ignore_out_lap', True)
               and timer_valid and prev_timer_valid and 0 < lap_ms < 3000 and prev_ms < lap_ms):
             self._chal_begin_run(lap_ms)
