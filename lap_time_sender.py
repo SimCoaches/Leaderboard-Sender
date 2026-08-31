@@ -753,6 +753,22 @@ def is_lead_gen_enabled():
         and window.email_field_enabled.isChecked()
     )
 
+def is_email_collection_enabled():
+    """Email is asked for only while Lead Gen is on and its own toggle is set."""
+    if not is_lead_gen_enabled():
+        return False
+    window = globals().get('main_window')
+    checkbox = getattr(window, 'collect_email_checkbox', None)
+    return True if checkbox is None else bool(checkbox.isChecked())
+
+def is_phone_collection_enabled():
+    """Phone is asked for only while Lead Gen is on and its own toggle is set."""
+    if not is_lead_gen_enabled():
+        return False
+    window = globals().get('main_window')
+    checkbox = getattr(window, 'collect_phone_checkbox', None)
+    return True if checkbox is None else bool(checkbox.isChecked())
+
 def send_sms_notification(phone_number, driver_name, simulator_name="your simulator"):
     """Send SMS notification via configured provider"""
     global sms_config
@@ -1336,11 +1352,15 @@ HTML_CONTENT = r"""
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         html, body {
-            width: 100%; height: 100vh; overflow: hidden;
-            position: fixed; top: 0; left: 0;
+            width: 100%;
+            /* Must scroll: with Lead Gen on the contact fields and survey
+               push the register button below the fold on a tablet */
+            min-height: 100vh;
             background-color: #000000;
         }
         body {
+            overflow-y: auto;
+            -webkit-overflow-scrolling: touch;
             font-family: 'Segoe UI', Arial, sans-serif;
             display: flex; justify-content: center; align-items: flex-start;
             padding-top: 10vh;
@@ -1465,10 +1485,10 @@ HTML_CONTENT = r"""
                 <input type="email" id="driverEmail" placeholder="Enter email address (required)" required>
                 <small style="color: #6e6e6e; font-style: italic;">Required for driver communication</small>
             </div>
-            <div class="input-group">
-                <label for="driverPhone">📱 Phone Number:</label>
-                <input type="tel" id="driverPhone" placeholder="Enter phone number (optional)">
-                <small id="driverPhoneHelp" style="color: #6e6e6e; font-style: italic;">Optional for partner race result integrations</small>
+            <div class="input-group" id="phoneGroup" style="display: none;">
+                <label for="driverPhone">📱 Phone Number: <span style="color: #f48771;">*</span></label>
+                <input type="tel" id="driverPhone" placeholder="Enter phone number (required)">
+                <small id="driverPhoneHelp" style="color: #6e6e6e; font-style: italic;">Required for race result delivery</small>
             </div>
         </div>
         <div id="surveySteps"></div>
@@ -1562,11 +1582,14 @@ HTML_CONTENT = r"""
             const driverEmail = document.getElementById('driverEmail')?.value?.trim() || '';
             const driverPhone = document.getElementById('driverPhone')?.value?.trim() || '';
             const emailInput = document.getElementById('driverEmail');
-            const leadGenEnabled = document.getElementById('emailGroup').style.display !== 'none';
+            // Each contact field is only required when it is actually shown
+            const wantEmail = document.getElementById('emailGroup').style.display !== 'none';
+            const phoneGroup = document.getElementById('phoneGroup');
+            const wantPhone = phoneGroup && phoneGroup.style.display !== 'none';
             if (!driverName) return 'Please enter your name';
-            if (leadGenEnabled && !driverEmail) return 'Please enter your email address';
-            if (leadGenEnabled && emailInput && !emailInput.checkValidity()) return 'Please enter a valid email address';
-            if (leadGenEnabled && !driverPhone) return 'Please enter your phone number';
+            if (wantEmail && !driverEmail) return 'Please enter your email address';
+            if (wantEmail && emailInput && !emailInput.checkValidity()) return 'Please enter a valid email address';
+            if (wantPhone && !driverPhone) return 'Please enter your phone number';
             return null;
         }
 
@@ -1703,10 +1726,13 @@ HTML_CONTENT = r"""
             const driverPhone = document.getElementById('driverPhone')?.value?.trim() || '';
             const statusDiv = document.getElementById('status');
             const emailGroup = document.getElementById('emailGroup');
-            const leadGenEnabled = emailGroup.style.display !== 'none';
+            const phoneGroup = document.getElementById('phoneGroup');
+            // Each field is required, and submitted, only when it is shown
+            const wantEmail = emailGroup && emailGroup.style.display !== 'none';
+            const wantPhone = phoneGroup && phoneGroup.style.display !== 'none';
             const driverEmailInput = document.getElementById('driverEmail');
-            const submitEmail = leadGenEnabled ? driverEmail : '';
-            const submitPhone = leadGenEnabled ? driverPhone : '';
+            const submitEmail = wantEmail ? driverEmail : '';
+            const submitPhone = wantPhone ? driverPhone : '';
 
             if (!driverName) {
                 statusDiv.textContent = 'Please enter your name';
@@ -1714,19 +1740,19 @@ HTML_CONTENT = r"""
                 statusDiv.style.display = 'block';
                 return;
             }
-            if (leadGenEnabled && !driverEmail) {
+            if (wantEmail && !driverEmail) {
                 statusDiv.textContent = 'Please enter your email address';
                 statusDiv.className = 'status error';
                 statusDiv.style.display = 'block';
                 return;
             }
-            if (leadGenEnabled && driverEmailInput && !driverEmailInput.checkValidity()) {
+            if (wantEmail && driverEmailInput && !driverEmailInput.checkValidity()) {
                 statusDiv.textContent = 'Please enter a valid email address';
                 statusDiv.className = 'status error';
                 statusDiv.style.display = 'block';
                 return;
             }
-            if (leadGenEnabled && !driverPhone) {
+            if (wantPhone && !driverPhone) {
                 statusDiv.textContent = 'Please enter your phone number';
                 statusDiv.className = 'status error';
                 statusDiv.style.display = 'block';
@@ -1830,30 +1856,24 @@ HTML_CONTENT = r"""
                         retryPendingSubmission();
                     }
 
-                    // Lead Gen contact fields
-                    const leadGenEnabled = Boolean(data.lead_gen_enabled || data.require_email);
+                    // Lead Gen contact fields. Email and phone are independent:
+                    // Lead Gen off means name only; with it on, each field is
+                    // shown only if its own toggle is set in the app settings.
+                    const leadGenEnabled = Boolean(data.lead_gen_enabled);
+                    const wantEmail = Boolean(data.require_email);
+                    const wantPhone = Boolean(data.require_phone);
                     const emailGroup = document.getElementById('emailGroup');
                     const phoneGroup = document.getElementById('phoneGroup');
                     const emailInput = document.getElementById('driverEmail');
-                    if (emailGroup) emailGroup.style.display = leadGenEnabled ? 'block' : 'none';
-                    if (phoneGroup) phoneGroup.style.display = leadGenEnabled ? 'block' : 'none';
                     const phoneInput = document.getElementById('driverPhone');
-                    const phoneLabel = document.querySelector('label[for="driverPhone"]');
-                    if (phoneLabel) {
-                        phoneLabel.innerHTML = 'Phone Number: <span style="color: #f48771;">*</span>';
-                    }
-                    if (phoneInput) {
-                        phoneInput.required = leadGenEnabled;
-                        phoneInput.placeholder = 'Enter phone number (required)';
-                    }
-                    const phoneHelp = document.getElementById('driverPhoneHelp');
-                    if (phoneHelp) {
-                        phoneHelp.textContent = 'Required for race result delivery';
-                    }
-                    if (!leadGenEnabled) {
-                        if (emailInput) emailInput.value = '';
-                        if (phoneInput) phoneInput.value = '';
-                    }
+                    if (emailGroup) emailGroup.style.display = wantEmail ? 'block' : 'none';
+                    if (phoneGroup) phoneGroup.style.display = wantPhone ? 'block' : 'none';
+                    if (emailInput) emailInput.required = wantEmail;
+                    if (phoneInput) phoneInput.required = wantPhone;
+                    // Only clear a field that is actually hidden, otherwise
+                    // polling wipes what the driver is typing
+                    if (!wantEmail && emailInput && emailInput.value) emailInput.value = '';
+                    if (!wantPhone && phoneInput && phoneInput.value) phoneInput.value = '';
                     // Survey questions: only re-render when the config changes so
                     // polling never wipes a half-answered wizard
                     const sq = Array.isArray(data.survey_questions) ? data.survey_questions : [];
@@ -3301,11 +3321,15 @@ QUEUE_HTML_CONTENT = r"""
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         html, body {
-            width: 100%; height: 100vh; overflow: hidden;
-            position: fixed; top: 0; left: 0;
+            width: 100%;
+            /* Must scroll: with Lead Gen on the contact fields and survey
+               push the register button below the fold on a tablet */
+            min-height: 100vh;
             background-color: #000000;
         }
         body {
+            overflow-y: auto;
+            -webkit-overflow-scrolling: touch;
             font-family: 'Segoe UI', Arial, sans-serif;
             display: flex; justify-content: center; align-items: flex-start;
             padding-top: 8vh;
@@ -4256,18 +4280,22 @@ def set_driver():
         if not driver_name:
             return jsonify({'success': False, 'error': 'driver_name is required'}), 400
 
-        if is_lead_gen_enabled():
+        # Each contact field is validated only when it is actually being
+        # collected, so Lead Gen can ask for email only, phone only, or both.
+        if is_email_collection_enabled():
             if not driver_email:
                 return jsonify({'success': False, 'error': 'email is required when Lead Gen is enabled'}), 400
             if not is_valid_email_address(driver_email):
                 return jsonify({'success': False, 'error': 'valid email is required when Lead Gen is enabled'}), 400
+        else:
+            driver_email = ""
 
+        if is_phone_collection_enabled():
             formatted_phone = format_phone_e164(driver_phone)
             if not formatted_phone:
                 return jsonify({'success': False, 'error': 'valid phone is required when Lead Gen is enabled'}), 400
             driver_phone = formatted_phone
         else:
-            driver_email = ""
             driver_phone = ""
 
         # Lead-gen survey: every configured question must be answered with one
@@ -4369,8 +4397,8 @@ def get_settings():
 
     return jsonify({
         'lead_gen_enabled': lead_gen_enabled,
-        'require_email': lead_gen_enabled,
-        'require_phone': lead_gen_enabled,
+        'require_email': is_email_collection_enabled(),
+        'require_phone': is_phone_collection_enabled(),
         'background_image': background_image,
         'timer_active': timer_active,
         'timer_seconds_left': timer_seconds_left,
@@ -7593,6 +7621,12 @@ class LapTimeSenderWindow(QMainWindow):
         if 'lead_gen_enabled' in settings:
             self.email_field_enabled.setChecked(bool(settings['lead_gen_enabled']))
 
+        # Restore which contact fields Lead Gen collects (both on by default)
+        if hasattr(self, 'collect_email_checkbox'):
+            self.collect_email_checkbox.setChecked(bool(settings.get('collect_email', True)))
+        if hasattr(self, 'collect_phone_checkbox'):
+            self.collect_phone_checkbox.setChecked(bool(settings.get('collect_phone', True)))
+
     def setup_ui(self):
         # Main window settings
         self.setWindowTitle("Lap Time Sender - Racing Leaderboard Interface")
@@ -8482,6 +8516,23 @@ class LapTimeSenderWindow(QMainWindow):
         lead_gen_cell_layout.setContentsMargins(0, 0, 0, 0)
         lead_gen_cell_layout.setSpacing(4)
         lead_gen_cell_layout.addWidget(self.email_field_enabled)
+
+        # Which contact fields Lead Gen asks for. Lead Gen off = name only.
+        contact_checkbox_style = "font-size: 11px; color: #cccccc;"
+        self.collect_email_checkbox = QCheckBox("Email")
+        self.collect_email_checkbox.setStyleSheet(contact_checkbox_style)
+        self.collect_email_checkbox.setChecked(True)
+        self.collect_email_checkbox.setToolTip("Ask drivers for an email address while Lead Gen is on")
+        self.collect_email_checkbox.toggled.connect(self._on_contact_fields_toggled)
+        lead_gen_cell_layout.addWidget(self.collect_email_checkbox)
+
+        self.collect_phone_checkbox = QCheckBox("Phone")
+        self.collect_phone_checkbox.setStyleSheet(contact_checkbox_style)
+        self.collect_phone_checkbox.setChecked(True)
+        self.collect_phone_checkbox.setToolTip("Ask drivers for a phone number while Lead Gen is on")
+        self.collect_phone_checkbox.toggled.connect(self._on_contact_fields_toggled)
+        lead_gen_cell_layout.addWidget(self.collect_phone_checkbox)
+
         lead_gen_cell_layout.addWidget(self.survey_questions_btn)
         grid_layout.addWidget(lead_gen_cell, 1, 1)
         
@@ -10155,6 +10206,14 @@ class LapTimeSenderWindow(QMainWindow):
         self.email_field_enabled.setText("On" if checked else "Off")
         settings = load_app_settings()
         settings['lead_gen_enabled'] = bool(checked)
+        save_app_settings(settings)
+
+    def _on_contact_fields_toggled(self, _checked=None):
+        """Persist which contact fields Lead Gen asks for. Registration pages
+        pick this up on their next poll, so no restart is needed."""
+        settings = load_app_settings()
+        settings['collect_email'] = bool(self.collect_email_checkbox.isChecked())
+        settings['collect_phone'] = bool(self.collect_phone_checkbox.isChecked())
         save_app_settings(settings)
 
     def on_edit_survey_questions(self):
