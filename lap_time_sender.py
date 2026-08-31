@@ -404,7 +404,10 @@ def normalize_sector_config(config):
         if spawn not in ('HOTLAP_START', 'START', 'PIT', 'TIME_ATTACK'):
             spawn = 'HOTLAP_START'
         return {'enabled': bool(config.get('enabled', False)), 'sectors': sectors,
-                'teleport_spawn': spawn}
+                'teleport_spawn': spawn,
+                # Only start timing at the start/finish line, so the drive out
+                # of the pits is not scored as a run
+                'ignore_out_lap': bool(config.get('ignore_out_lap', True))}
     except (KeyError, TypeError, ValueError):
         return None
 
@@ -6010,11 +6013,13 @@ class AssettoCorsaMonitor(GameMonitor):
                 self._chal_state = 'idle'
             return False
 
-        # idle: arm on a line crossing, or on a lap timer freshly counting up
-        # (covers session restarts where the car rolls from the pit/start box)
+        # idle: arm on a line crossing. With "ignore out lap" off, also arm on a
+        # lap timer freshly counting up, which starts timing from a pit/rolling
+        # start - that makes the drive out to the line part of the run.
         if line_crossed:
             self._chal_begin_run(0)
-        elif timer_valid and prev_timer_valid and 0 < lap_ms < 3000 and prev_ms < lap_ms:
+        elif (not self.challenge_config.get('ignore_out_lap', True)
+              and timer_valid and prev_timer_valid and 0 < lap_ms < 3000 and prev_ms < lap_ms):
             self._chal_begin_run(lap_ms)
         return False
     
@@ -8186,6 +8191,17 @@ class LapTimeSenderWindow(QMainWindow):
         sector_title.setStyleSheet("font-size: 12px; font-weight: bold; color: #e0e0e0;")
         sector_header_row.addWidget(sector_title)
         sector_header_row.addStretch()
+        self.ignore_out_lap_checkbox = QCheckBox("Ignore out lap")
+        self.ignore_out_lap_checkbox.setStyleSheet("font-size: 11px; color: #e0e0e0;")
+        self.ignore_out_lap_checkbox.setChecked(bool(self.sector_config.get('ignore_out_lap', True)))
+        self.ignore_out_lap_checkbox.setToolTip(
+            "On (recommended): timing starts when the car crosses the start/finish line,\n"
+            "so driving out of the pits is not scored.\n"
+            "Off: timing starts as soon as the car rolls, which counts the out lap."
+        )
+        self.ignore_out_lap_checkbox.toggled.connect(self.on_ignore_out_lap_toggled)
+        sector_header_row.addWidget(self.ignore_out_lap_checkbox)
+
         self.sector_challenge_enabled = QCheckBox("Enable Sector Challenge")
         self.sector_challenge_enabled.setStyleSheet("font-size: 11px; color: #e0e0e0;")
         self.sector_challenge_enabled.setChecked(bool(self.sector_config.get('enabled')))
@@ -9942,6 +9958,7 @@ class LapTimeSenderWindow(QMainWindow):
             'enabled': self.sector_challenge_enabled.isChecked(),
             'sectors': sectors,
             'teleport_spawn': self.sector_config.get('teleport_spawn', 'HOTLAP_START'),
+            'ignore_out_lap': self.sector_config.get('ignore_out_lap', True),
         })
         if not config:
             return
@@ -9969,6 +9986,12 @@ class LapTimeSenderWindow(QMainWindow):
 
     def on_sector_challenge_toggled(self, checked):
         self.sector_config['enabled'] = bool(checked)
+        save_sector_config(self.sector_config)
+        self._apply_sector_config_to_monitor()
+
+    def on_ignore_out_lap_toggled(self, checked):
+        """Start timing at the start/finish line instead of the pit exit."""
+        self.sector_config['ignore_out_lap'] = bool(checked)
         save_sector_config(self.sector_config)
         self._apply_sector_config_to_monitor()
 
@@ -10002,6 +10025,7 @@ class LapTimeSenderWindow(QMainWindow):
             'enabled': self.sector_challenge_enabled.isChecked(),
             'sectors': sectors,
             'teleport_spawn': self.sector_config.get('teleport_spawn', 'HOTLAP_START'),
+            'ignore_out_lap': self.sector_config.get('ignore_out_lap', True),
         })
         if not config:
             self.show_error("Invalid sectors: need at least one, start % between 0 and 99.9, no duplicate start %, times above 0.")
