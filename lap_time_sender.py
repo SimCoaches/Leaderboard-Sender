@@ -7218,9 +7218,14 @@ class WaitingOverlay(QWidget):
         
     def setup_ui(self):
         # Make it a full-screen overlay window
-        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | 
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint |
                            Qt.WindowType.WindowStaysOnTopHint |
                            Qt.WindowType.Tool)
+        # Never take focus. Activating a window over a game running in
+        # exclusive fullscreen forces its D3D swap chain to reset, which can
+        # take the graphics driver down with it. The overlay has nothing to
+        # interact with, so it only ever needs to be on top - not focused.
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
         
         # Get screen geometry and make it full screen
