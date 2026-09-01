@@ -69,7 +69,16 @@ Runs are judged live in `AssettoCorsaMonitor` using `normalizedCarPosition` +
 - Time expires mid-sector → instant fail: partial run is submitted with its
   `distance_pct`, the car is put back at start/finish, and the waiting screen
   comes up
-- Complete all sectors → lap submitted normally with `distance_pct: 100`
+- Complete all sectors → `challenge_completed(total_s)` is emitted at the
+  line crossing with the accumulated run time (AC's `iLastTime` is not
+  trusted after a teleport); the run is submitted with `distance_pct: 100`,
+  a gold "Challenge Complete!" screen with the total time is held ≥7 s, and
+  the car is reset for the next driver exactly like a failure
+
+The waiting / end-of-run overlay covers the primary monitor itself and a
+`ScreenBlanker` per extra monitor chosen under Advanced → "Cover Screens"
+(setting `waiting_screen_monitors`, default all). On a rig with a 4th
+broadcast monitor, leave that one unticked or the overlay hides OBS.
 
 Putting the car back uses the `LeaderboardSector` CSP companion app (`ac_app/`)
 when it is installed in AC: the app polls `GET /api/ac/command` on the local

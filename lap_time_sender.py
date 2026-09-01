@@ -5948,6 +5948,7 @@ class AssettoCorsaMonitor(GameMonitor):
     # Custom sector challenge signals
     sector_result = pyqtSignal(int, float, float, bool)  # sector_index, sector_time_s, target_s, passed
     challenge_failed = pyqtSignal(int, float, float)     # sector_index, distance_pct, elapsed_s
+    challenge_completed = pyqtSignal(float)              # total_s for a run that beat every sector
 
     def __init__(self):
         super().__init__()
@@ -6132,8 +6133,14 @@ class AssettoCorsaMonitor(GameMonitor):
                     passed = elapsed_s <= final_target
                     self.sector_result.emit(self._chal_sector, elapsed_s, final_target, passed)
                     if passed:
-                        print(f"[Sectors] Run COMPLETE - all {len(sectors)} sectors passed")
+                        total_s = self._chal_run_elapsed_ms / 1000.0
+                        print(f"[Sectors] Run COMPLETE - all {len(sectors)} sectors passed "
+                              f"in {total_s:.3f}s")
                         lap_ok = True
+                        # Reported from here, not from AC's lap counter: after a
+                        # teleport AC's own lap timer and count are unreliable,
+                        # and this is the line-to-line time we actually judged.
+                        self.challenge_completed.emit(total_s)
                     else:
                         self._chal_fail(self._chal_sector, prev_pos, prev_ms)
                 else:
@@ -6289,9 +6296,13 @@ class AssettoCorsaMonitor(GameMonitor):
             if graphics.completedLaps > self.last_completed_laps:
                 self.last_completed_laps = graphics.completedLaps
 
-                # In challenge mode only laps that beat every sector target count
-                if challenge_on and not self._chal_consume_lap_ok():
-                    print("[Sectors] Lap not scored (sector targets not all met)")
+                # In challenge mode a completed run is reported by the
+                # challenge_completed signal at the line crossing, with the
+                # time we judged. AC's own lap time is not used: after a
+                # teleport its lap timer may still be counting the previous
+                # lap, so iLastTime would be wrong.
+                if challenge_on:
+                    self._chal_consume_lap_ok()
                     return False, 0
 
                 # Validate racing context first
@@ -7485,9 +7496,30 @@ class BroadcastDirector(threading.Thread):
         return True
 
 
+class ScreenBlanker(QWidget):
+    """Plain dark cover for one extra monitor.
+
+    On a triple-screen rig the waiting overlay only covers the primary
+    monitor, leaving the game visible on the sides. One of these sits on
+    each additional screen the operator chooses, shown and hidden in step
+    with the main overlay. Never takes focus, for the same D3D reason as
+    the overlay itself.
+    """
+
+    def __init__(self, screen):
+        super().__init__()
+        self.screen_name = screen.name()
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint |
+                            Qt.WindowType.WindowStaysOnTopHint |
+                            Qt.WindowType.Tool)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        self.setStyleSheet("QWidget { background-color: #1e1e1e; }")
+        self.setGeometry(screen.geometry())
+
+
 class WaitingOverlay(QWidget):
     """Full-screen overlay that shows custom image or looping video until a driver signs up"""
-    
+
     def __init__(self):
         super().__init__()
         self.media_path = ""
@@ -7495,7 +7527,30 @@ class WaitingOverlay(QWidget):
         self.media_player = None
         self.video_widget = None
         self.image_label = None
+        self._blankers = {}   # screen name -> ScreenBlanker for extra monitors
         self.setup_ui()
+
+    def set_covered_screens(self, screen_names):
+        """Choose which additional monitors get blanked alongside the primary
+        one. Pass the QScreen names to cover; the primary is always covered
+        by the overlay itself and is ignored here."""
+        primary = QApplication.primaryScreen()
+        wanted = {name for name in (screen_names or []) if primary is None or name != primary.name()}
+        # Drop covers that are no longer wanted
+        for name in list(self._blankers):
+            if name not in wanted:
+                self._blankers.pop(name).close()
+        # Add covers for newly wanted screens that actually exist right now
+        for screen in QApplication.screens():
+            name = screen.name()
+            if name in wanted and name not in self._blankers:
+                blanker = ScreenBlanker(screen)
+                self._blankers[name] = blanker
+                if self.isVisible():
+                    blanker.show()
+            elif name in self._blankers:
+                # Keep geometry current if the layout moved
+                self._blankers[name].setGeometry(screen.geometry())
         
     def setup_ui(self):
         # Make it a full-screen overlay window
@@ -7694,15 +7749,19 @@ class WaitingOverlay(QWidget):
         self.media_player.setSource(QUrl.fromLocalFile(self.media_path))
         
     def show(self):
-        """Show the overlay and start video if applicable"""
+        """Show the overlay (and the side-screen covers) and start video if applicable"""
         super().show()
+        for blanker in self._blankers.values():
+            blanker.show()
         if self.is_video and self.media_player:
             self.media_player.play()
-            
+
     def hide(self):
-        """Hide the overlay and stop video if applicable"""
+        """Hide the overlay (and the side-screen covers) and stop video if applicable"""
         if self.is_video and self.media_player:
             self.media_player.stop()
+        for blanker in self._blankers.values():
+            blanker.hide()
         super().hide()
         
     def update_message(self, message):
@@ -7877,6 +7936,17 @@ class LapTimeSenderWindow(QMainWindow):
         self.broadcast_mode = mode
         if hasattr(self, 'broadcast_mode_combo'):
             self.broadcast_mode_combo.setCurrentIndex(['off', 'waiting', 'replay'].index(mode))
+
+        # Restore which monitors the waiting screen covers. Absent setting =
+        # every monitor, which is right for a plain triple-screen rig.
+        if hasattr(self, 'cover_screen_checkboxes'):
+            saved = settings.get('waiting_screen_monitors')
+            for name, box in self.cover_screen_checkboxes.items():
+                if box.isEnabled():
+                    box.blockSignals(True)
+                    box.setChecked(True if saved is None else name in saved)
+                    box.blockSignals(False)
+            self._apply_cover_screens()
 
         # Restore background image path
         if settings.get('background_image_path'):
@@ -9191,6 +9261,51 @@ class LapTimeSenderWindow(QMainWindow):
         self.broadcast_mode_combo.currentIndexChanged.connect(self._on_broadcast_mode_changed)
         grid_layout.addWidget(self.broadcast_mode_combo, 6, 1, 1, 2)
 
+        # Row 7: which monitors the waiting screen covers (Advanced). Triple
+        # screen rigs need the side monitors blanked too; a 4th broadcast
+        # monitor must be left alone or the overlay hides the OBS projector.
+        cover_screens_label = QLabel("Cover Screens:")
+        cover_screens_label.setMinimumWidth(80)
+        cover_screens_label.setMaximumWidth(100)
+        cover_screens_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        cover_screens_label.setStyleSheet("""
+            QLabel {
+                font-size: 11px;
+                color: #cccccc;
+                font-family: 'Segoe UI', 'Arial', sans-serif;
+            }
+        """)
+        cover_screens_label.setToolTip(
+            "Monitors the waiting / Out of Time / Challenge Complete screens cover.\n"
+            "Tick the driver's screens (all three on a triple setup). Leave the\n"
+            "broadcast monitor unticked so it keeps showing the OBS feed."
+        )
+        grid_layout.addWidget(cover_screens_label, 7, 0)
+
+        self.cover_screens_widget = QWidget()
+        cover_screens_layout = QHBoxLayout(self.cover_screens_widget)
+        cover_screens_layout.setContentsMargins(0, 0, 0, 0)
+        cover_screens_layout.setSpacing(10)
+        self.cover_screen_checkboxes = {}
+        primary_screen = QApplication.primaryScreen()
+        for index, screen in enumerate(QApplication.screens(), start=1):
+            geo = screen.geometry()
+            is_primary = primary_screen is not None and screen.name() == primary_screen.name()
+            box = QCheckBox(f"{index}: {geo.width()}x{geo.height()}" + (" (main)" if is_primary else ""))
+            box.setStyleSheet("font-size: 10px; color: #cccccc;")
+            box.setChecked(True)
+            if is_primary:
+                # The overlay itself always covers the main screen
+                box.setEnabled(False)
+                box.setToolTip("The main screen is always covered")
+            else:
+                box.setToolTip(f"{screen.name()}  at {geo.x()},{geo.y()}")
+                box.toggled.connect(self._on_cover_screens_changed)
+            self.cover_screen_checkboxes[screen.name()] = box
+            cover_screens_layout.addWidget(box)
+        cover_screens_layout.addStretch()
+        grid_layout.addWidget(self.cover_screens_widget, 7, 1, 1, 3)
+
         # Laps input (only used in Laps mode) - on same row as minutes
         self.lap_count_label = QLabel("Laps:")
         self.lap_count_label.setMinimumWidth(40)
@@ -9261,6 +9376,7 @@ class LapTimeSenderWindow(QMainWindow):
             (video_enable_label, self.video_required_toggle, self.video_path_input, self.select_video_button),
             (waiting_media_label, self.waiting_media_path, self.select_waiting_media_button),
             (broadcast_mode_label, self.broadcast_mode_combo),
+            (cover_screens_label, self.cover_screens_widget),
         ]
         self.set_advanced_visible(False)
         # Let the grid determine its own height based on contents to avoid crowding
@@ -9333,6 +9449,7 @@ class LapTimeSenderWindow(QMainWindow):
                     if hasattr(self.current_monitor, 'set_challenge_config'):
                         self.current_monitor.sector_result.connect(self.on_sector_result)
                         self.current_monitor.challenge_failed.connect(self.on_challenge_failed)
+                        self.current_monitor.challenge_completed.connect(self.on_challenge_completed)
                         self.current_monitor.set_challenge_config(self.sector_config)
 
                     # Start the monitor
@@ -10483,6 +10600,18 @@ class LapTimeSenderWindow(QMainWindow):
         checks.append(('ok', 'Driver registration', detail))
         checks.append(('ok', 'Registration page', f'http://{self.local_ip}:{self.web_port}/'))
 
+        # --- Waiting screen coverage ------------------------------------------
+        screens = QApplication.screens()
+        covered = self._covered_screen_names() if hasattr(self, 'cover_screen_checkboxes') else []
+        if len(screens) > 1:
+            uncovered = len(screens) - len(covered)
+            checks.append(('ok' if uncovered <= 1 else 'warn', 'Waiting screen coverage',
+                           f'covers {len(covered)} of {len(screens)} monitors'
+                           + ('' if uncovered <= 1 else
+                              ' - side screens will still show the game; tick them under Cover Screens')))
+        else:
+            checks.append(('ok', 'Waiting screen coverage', 'single monitor'))
+
         # --- The leaderboard itself -------------------------------------------
         server_url = (self.current_server_url or '').rstrip('/')
         if not server_url:
@@ -10700,10 +10829,34 @@ class LapTimeSenderWindow(QMainWindow):
             hold_ms=7000))
 
         # Reset the car once the screen is up, so the move happens out of sight
-        QTimer.singleShot(1400, lambda: self._reset_car_after_fail())
+        QTimer.singleShot(1400, lambda: self._reset_car_for_next_driver())
 
-    def _reset_car_after_fail(self):
-        """Put the car back for the next driver. Called once the 'Out of Time'
+    def on_challenge_completed(self, total_s):
+        """A driver beat every sector and crossed the line: score the full run,
+        congratulate them, and put the car back for the next driver - the same
+        shape as a failure, just with better news on the screen."""
+        print(f"[Sectors] Challenge COMPLETED in {total_s:.3f}s")
+
+        driver = self.driver_name.text().strip() if hasattr(self.driver_name, 'text') else ''
+        if driver:
+            self.send_lap_time(total_s, from_game=True, override_driver=driver,
+                               distance_pct=100.0)
+        self._log_sector_run("COMPLETE", 100.0, total_s)
+
+        time_text = format_time_ms(int(total_s * 1000))
+        QTimer.singleShot(400, lambda: self.end_session(
+            headline="🏆 Challenge Complete!",
+            detail=(f"You made it through every sector.\n"
+                    f"Total time: {time_text}\n\n"
+                    "Fantastic drive - please hop out for the next driver."),
+            accent="#d4af37",
+            hold_ms=7000))
+
+        # Same as a failure: move the car only once the screen is covering the game
+        QTimer.singleShot(1400, lambda: self._reset_car_for_next_driver())
+
+    def _reset_car_for_next_driver(self):
+        """Put the car back for the next driver. Called once the end-of-run
         screen is already covering the game, so nobody watches it happen."""
         if ac_app_alive():
             spawn = self.sector_config.get('teleport_spawn', 'HOTLAP_START')
@@ -10763,6 +10916,21 @@ class LapTimeSenderWindow(QMainWindow):
             print("[Sectors] Sent Ctrl+O restart to Assetto Corsa")
         except Exception as e:
             print(f"[Sectors] Could not restart AC session: {e}")
+
+    def _covered_screen_names(self):
+        """Names of every monitor the waiting screen should cover, primary included."""
+        return [name for name, box in self.cover_screen_checkboxes.items() if box.isChecked()]
+
+    def _apply_cover_screens(self):
+        if hasattr(self, 'waiting_overlay') and hasattr(self, 'cover_screen_checkboxes'):
+            self.waiting_overlay.set_covered_screens(self._covered_screen_names())
+
+    def _on_cover_screens_changed(self, _checked=None):
+        """Persist the monitor choice immediately and apply it to the overlay."""
+        self._apply_cover_screens()
+        settings = load_app_settings()
+        settings['waiting_screen_monitors'] = self._covered_screen_names()
+        save_app_settings(settings)
 
     def _on_broadcast_mode_changed(self, index):
         """Persist the 4th-screen broadcast mode immediately (like Lead Gen)."""
