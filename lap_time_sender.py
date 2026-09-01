@@ -6987,6 +6987,129 @@ class F1Monitor(GameMonitor):
 class State:
     ir_connected = False
 
+def find_assetto_corsa_folder():
+    """Locate the Assetto Corsa install via Steam, or None."""
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r'Software\Valve\Steam') as key:
+            steam_path = winreg.QueryValueEx(key, 'SteamPath')[0].replace('/', '\\')
+    except Exception:
+        return None
+
+    libraries = [steam_path]
+    vdf = Path(steam_path) / 'steamapps' / 'libraryfolders.vdf'
+    try:
+        if vdf.exists():
+            import re as _re
+            for match in _re.finditer(r'"path"\s+"([^"]+)"', vdf.read_text(encoding='utf-8', errors='ignore')):
+                libraries.append(match.group(1).replace('\\\\', '\\'))
+    except Exception:
+        pass
+
+    for library in dict.fromkeys(libraries):
+        candidate = Path(library) / 'steamapps' / 'common' / 'assettocorsa'
+        if (candidate / 'AssettoCorsa.exe').exists() or candidate.exists():
+            return candidate
+    return None
+
+
+class PreflightDialog(QDialog):
+    """Pre-event check: verifies the whole chain on this simulator so nothing
+    is discovered mid-event. Read-only - it never changes any setting."""
+
+    def __init__(self, window, parent=None):
+        super().__init__(parent)
+        self.window = window
+        self.setWindowTitle("Preflight Check")
+        self.setMinimumSize(680, 520)
+        self.setStyleSheet("QDialog { background-color: #252526; }")
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(8)
+
+        title = QLabel("Preflight Check")
+        title.setStyleSheet("font-size: 15px; font-weight: bold; color: #e0e0e0;")
+        layout.addWidget(title)
+
+        self.summary = QLabel("Running checks...")
+        self.summary.setWordWrap(True)
+        self.summary.setStyleSheet("font-size: 12px; color: #cccccc;")
+        layout.addWidget(self.summary)
+
+        self.results = QTableWidget(0, 3)
+        self.results.setHorizontalHeaderLabels(["", "Check", "Result"])
+        self.results.verticalHeader().setVisible(False)
+        self.results.setColumnWidth(0, 34)
+        self.results.setColumnWidth(1, 250)
+        self.results.horizontalHeader().setStretchLastSection(True)
+        self.results.setWordWrap(True)
+        self.results.setStyleSheet("""
+            QTableWidget {
+                background-color: #1e1e1e;
+                color: #e0e0e0;
+                border: 1px solid #3e3e42;
+                font-size: 11px;
+                gridline-color: #2d2d30;
+            }
+            QHeaderView::section {
+                background-color: #2d2d30; color: #9d9d9d;
+                border: none; padding: 4px; font-size: 10px;
+            }
+        """)
+        layout.addWidget(self.results)
+
+        button_row = QHBoxLayout()
+        rerun = QPushButton("🔄 Run Again")
+        rerun.clicked.connect(self.run_checks)
+        close = QPushButton("Close")
+        close.clicked.connect(self.accept)
+        for btn in (rerun, close):
+            btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #3e3e42; color: #e0e0e0; border: none;
+                    border-radius: 4px; padding: 6px 14px; font-size: 11px;
+                }
+                QPushButton:hover { background-color: #4e4e52; }
+            """)
+        button_row.addWidget(rerun)
+        button_row.addStretch()
+        button_row.addWidget(close)
+        layout.addLayout(button_row)
+
+        self.run_checks()
+
+    def run_checks(self):
+        checks = self.window.collect_preflight_checks()
+        self.results.setRowCount(len(checks))
+        for row, (level, label, detail) in enumerate(checks):
+            icon = {'ok': '✔', 'warn': '!', 'fail': '✘'}.get(level, '?')
+            colour = {'ok': '#6ec06e', 'warn': '#d9a441', 'fail': '#f48771'}.get(level, '#cccccc')
+            icon_item = QTableWidgetItem(icon)
+            icon_item.setForeground(QColor(colour))
+            icon_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            self.results.setItem(row, 0, icon_item)
+            for col, text in ((1, label), (2, detail)):
+                item = QTableWidgetItem(text)
+                item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                if col == 2:
+                    item.setForeground(QColor(colour))
+                self.results.setItem(row, col, item)
+        self.results.resizeRowsToContents()
+
+        failures = sum(1 for level, _, _ in checks if level == 'fail')
+        warnings = sum(1 for level, _, _ in checks if level == 'warn')
+        if failures:
+            self.summary.setText(f"{failures} problem(s) would affect the event - see the red rows below.")
+            self.summary.setStyleSheet("font-size: 12px; color: #f48771; font-weight: bold;")
+        elif warnings:
+            self.summary.setText(f"Ready, with {warnings} thing(s) worth a look (amber).")
+            self.summary.setStyleSheet("font-size: 12px; color: #d9a441; font-weight: bold;")
+        else:
+            self.summary.setText("All checks passed - this simulator is ready to run the event.")
+            self.summary.setStyleSheet("font-size: 12px; color: #6ec06e; font-weight: bold;")
+
+
 class SurveyQuestionsDialog(QDialog):
     """Editor for the lead-gen survey questions shown on the registration page."""
 
@@ -8457,7 +8580,10 @@ class LapTimeSenderWindow(QMainWindow):
         remove_sector_btn.clicked.connect(self.on_remove_sector_row)
         save_sectors_btn = QPushButton("💾 Save Sectors")
         save_sectors_btn.clicked.connect(self.on_save_sectors)
-        for btn in (add_sector_btn, remove_sector_btn, save_sectors_btn):
+        preflight_btn = QPushButton("🚦 Preflight Check")
+        preflight_btn.setToolTip("Verify this simulator end to end before the event starts")
+        preflight_btn.clicked.connect(self.on_run_preflight)
+        for btn in (add_sector_btn, remove_sector_btn, save_sectors_btn, preflight_btn):
             btn.setStyleSheet("""
                 QPushButton {
                     background-color: #3e3e42;
@@ -10213,6 +10339,113 @@ class LapTimeSenderWindow(QMainWindow):
         self.sector_config['enabled'] = bool(checked)
         save_sector_config(self.sector_config)
         self._apply_sector_config_to_monitor()
+
+    def collect_preflight_checks(self):
+        """Check the whole chain on this simulator. Returns (level, label,
+        detail) rows where level is 'ok', 'warn' or 'fail'.
+
+        Everything here is observed live - shared memory, the companion app's
+        heartbeat, the leaderboard's own API - rather than assumed from config.
+        """
+        checks = []
+        challenge_on = bool(self.sector_config.get('enabled'))
+
+        # --- Assetto Corsa and Custom Shaders Patch ---------------------------
+        ac_folder = find_assetto_corsa_folder()
+        if ac_folder:
+            checks.append(('ok', 'Assetto Corsa installed', str(ac_folder)))
+            csp = (ac_folder / 'extension').exists()
+            checks.append(('ok' if csp else 'fail', 'Custom Shaders Patch',
+                           'installed' if csp else 'NOT installed - install CSP via Content Manager'))
+            app_lua = ac_folder / 'apps' / 'lua' / 'LeaderboardSector' / 'LeaderboardSector.lua'
+            checks.append(('ok' if app_lua.exists() else 'fail', 'LeaderboardSector app files',
+                           'installed in AC' if app_lua.exists()
+                           else f'MISSING - copy ac_app\\LeaderboardSector into {ac_folder}\\apps\\lua'))
+        else:
+            checks.append(('warn', 'Assetto Corsa installed', 'not found via Steam - check manually'))
+            checks.append(('warn', 'Custom Shaders Patch', 'cannot check without the AC folder'))
+            checks.append(('warn', 'LeaderboardSector app files', 'cannot check without the AC folder'))
+
+        # --- Is AC actually feeding us telemetry right now? -------------------
+        monitor = self.current_monitor
+        connected = bool(monitor and getattr(monitor, 'game_name', '') == 'Assetto Corsa'
+                         and getattr(monitor, 'graphics_handle', None))
+        checks.append(('ok' if connected else 'warn', 'Assetto Corsa running',
+                       'connected to shared memory' if connected
+                       else 'not connected - start AC and enter a session'))
+
+        track_length = getattr(monitor, 'track_length_m', None) if monitor else None
+        if track_length:
+            checks.append(('ok', 'Track length detected',
+                           f'{track_length:.0f}m - distances reported in metres'))
+        else:
+            checks.append(('warn', 'Track length detected',
+                           'unavailable - runs still record a percentage'))
+
+        # --- The in-game companion app: decides teleport vs pit reset ---------
+        spawn = self.sector_config.get('teleport_spawn', 'HOTLAP_START')
+        spawn_label = {'HOTLAP_START': 'before start/finish', 'START': 'starting grid',
+                       'PIT': 'pits'}.get(spawn, spawn)
+        if ac_app_alive():
+            checks.append(('ok', 'CSP app connected',
+                           f'failed runs teleport to {spawn_label}'))
+        else:
+            checks.append(('fail' if challenge_on else 'warn', 'CSP app connected',
+                           'NOT polling - failed runs will restart the AC session '
+                           'and drop the car in the pits'))
+
+        # --- Sector challenge configuration -----------------------------------
+        sectors = self.sector_config.get('sectors', [])
+        checks.append(('ok' if challenge_on else 'warn', 'Sector challenge enabled',
+                       f'{len(sectors)} sectors configured' if challenge_on
+                       else 'OFF - tick "Enable Sector Challenge" to run the event'))
+        if challenge_on and sectors:
+            bounds = ', '.join(f"{s['start_pct']:g}%" for s in sectors)
+            checks.append(('ok', 'Sector boundaries', f'{bounds} -> finish'))
+        ignore_out_lap = self.sector_config.get('ignore_out_lap', True)
+        checks.append(('ok' if ignore_out_lap else 'warn', 'Ignore out lap',
+                       'on - timing starts at the line' if ignore_out_lap
+                       else 'OFF - the drive out of the pits will be scored'))
+
+        # --- Driver sign-in ----------------------------------------------------
+        lead_gen = is_lead_gen_enabled()
+        if lead_gen:
+            wanted = [n for n, on in (('email', is_email_collection_enabled()),
+                                      ('phone', is_phone_collection_enabled())) if on]
+            detail = f"on - asking for name + {' + '.join(wanted)}" if wanted else 'on - name only'
+        else:
+            detail = 'off - name only'
+        checks.append(('ok', 'Driver registration', detail))
+        checks.append(('ok', 'Registration page', f'http://{self.local_ip}:{self.web_port}/'))
+
+        # --- The leaderboard itself -------------------------------------------
+        server_url = (self.current_server_url or '').rstrip('/')
+        if not server_url:
+            checks.append(('fail', 'Leaderboard reachable', 'no server URL configured'))
+        else:
+            try:
+                response = requests.get(f'{server_url}/api/leaderboard', timeout=3)
+                data = response.json()
+                checks.append(('ok', 'Leaderboard reachable', server_url))
+                mode = str(data.get('ranking_mode', '')) or 'lap_time'
+                if challenge_on and mode != 'distance':
+                    checks.append(('fail', 'Leaderboard ranking mode',
+                                   'set to Fastest Lap - partial runs will rank by time, '
+                                   'not distance. Switch it to Distance Challenge'))
+                else:
+                    checks.append(('ok', 'Leaderboard ranking mode',
+                                   'Distance Challenge' if mode == 'distance' else 'Fastest Lap'))
+            except Exception as e:
+                checks.append(('fail', 'Leaderboard reachable',
+                               f'{server_url} did not answer ({type(e).__name__}) - '
+                               'is the Receiver running with its server started?'))
+                checks.append(('warn', 'Leaderboard ranking mode', 'cannot check while offline'))
+
+        return checks
+
+    def on_run_preflight(self):
+        """Open the pre-event check dialog."""
+        PreflightDialog(self, self).exec()
 
     def _update_csp_status(self):
         """Show whether the in-game CSP app is polling, so it is obvious which
