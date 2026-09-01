@@ -5989,6 +5989,20 @@ class AssettoCorsaMonitor(GameMonitor):
         self._chal_reset_requested = False
         self._chal_await_reset = False
 
+    def get_challenge_status(self):
+        """Short live description of what the challenge is doing, so it is
+        obvious whether it is armed, running, or not watching at all."""
+        if not self._challenge_enabled():
+            return 'off'
+        total = len(self.challenge_config['sectors'])
+        state = getattr(self, '_chal_state', 'idle')
+        if state == 'running':
+            return (f"running - sector {self._chal_sector + 1}/{total}, "
+                    f"{self._chal_sector_elapsed_ms / 1000.0:.1f}s")
+        if state == 'failed':
+            return 'run ended - waiting to cross the line'
+        return 'armed - waiting to cross start/finish'
+
     def request_challenge_reset(self):
         """Thread-safe request (e.g. after a CSP teleport) to re-arm the
         challenge state machine; consumed by the monitor's poll loop."""
@@ -10482,16 +10496,38 @@ class LapTimeSenderWindow(QMainWindow):
         PreflightDialog(self, self).exec()
 
     def _update_csp_status(self):
-        """Show whether the in-game CSP app is polling, so it is obvious which
-        reset will actually be used."""
+        """Show whether the in-game CSP app is polling, and what the challenge
+        itself is doing right now - 'connected' alone doesn't mean sectors are
+        being judged."""
         if not hasattr(self, 'csp_status_label'):
             return
+
         if ac_app_alive():
-            self.csp_status_label.setText("CSP app: connected")
-            self.csp_status_label.setStyleSheet("font-size: 11px; color: #6ec06e;")
+            csp_text, csp_colour = "CSP app: connected", "#6ec06e"
         else:
-            self.csp_status_label.setText("CSP app: not found (resets to pits)")
-            self.csp_status_label.setStyleSheet("font-size: 11px; color: #d9a441;")
+            csp_text, csp_colour = "CSP app: not found (resets to pits)", "#d9a441"
+
+        monitor = self.current_monitor
+        if monitor is None or not hasattr(monitor, 'get_challenge_status'):
+            chal_text, chal_colour = "Challenge: no sim connected", "#d9a441"
+        else:
+            try:
+                status = monitor.get_challenge_status()
+            except Exception:
+                status = 'unknown'
+            chal_text = f"Challenge: {status}"
+            if status == 'off':
+                chal_text = "Challenge: OFF - tick Enable Sector Challenge"
+                chal_colour = "#d9a441"
+            elif status.startswith('running'):
+                chal_colour = "#6ec06e"
+            else:
+                chal_colour = "#9d9d9d"
+
+        self.csp_status_label.setText(f"{csp_text}   |   {chal_text}")
+        # Colour by the more urgent of the two
+        self.csp_status_label.setStyleSheet(
+            f"font-size: 11px; color: {'#d9a441' if '#d9a441' in (csp_colour, chal_colour) else chal_colour};")
 
     def on_teleport_spawn_changed(self, _index=None):
         """Persist where a failed driver is put back."""
