@@ -44,7 +44,41 @@ end
 -- recovers it to the pits. physics.setCarPosition() is documented to align
 -- the car on the track surface, so replaying a real on-track position is far
 -- safer and puts the next driver exactly where we want them.
-local gridPos, gridDir = nil, nil
+--
+-- gridFwd is the car's FORWARD vector. setCarPosition expects the opposite of
+-- it (CSP's own debug app passes -cameraLook), so it is negated at the call.
+local gridPos, gridFwd = nil, nil
+local savedThisSession = false
+
+-- Learned point is remembered per track (and layout) so a rig only has to be
+-- shown the line once, not at the start of every event day.
+local trackKey = 'startPoint'
+pcall(function() trackKey = 'startPoint::' .. tostring(ac.getTrackFullID('-')) end)
+local storedPoint = ac.storage(trackKey, '')
+
+local function saveStartPoint()
+  if not (gridPos and gridFwd) then return end
+  pcall(function()
+    storedPoint:set(string.format('%.4f,%.4f,%.4f,%.4f,%.4f,%.4f',
+      gridPos.x, gridPos.y, gridPos.z, gridFwd.x, gridFwd.y, gridFwd.z))
+  end)
+end
+
+local function loadStartPoint()
+  pcall(function()
+    local raw = storedPoint:get()
+    if type(raw) ~= 'string' or raw == '' then return end
+    local n = {}
+    for value in raw:gmatch('[-+%deE%.]+') do n[#n + 1] = tonumber(value) end
+    if #n == 6 and n[1] and n[6] then
+      gridPos = vec3(n[1], n[2], n[3])
+      gridFwd = vec3(n[4], n[5], n[6])
+      savedThisSession = true   -- already on disk, no need to rewrite it
+    end
+  end)
+end
+
+loadStartPoint()
 
 local function rememberStartPoint()
   local car = ac.getCar(0)
@@ -53,7 +87,12 @@ local function rememberStartPoint()
   -- just before the line, and actually moving along the track
   if sp and sp > 0.985 and sp < 0.999 and car.speedKmh and car.speedKmh > 5 then
     gridPos = vec3(car.position.x, car.position.y, car.position.z)
-    gridDir = vec3(car.look.x, car.look.y, car.look.z)
+    gridFwd = vec3(car.look.x, car.look.y, car.look.z)
+    if not savedThisSession then
+      saveStartPoint()
+      savedThisSession = true
+      ac.log('LeaderboardSector: start point learned and saved for this track')
+    end
   end
 end
 
@@ -66,9 +105,11 @@ local function runCommand(body)
 
   local usedRecalled = false
   local ok, err = pcall(function()
-    if gridPos and gridDir and arg ~= 'PIT' then
-      -- Surface-aligned, and a position we know is on the racing line
-      physics.setCarPosition(0, gridPos, gridDir)
+    if gridPos and gridFwd and arg ~= 'PIT' then
+      -- Surface-aligned, and a position we know is on the racing line.
+      -- setCarPosition wants the opposite of the forward vector, otherwise
+      -- the car is placed facing back down the track.
+      physics.setCarPosition(0, gridPos, -gridFwd)
       usedRecalled = true
     else
       physics.teleportCarTo(0, arg)
@@ -131,10 +172,15 @@ function script.windowMain(dt)
   ui.popFont()
   ui.textColored(statusText, statusOk and rgbm(0.4, 1, 0.4, 1) or rgbm(1, 0.8, 0.3, 1))
   if gridPos then
-    ui.textColored('Start point learned', rgbm(0.4, 1, 0.4, 1))
+    ui.textColored('Start point saved for this track', rgbm(0.4, 1, 0.4, 1))
   else
-    ui.textColored('Start point not learned yet - drive past the line once',
+    ui.textColored('Start point not set - drive past the line once (saves automatically)',
       rgbm(1, 0.8, 0.3, 1))
   end
   ui.text(lastTeleportText)
+  if ui.button('Re-learn start point') then
+    gridPos, gridFwd, savedThisSession = nil, nil, false
+    pcall(function() storedPoint:set('') end)
+    lastTeleportText = 'Start point cleared - drive past the line to set it again'
+  end
 end
