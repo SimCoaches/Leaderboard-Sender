@@ -7557,24 +7557,30 @@ class WaitingOverlay(QWidget):
         
         self.layout.addWidget(content_widget)
 
-    def show_session_complete(self):
-        """Show a prominent 'Session Complete' interstitial screen"""
+    def show_session_complete(self, headline=None, detail=None, accent=None):
+        """Show a prominent end-of-session interstitial.
+
+        Defaults to a neutral 'Session Complete'; the sector challenge passes
+        its own wording so a driver is told they ran out of time in a sector
+        rather than being dropped to the waiting screen with no explanation.
+        """
         # Stop and clear any media, then show completion message
         self.clear_media()
-        
+
         content_widget = QWidget()
         content_layout = QVBoxLayout(content_widget)
         content_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        
-        title = QLabel("✅ Session Complete")
+
+        title = QLabel(headline or "✅ Session Complete")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         title_font = QFont("Segoe UI", 52, QFont.Weight.Bold)
         title.setFont(title_font)
-        title.setStyleSheet("color: #4ec9b0; margin-bottom: 20px;")
+        title.setStyleSheet(f"color: {accent or '#4ec9b0'}; margin-bottom: 20px;")
         content_layout.addWidget(title)
-        
-        subtitle = QLabel("Please change driver. Returning to waiting screen...")
+
+        subtitle = QLabel(detail or "Please change driver. Returning to waiting screen...")
         subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        subtitle.setWordWrap(True)
         subtitle_font = QFont("Segoe UI", 22)
         subtitle.setFont(subtitle_font)
         subtitle.setStyleSheet("color: #cccccc; margin-bottom: 16px;")
@@ -10187,8 +10193,13 @@ class LapTimeSenderWindow(QMainWindow):
         if hasattr(self, 'toggle_waiting_screen_btn'):
             self.toggle_waiting_screen_btn.setText("Show Waiting Screen")
         
-    def end_session(self):
-        """End the current session and return to waiting screen"""
+    def end_session(self, headline=None, detail=None, accent=None, hold_ms=4000):
+        """End the current session and return to waiting screen.
+
+        The interstitial wording and how long it stays up are configurable so
+        a driver who ran out of time in a sector is told why, and has long
+        enough to read it and climb out of the rig.
+        """
         print("[END SESSION] end_session() called - showing session complete screen")
 
         # 4th screen: waiting scene, or save + loop the run's replay.
@@ -10210,7 +10221,7 @@ class LapTimeSenderWindow(QMainWindow):
         
         # Show a brief "session complete" interstitial, then return to waiting
         try:
-            self.waiting_overlay.show_session_complete()
+            self.waiting_overlay.show_session_complete(headline, detail, accent)
             self.waiting_overlay.show()
             print("[OK] Session complete screen should now be visible")
         except Exception as e:
@@ -10231,7 +10242,7 @@ class LapTimeSenderWindow(QMainWindow):
                 self.waiting_overlay.show_default_content()
             self.waiting_overlay.show()
         
-        QTimer.singleShot(4000, to_waiting)
+        QTimer.singleShot(max(1000, int(hold_ms)), to_waiting)
         # Update button text
         if hasattr(self, 'toggle_waiting_screen_btn'):
             self.toggle_waiting_screen_btn.setText("Hide Waiting Screen")
@@ -10611,7 +10622,22 @@ class LapTimeSenderWindow(QMainWindow):
         else:
             # No CSP app polling: restart AC via hotkey (needs keyboard focus)
             QTimer.singleShot(600, self.restart_ac_session)
-        QTimer.singleShot(1500, self.end_session)
+
+        # Tell the driver why their run ended, and leave it up long enough to
+        # read it and get out of the rig before the waiting screen returns.
+        track_length = getattr(self.current_monitor, 'track_length_m', None)
+        if track_length:
+            distance_text = (f"You reached {distance_pct:.1f}% of the lap "
+                             f"({distance_pct / 100.0 * track_length:,.0f}m)")
+        else:
+            distance_text = f"You reached {distance_pct:.1f}% of the lap"
+        QTimer.singleShot(1500, lambda: self.end_session(
+            headline="⏱ Out of Time",
+            detail=(f"Sector {sector_index + 1} wasn't completed in time.\n"
+                    f"{distance_text} in {format_time_ms(int(elapsed_s * 1000))}.\n\n"
+                    "Great run - please hop out for the next driver."),
+            accent="#f48771",
+            hold_ms=7000))
 
     def _verify_ac_teleport(self, cmd_id):
         """Confirm the CSP app executed the teleport; fall back to Ctrl+O if not."""
