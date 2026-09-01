@@ -6151,8 +6151,14 @@ class AssettoCorsaMonitor(GameMonitor):
         if self._chal_state == 'failed':
             # Hold until the session restarts or the car is back at the line.
             # A line crossing also resets the lap timer, so check it first.
+            # This is the path every failed driver takes (fail -> teleport ->
+            # cross the line), so it needs the same stale-timer guard as the
+            # other two: without it the new run is judged against the previous
+            # run's clock and dies instantly at 0%.
             if line_crossed:
-                self._chal_begin_run(0)
+                already_reset = timer_valid and lap_ms < 3000
+                self._chal_begin_run(lap_ms if already_reset else 0,
+                                     await_timer_reset=not already_reset)
             elif timer_reset or teleported:
                 self._chal_state = 'idle'
             return False
