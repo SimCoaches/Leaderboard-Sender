@@ -83,11 +83,23 @@ if (-not $acRoot) {
 }
 Write-Host "Found Assetto Corsa at: $acRoot"
 
-# --- Check CSP ----------------------------------------------------------------
+# --- Check CSP, and install it if missing ------------------------------------
+# Without CSP the companion app never loads, so a failed driver gets AC's
+# session restart (which spawns in the pits) instead of a teleport to the line.
 if (-not (Test-Path (Join-Path $acRoot 'extension'))) {
-    Warn "Custom Shaders Patch does not appear to be installed (no 'extension' folder)."
-    Warn "Install CSP via Content Manager - the companion app and broadcast camera need it."
-    # Continue anyway: the files are harmless and start working once CSP arrives.
+    Write-Host "== Custom Shaders Patch is not installed - installing it"
+    $cspScript = Join-Path $PSScriptRoot 'install_csp.ps1'
+    if (Test-Path $cspScript) {
+        & powershell -NoProfile -ExecutionPolicy Bypass -File $cspScript -NonInteractive
+        if (Test-Path (Join-Path $acRoot 'extension')) {
+            Write-Host "Custom Shaders Patch installed."
+        } else {
+            Warn "Automatic CSP install did not complete - install it via Content Manager."
+        }
+    } else {
+        Warn "install_csp.ps1 not found - install CSP via Content Manager."
+    }
+    # Either way the app files below are harmless and start working once CSP is there.
 }
 
 # --- Copy the companion app ---------------------------------------------------

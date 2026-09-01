@@ -10356,7 +10356,8 @@ class LapTimeSenderWindow(QMainWindow):
             checks.append(('ok', 'Assetto Corsa installed', str(ac_folder)))
             csp = (ac_folder / 'extension').exists()
             checks.append(('ok' if csp else 'fail', 'Custom Shaders Patch',
-                           'installed' if csp else 'NOT installed - install CSP via Content Manager'))
+                           'installed' if csp
+                           else 'NOT installed - run ac_app\\install_csp.ps1 (or install it via Content Manager)'))
             app_lua = ac_folder / 'apps' / 'lua' / 'LeaderboardSector' / 'LeaderboardSector.lua'
             checks.append(('ok' if app_lua.exists() else 'fail', 'LeaderboardSector app files',
                            'installed in AC' if app_lua.exists()

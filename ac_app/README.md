@@ -11,8 +11,19 @@ keyboard focus and AC's hotkey binding to be unchanged.
 
 ## Requirements
 
-- Assetto Corsa with **Custom Shaders Patch (CSP)** installed
-  (any reasonably recent build; installing via Content Manager is easiest)
+- Assetto Corsa with **Custom Shaders Patch (CSP)** installed.
+  `install_ac_app.ps1` installs CSP automatically if it is missing, so
+  normally there is nothing to do. To install or update it on its own:
+
+  ```bash
+  powershell -ExecutionPolicy Bypass -File install_csp.ps1
+  ```
+
+  It downloads the official public build from acstuff.club (the same source
+  Content Manager uses) and extracts `dwrite.dll` plus the `extension` folder
+  into the Assetto Corsa root. An existing CSP install is left alone unless
+  `-Force` is passed, which backs the old one up first. Close AC before
+  running it.
 - The Lap Time Sender running on the **same PC** as Assetto Corsa
   (the app finds it on `http://127.0.0.1:5001`, automatically probing the
   Sender's fallback ports 5101-5105 if 5001 is taken by another program)
