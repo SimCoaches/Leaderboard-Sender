@@ -7497,24 +7497,98 @@ class BroadcastDirector(threading.Thread):
 
 
 class ScreenBlanker(QWidget):
-    """Plain dark cover for one extra monitor.
+    """Cover for one extra monitor, showing the same waiting media as the
+    main overlay.
 
     On a triple-screen rig the waiting overlay only covers the primary
     monitor, leaving the game visible on the sides. One of these sits on
     each additional screen the operator chooses, shown and hidden in step
-    with the main overlay. Never takes focus, for the same D3D reason as
-    the overlay itself.
+    with the main overlay. It shows the same image (scaled to fill its own
+    screen) or the same looping video (muted - the audio comes from the
+    main screen), and plain dark during the session-over screens. Never
+    takes focus, for the same D3D reason as the overlay itself.
     """
+
+    VIDEO_EXTENSIONS = ('.mp4', '.mov', '.mkv', '.avi')
 
     def __init__(self, screen):
         super().__init__()
         self.screen_name = screen.name()
+        self.media_path = None
+        self.media_player = None
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint |
                             Qt.WindowType.WindowStaysOnTopHint |
                             Qt.WindowType.Tool)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
         self.setStyleSheet("QWidget { background-color: #1e1e1e; }")
         self.setGeometry(screen.geometry())
+        self._layout = QVBoxLayout(self)
+        self._layout.setContentsMargins(0, 0, 0, 0)
+
+    def set_media(self, file_path):
+        """Show the given image/video on this screen, or plain dark for None."""
+        if file_path == self.media_path:
+            return
+        self.clear_media()
+        self.media_path = file_path
+        if not file_path:
+            return
+        if file_path.lower().endswith(self.VIDEO_EXTENSIONS):
+            self._setup_video(file_path)
+        else:
+            self._setup_image(file_path)
+
+    def clear_media(self):
+        if self.media_player:
+            self.media_player.stop()
+            self.media_player = None
+        while self._layout.count():
+            child = self._layout.takeAt(0)
+            if child.widget():
+                child.widget().deleteLater()
+        self.media_path = None
+
+    def _setup_image(self, file_path):
+        pixmap = QPixmap(file_path)
+        if pixmap.isNull():
+            return
+        label = QLabel()
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        label.setScaledContents(True)
+        # Scaled for THIS screen's size, which may differ from the primary
+        label.setPixmap(pixmap.scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                                      Qt.TransformationMode.SmoothTransformation))
+        self._layout.addWidget(label)
+
+    def _setup_video(self, file_path):
+        self.media_player = QMediaPlayer(self)
+        video_widget = QVideoWidget()
+        audio_output = QAudioOutput(self)
+        audio_output.setVolume(0.0)      # main screen carries the sound
+        self.media_player.setAudioOutput(audio_output)
+        self.media_player.setVideoOutput(video_widget)
+        self._layout.addWidget(video_widget)
+
+        def on_status_changed(status):
+            from PyQt6.QtMultimedia import QMediaPlayer as _QMP
+            if status == _QMP.MediaStatus.EndOfMedia and self.media_player:
+                self.media_player.setPosition(0)
+                self.media_player.play()
+
+        self.media_player.mediaStatusChanged.connect(on_status_changed)
+        self.media_player.setSource(QUrl.fromLocalFile(file_path))
+        if self.isVisible():
+            self.media_player.play()
+
+    def show(self):
+        super().show()
+        if self.media_player:
+            self.media_player.play()
+
+    def hide(self):
+        if self.media_player:
+            self.media_player.stop()
+        super().hide()
 
 
 class WaitingOverlay(QWidget):
@@ -7528,7 +7602,15 @@ class WaitingOverlay(QWidget):
         self.video_widget = None
         self.image_label = None
         self._blankers = {}   # screen name -> ScreenBlanker for extra monitors
+        self._blanker_media = None   # what the side screens show right now (None = dark)
         self.setup_ui()
+
+    def _sync_blanker_media(self, file_path):
+        """Side screens show the waiting media when the main screen does, and
+        go dark for the session-over / default screens."""
+        self._blanker_media = file_path
+        for blanker in self._blankers.values():
+            blanker.set_media(file_path)
 
     def set_covered_screens(self, screen_names):
         """Choose which additional monitors get blanked alongside the primary
@@ -7545,6 +7627,7 @@ class WaitingOverlay(QWidget):
             name = screen.name()
             if name in wanted and name not in self._blankers:
                 blanker = ScreenBlanker(screen)
+                blanker.set_media(self._blanker_media)
                 self._blankers[name] = blanker
                 if self.isVisible():
                     blanker.show()
@@ -7585,8 +7668,9 @@ class WaitingOverlay(QWidget):
         
     def show_default_content(self):
         """Show default waiting screen content when no custom media is set"""
-        # Clear existing content
+        # Clear existing content; side screens go dark
         self.clear_media()
+        self._sync_blanker_media(None)
         
         # Create centered content
         content_widget = QWidget()
@@ -7634,8 +7718,10 @@ class WaitingOverlay(QWidget):
         its own wording so a driver is told they ran out of time in a sector
         rather than being dropped to the waiting screen with no explanation.
         """
-        # Stop and clear any media, then show completion message
+        # Stop and clear any media, then show completion message. Side
+        # screens go dark so the message on the main screen is the focus.
         self.clear_media()
+        self._sync_blanker_media(None)
 
         content_widget = QWidget()
         content_layout = QVBoxLayout(content_widget)
@@ -7682,11 +7768,13 @@ class WaitingOverlay(QWidget):
         
         # Clear existing widgets
         self.clear_media()
-        
+
         if self.is_video:
             self.setup_video()
         else:
             self.setup_image()
+        # Every covered side screen shows the same media, sized for itself
+        self._sync_blanker_media(file_path)
             
     def clear_media(self):
         """Clear any existing media widgets"""

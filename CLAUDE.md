@@ -77,8 +77,11 @@ Runs are judged live in `AssettoCorsaMonitor` using `normalizedCarPosition` +
 
 The waiting / end-of-run overlay covers the primary monitor itself and a
 `ScreenBlanker` per extra monitor chosen under Advanced → "Cover Screens"
-(setting `waiting_screen_monitors`, default all). On a rig with a 4th
-broadcast monitor, leave that one unticked or the overlay hides OBS.
+(setting `waiting_screen_monitors`, default all). Each blanker shows the
+same waiting image/video as the main screen, scaled to its own screen
+(video muted; sound comes from the primary), and goes dark during the
+session-over screens. On a rig with a 4th broadcast monitor, leave that
+one unticked or the overlay hides OBS.
 
 Putting the car back uses the `LeaderboardSector` CSP companion app (`ac_app/`)
 when it is installed in AC: the app polls `GET /api/ac/command` on the local
