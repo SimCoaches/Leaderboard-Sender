@@ -8359,6 +8359,44 @@ class LapTimeSenderWindow(QMainWindow):
         sector_title.setStyleSheet("font-size: 12px; font-weight: bold; color: #e0e0e0;")
         sector_header_row.addWidget(sector_title)
         sector_header_row.addStretch()
+
+        # Where a failed driver is put back, and whether the in-game app that
+        # can do it is actually running. Without it the fallback restarts the
+        # AC session, which spawns wherever the session does - the pits in
+        # Practice - so this needs to be visible, not buried in a config file.
+        self.csp_status_label = QLabel("Reset: checking...")
+        self.csp_status_label.setStyleSheet("font-size: 11px; color: #9d9d9d;")
+        self.csp_status_label.setToolTip(
+            "Whether the LeaderboardSector CSP app is running in Assetto Corsa.\n"
+            "Connected: the car is teleported to the spawn chosen here.\n"
+            "Not found: AC's session is restarted instead (Ctrl+O), which puts\n"
+            "the car wherever that session type spawns - usually the pits."
+        )
+        sector_header_row.addWidget(self.csp_status_label)
+
+        self.teleport_spawn_combo = QComboBox()
+        self.teleport_spawn_combo.addItem("Reset to: Before start/finish", "HOTLAP_START")
+        self.teleport_spawn_combo.addItem("Reset to: Starting grid", "START")
+        self.teleport_spawn_combo.addItem("Reset to: Pits", "PIT")
+        self.teleport_spawn_combo.setStyleSheet("font-size: 11px; color: #e0e0e0;")
+        self.teleport_spawn_combo.setToolTip(
+            "Where a driver is put after missing a sector. 'Before start/finish'\n"
+            "starts the next driver immediately. Needs the CSP app - see the\n"
+            "status to the left."
+        )
+        spawn_index = self.teleport_spawn_combo.findData(
+            self.sector_config.get('teleport_spawn', 'HOTLAP_START'))
+        if spawn_index >= 0:
+            self.teleport_spawn_combo.setCurrentIndex(spawn_index)
+        self.teleport_spawn_combo.currentIndexChanged.connect(self.on_teleport_spawn_changed)
+        sector_header_row.addWidget(self.teleport_spawn_combo)
+
+        # Poll the companion app's heartbeat so the label reflects reality
+        self._csp_status_timer = QTimer(self)
+        self._csp_status_timer.timeout.connect(self._update_csp_status)
+        self._csp_status_timer.start(2000)
+        self._update_csp_status()
+
         self.ignore_out_lap_checkbox = QCheckBox("Ignore out lap")
         self.ignore_out_lap_checkbox.setStyleSheet("font-size: 11px; color: #e0e0e0;")
         self.ignore_out_lap_checkbox.setChecked(bool(self.sector_config.get('ignore_out_lap', True)))
@@ -10142,7 +10180,9 @@ class LapTimeSenderWindow(QMainWindow):
         config = normalize_sector_config({
             'enabled': self.sector_challenge_enabled.isChecked(),
             'sectors': sectors,
-            'teleport_spawn': self.sector_config.get('teleport_spawn', 'HOTLAP_START'),
+            'teleport_spawn': self.teleport_spawn_combo.currentData()
+                                if hasattr(self, 'teleport_spawn_combo')
+                                else self.sector_config.get('teleport_spawn', 'HOTLAP_START'),
             'ignore_out_lap': self.sector_config.get('ignore_out_lap', True),
         })
         if not config:
@@ -10171,6 +10211,27 @@ class LapTimeSenderWindow(QMainWindow):
 
     def on_sector_challenge_toggled(self, checked):
         self.sector_config['enabled'] = bool(checked)
+        save_sector_config(self.sector_config)
+        self._apply_sector_config_to_monitor()
+
+    def _update_csp_status(self):
+        """Show whether the in-game CSP app is polling, so it is obvious which
+        reset will actually be used."""
+        if not hasattr(self, 'csp_status_label'):
+            return
+        if ac_app_alive():
+            self.csp_status_label.setText("CSP app: connected")
+            self.csp_status_label.setStyleSheet("font-size: 11px; color: #6ec06e;")
+        else:
+            self.csp_status_label.setText("CSP app: not found (resets to pits)")
+            self.csp_status_label.setStyleSheet("font-size: 11px; color: #d9a441;")
+
+    def on_teleport_spawn_changed(self, _index=None):
+        """Persist where a failed driver is put back."""
+        spawn = self.teleport_spawn_combo.currentData()
+        if spawn not in ('HOTLAP_START', 'START', 'PIT'):
+            return
+        self.sector_config['teleport_spawn'] = spawn
         save_sector_config(self.sector_config)
         self._apply_sector_config_to_monitor()
 
@@ -10209,7 +10270,9 @@ class LapTimeSenderWindow(QMainWindow):
         config = normalize_sector_config({
             'enabled': self.sector_challenge_enabled.isChecked(),
             'sectors': sectors,
-            'teleport_spawn': self.sector_config.get('teleport_spawn', 'HOTLAP_START'),
+            'teleport_spawn': self.teleport_spawn_combo.currentData()
+                                if hasattr(self, 'teleport_spawn_combo')
+                                else self.sector_config.get('teleport_spawn', 'HOTLAP_START'),
             'ignore_out_lap': self.sector_config.get('ignore_out_lap', True),
         })
         if not config:
