@@ -10614,6 +10614,32 @@ class LapTimeSenderWindow(QMainWindow):
                                distance_pct=distance_pct, challenge_fail=True)
         self._log_sector_run(f"FAILED S{sector_index + 1}", distance_pct, elapsed_s)
 
+        # Order matters: cover the game with the "Out of Time" screen FIRST,
+        # then reset the car behind it. Teleporting while the driver is still
+        # looking at the track is disorienting, and they lose the moment where
+        # they find out what happened.
+        track_length = getattr(self.current_monitor, 'track_length_m', None)
+        if track_length:
+            distance_text = (f"You reached {distance_pct:.1f}% of the lap "
+                             f"({distance_pct / 100.0 * track_length:,.0f}m)")
+        else:
+            distance_text = f"You reached {distance_pct:.1f}% of the lap"
+
+        # Short delay so the red sector flash registers before the screen covers it
+        QTimer.singleShot(400, lambda: self.end_session(
+            headline="⏱ Out of Time",
+            detail=(f"Sector {sector_index + 1} wasn't completed in time.\n"
+                    f"{distance_text} in {format_time_ms(int(elapsed_s * 1000))}.\n\n"
+                    "Great run - please hop out for the next driver."),
+            accent="#f48771",
+            hold_ms=7000))
+
+        # Reset the car once the screen is up, so the move happens out of sight
+        QTimer.singleShot(1400, lambda: self._reset_car_after_fail())
+
+    def _reset_car_after_fail(self):
+        """Put the car back for the next driver. Called once the 'Out of Time'
+        screen is already covering the game, so nobody watches it happen."""
         if ac_app_alive():
             spawn = self.sector_config.get('teleport_spawn', 'HOTLAP_START')
             cmd_id = ac_app_issue_teleport(spawn)
@@ -10621,23 +10647,7 @@ class LapTimeSenderWindow(QMainWindow):
             QTimer.singleShot(2500, lambda: self._verify_ac_teleport(cmd_id))
         else:
             # No CSP app polling: restart AC via hotkey (needs keyboard focus)
-            QTimer.singleShot(600, self.restart_ac_session)
-
-        # Tell the driver why their run ended, and leave it up long enough to
-        # read it and get out of the rig before the waiting screen returns.
-        track_length = getattr(self.current_monitor, 'track_length_m', None)
-        if track_length:
-            distance_text = (f"You reached {distance_pct:.1f}% of the lap "
-                             f"({distance_pct / 100.0 * track_length:,.0f}m)")
-        else:
-            distance_text = f"You reached {distance_pct:.1f}% of the lap"
-        QTimer.singleShot(1500, lambda: self.end_session(
-            headline="⏱ Out of Time",
-            detail=(f"Sector {sector_index + 1} wasn't completed in time.\n"
-                    f"{distance_text} in {format_time_ms(int(elapsed_s * 1000))}.\n\n"
-                    "Great run - please hop out for the next driver."),
-            accent="#f48771",
-            hold_ms=7000))
+            self.restart_ac_session()
 
     def _verify_ac_teleport(self, cmd_id):
         """Confirm the CSP app executed the teleport; fall back to Ctrl+O if not."""
