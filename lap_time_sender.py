@@ -8606,7 +8606,12 @@ class LapTimeSenderWindow(QMainWindow):
         preflight_btn = QPushButton("🚦 Preflight Check")
         preflight_btn.setToolTip("Verify this simulator end to end before the event starts")
         preflight_btn.clicked.connect(self.on_run_preflight)
-        for btn in (add_sector_btn, remove_sector_btn, save_sectors_btn, preflight_btn):
+        reset_car_btn = QPushButton("🔄 Reset Car to Line")
+        reset_car_btn.setToolTip("Put the car back at start/finish now and re-arm the challenge -\n"
+                                 "use if an automatic reset didn't happen")
+        reset_car_btn.clicked.connect(self.on_reset_car_now)
+        for btn in (add_sector_btn, remove_sector_btn, save_sectors_btn,
+                    preflight_btn, reset_car_btn):
             btn.setStyleSheet("""
                 QPushButton {
                     background-color: #3e3e42;
@@ -10494,6 +10499,29 @@ class LapTimeSenderWindow(QMainWindow):
     def on_run_preflight(self):
         """Open the pre-event check dialog."""
         PreflightDialog(self, self).exec()
+
+    def on_reset_car_now(self):
+        """Put the car back at the line by hand and re-arm the challenge.
+
+        For when an automatic reset didn't happen, or to set the car up for
+        the next driver without waiting for a run to end.
+        """
+        monitor = self.current_monitor
+        spawn = self.sector_config.get('teleport_spawn', 'HOTLAP_START')
+
+        if ac_app_alive():
+            cmd_id = ac_app_issue_teleport(spawn)
+            print(f"[Sectors] Manual reset: teleport command {cmd_id} sent (spawn {spawn})")
+            self.show_success("🔄 Sent the car back to the start/finish line")
+        else:
+            print("[Sectors] Manual reset: CSP app not connected, using Ctrl+O restart")
+            self.restart_ac_session()
+            self.show_success("🔄 Restarted the Assetto Corsa session "
+                              "(CSP app not connected, so the car returns to its session spawn)")
+
+        # Clear any half-finished run so the next driver starts fresh at the line
+        if monitor is not None and hasattr(monitor, 'request_challenge_reset'):
+            monitor.request_challenge_reset()
 
     def _update_csp_status(self):
         """Show whether the in-game CSP app is polling, and what the challenge
