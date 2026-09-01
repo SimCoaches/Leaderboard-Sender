@@ -56,12 +56,43 @@ function Write-TextFile([string]$path, [string]$content) {
 }
 
 function Find-Obs {
-    foreach ($candidate in @("$env:ProgramFiles\obs-studio", "${env:ProgramFiles(x86)}\obs-studio")) {
-        if (Test-Path "$candidate\bin\64bit\obs64.exe") { return $candidate }
+    <#
+      Finding OBS has to work from a 32-bit PowerShell, because the installer
+      is 32-bit and Windows hands its children the 32-bit shell. In there
+      $env:ProgramFiles is "C:\Program Files (x86)", so checking it alone
+      misses a normal 64-bit OBS and the setup reinstalls it every run.
+      ProgramW6432 is the real 64-bit Program Files from either bitness.
+    #>
+    $roots = @($env:ProgramW6432, $env:ProgramFiles, ${env:ProgramFiles(x86)}) |
+        Where-Object { $_ } | Select-Object -Unique
+    foreach ($root in $roots) {
+        if (Test-Path "$root\obs-studio\bin\64bit\obs64.exe") { return "$root\obs-studio" }
     }
-    $reg = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\OBS Studio' -ErrorAction SilentlyContinue
-    if ($reg -and $reg.InstallLocation -and (Test-Path "$($reg.InstallLocation)\bin\64bit\obs64.exe")) {
-        return $reg.InstallLocation
+
+    # Registry, in both views. OBS often leaves InstallLocation empty but
+    # DisplayIcon points straight at obs64.exe, so derive the root from it.
+    $keys = @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\OBS Studio',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\OBS Studio',
+        'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\OBS Studio'
+    )
+    foreach ($key in $keys) {
+        $reg = Get-ItemProperty $key -ErrorAction SilentlyContinue
+        if (-not $reg) { continue }
+        if ($reg.InstallLocation -and (Test-Path "$($reg.InstallLocation)\bin\64bit\obs64.exe")) {
+            return $reg.InstallLocation.TrimEnd('\')
+        }
+        $icon = ($reg.DisplayIcon -replace '^"|",?\d*$', '') -replace ',\d+$', ''
+        if ($icon -and (Test-Path $icon) -and $icon -match 'obs64\.exe$') {
+            # ...\obs-studio\bin\64bit\obs64.exe -> ...\obs-studio
+            return (Split-Path (Split-Path (Split-Path $icon -Parent) -Parent) -Parent)
+        }
+    }
+
+    # Last resort: a running instance tells us exactly where it lives
+    $proc = Get-Process obs64 -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($proc -and $proc.Path) {
+        return (Split-Path (Split-Path (Split-Path $proc.Path -Parent) -Parent) -Parent)
     }
     return $null
 }

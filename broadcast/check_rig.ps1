@@ -49,14 +49,29 @@ $cspIni = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'Assetto Corsa
 $flagOk = (Test-Path $cspIni) -and ((Get-Content $cspIni -Raw) -match '(?ms)^\[OBS\].*?^\s*DIRECT_PASS\s*=\s*1')
 $null = Check "CSP OBS integration enabled ([OBS] DIRECT_PASS=1)" $flagOk "Run install_ac_app.ps1, or enable OBS integration in CSP Small Tweaks."
 
-# OBS Studio
+# OBS Studio. Must work from a 32-bit shell too, where $env:ProgramFiles is
+# the x86 folder - ProgramW6432 is the real 64-bit one from either bitness.
 $obsRoot = $null
-foreach ($candidate in @("$env:ProgramFiles\obs-studio", "${env:ProgramFiles(x86)}\obs-studio")) {
-    if (Test-Path "$candidate\bin\64bit\obs64.exe") { $obsRoot = $candidate; break }
+$obsRoots = @($env:ProgramW6432, $env:ProgramFiles, ${env:ProgramFiles(x86)}) |
+    Where-Object { $_ } | Select-Object -Unique
+foreach ($candidate in $obsRoots) {
+    if (Test-Path "$candidate\obs-studio\bin\64bit\obs64.exe") { $obsRoot = "$candidate\obs-studio"; break }
 }
 if (-not $obsRoot) {
-    $reg = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\OBS Studio'
-    if ($reg -and $reg.InstallLocation -and (Test-Path "$($reg.InstallLocation)\bin\64bit\obs64.exe")) { $obsRoot = $reg.InstallLocation }
+    foreach ($key in @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\OBS Studio',
+                       'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\OBS Studio',
+                       'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\OBS Studio')) {
+        $reg = Get-ItemProperty $key -ErrorAction SilentlyContinue
+        if (-not $reg) { continue }
+        if ($reg.InstallLocation -and (Test-Path "$($reg.InstallLocation)\bin\64bit\obs64.exe")) {
+            $obsRoot = $reg.InstallLocation.TrimEnd('\'); break
+        }
+        # OBS often leaves InstallLocation blank but DisplayIcon is obs64.exe
+        $icon = ($reg.DisplayIcon -replace '^"|",?\d*$', '') -replace ',\d+$', ''
+        if ($icon -and (Test-Path $icon) -and $icon -match 'obs64\.exe$') {
+            $obsRoot = (Split-Path (Split-Path (Split-Path $icon -Parent) -Parent) -Parent); break
+        }
+    }
 }
 $null = Check "OBS Studio installed" $obsRoot "Run setup_broadcast.ps1 (or the Lap Time Sender installer's broadcast task)."
 
