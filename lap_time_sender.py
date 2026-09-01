@@ -6987,6 +6987,20 @@ class F1Monitor(GameMonitor):
 class State:
     ir_connected = False
 
+def get_bundled_app_lua():
+    """The LeaderboardSector script shipped alongside this Sender, or None.
+    Used to tell whether the copy inside Assetto Corsa is current."""
+    if getattr(sys, 'frozen', False):
+        base_path = Path(sys.executable).parent
+    else:
+        base_path = Path(__file__).parent
+    candidate = base_path / 'ac_app' / 'LeaderboardSector' / 'LeaderboardSector.lua'
+    try:
+        return candidate.read_text(encoding='utf-8', errors='ignore') if candidate.exists() else None
+    except Exception:
+        return None
+
+
 def find_assetto_corsa_folder():
     """Locate the Assetto Corsa install via Steam, or None."""
     try:
@@ -10358,10 +10372,29 @@ class LapTimeSenderWindow(QMainWindow):
             checks.append(('ok' if csp else 'fail', 'Custom Shaders Patch',
                            'installed' if csp
                            else 'NOT installed - run ac_app\\install_csp.ps1 (or install it via Content Manager)'))
-            app_lua = ac_folder / 'apps' / 'lua' / 'LeaderboardSector' / 'LeaderboardSector.lua'
-            checks.append(('ok' if app_lua.exists() else 'fail', 'LeaderboardSector app files',
-                           'installed in AC' if app_lua.exists()
-                           else f'MISSING - copy ac_app\\LeaderboardSector into {ac_folder}\\apps\\lua'))
+            app_dir = ac_folder / 'apps' / 'lua' / 'LeaderboardSector'
+            app_lua = app_dir / 'LeaderboardSector.lua'
+            if not app_lua.exists():
+                checks.append(('fail', 'LeaderboardSector app files',
+                               f'MISSING - run ac_app\\install_ac_app.ps1'))
+            else:
+                # An out-of-date copy is worse than a missing one: it looks
+                # installed but can be pointing at the wrong port, so the app
+                # never reaches this Sender.
+                shipped = get_bundled_app_lua()
+                try:
+                    installed_text = app_lua.read_text(encoding='utf-8', errors='ignore')
+                except Exception:
+                    installed_text = ''
+                if shipped and installed_text and shipped.strip() != installed_text.strip():
+                    checks.append(('fail', 'LeaderboardSector app files',
+                                   'OUT OF DATE in AC - re-run ac_app\\install_ac_app.ps1, '
+                                   'then restart Assetto Corsa'))
+                else:
+                    checks.append(('ok', 'LeaderboardSector app files', 'installed in AC and up to date'))
+                if (app_dir / 'LeaderboardSector').exists():
+                    checks.append(('warn', 'LeaderboardSector app folder',
+                                   'a nested copy exists - re-run install_ac_app.ps1 to clean it up'))
         else:
             checks.append(('warn', 'Assetto Corsa installed', 'not found via Steam - check manually'))
             checks.append(('warn', 'Custom Shaders Patch', 'cannot check without the AC folder'))

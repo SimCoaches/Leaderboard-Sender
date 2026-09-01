@@ -110,10 +110,21 @@ if (-not (Test-Path (Join-Path $src 'LeaderboardSector.lua'))) {
     Done 1
 }
 $destDir = Join-Path $acRoot 'apps\lua'
+$dest = Join-Path $destDir 'LeaderboardSector'
 try {
     New-Item -ItemType Directory -Force $destDir | Out-Null
-    Copy-Item $src (Join-Path $destDir 'LeaderboardSector') -Recurse -Force
-    Write-Host "Installed -> $destDir\LeaderboardSector"
+    # Replace, don't merge. Copy-Item -Recurse into an existing folder nests a
+    # copy inside it (LeaderboardSector\LeaderboardSector) and leaves the old
+    # script in place, so updates silently never apply.
+    if (Test-Path $dest) {
+        Remove-Item $dest -Recurse -Force -Confirm:$false
+        Write-Host "Removed previous install so the update actually replaces it"
+    }
+    Copy-Item $src $dest -Recurse -Force
+    # Guard against ever shipping a nested copy again
+    $nested = Join-Path $dest 'LeaderboardSector'
+    if (Test-Path $nested) { Remove-Item $nested -Recurse -Force -Confirm:$false }
+    Write-Host "Installed -> $dest"
 } catch {
     Warn "Could not copy into $destDir ($($_.Exception.Message))."
     Warn "Re-run this script as Administrator."
