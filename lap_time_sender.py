@@ -5991,17 +5991,23 @@ class AssettoCorsaMonitor(GameMonitor):
 
     def get_challenge_status(self):
         """Short live description of what the challenge is doing, so it is
-        obvious whether it is armed, running, or not watching at all."""
+        obvious whether it is armed, running, or not watching at all.
+
+        Includes the car's live track position: if that isn't moving, the
+        problem is the telemetry feed, not the sector logic.
+        """
         if not self._challenge_enabled():
             return 'off'
         total = len(self.challenge_config['sectors'])
         state = getattr(self, '_chal_state', 'idle')
+        pos = getattr(self, '_chal_prev_pos', None)
+        where = f" [car at {pos * 100:.1f}%]" if pos is not None else " [no position yet]"
         if state == 'running':
             return (f"running - sector {self._chal_sector + 1}/{total}, "
-                    f"{self._chal_sector_elapsed_ms / 1000.0:.1f}s")
+                    f"{self._chal_sector_elapsed_ms / 1000.0:.1f}s{where}")
         if state == 'failed':
-            return 'run ended - waiting to cross the line'
-        return 'armed - waiting to cross start/finish'
+            return f'run ended - waiting to cross the line{where}'
+        return f'armed - waiting to cross start/finish{where}'
 
     def request_challenge_reset(self):
         """Thread-safe request (e.g. after a CSP teleport) to re-arm the
@@ -6043,6 +6049,8 @@ class AssettoCorsaMonitor(GameMonitor):
         return None
 
     def _chal_begin_run(self, anchor_ms=0):
+        print(f"[Sectors] Run armed at the start/finish line "
+              f"({len(self.challenge_config['sectors'])} sectors)")
         self._chal_state = 'running'
         self._chal_sector = 0
         self._chal_sector_elapsed_ms = 0.0
@@ -6093,7 +6101,11 @@ class AssettoCorsaMonitor(GameMonitor):
         # iCurrentTime is INT32_MAX while AC has no live lap running
         timer_valid = 0 <= lap_ms < 86400000
         prev_timer_valid = prev_ms is not None and 0 <= prev_ms < 86400000
-        line_crossed = prev_pos > 0.9 and pos < 0.1
+        # A lap wraps when track position jumps backwards by most of a lap.
+        # Testing "prev > 0.9 and pos < 0.1" assumed the spline runs right up
+        # to 1.0 and that a sample lands in each window; a wrap of more than
+        # half the lap is true regardless of where the spline tops out.
+        line_crossed = (prev_pos - pos) > 0.5
         timer_reset = timer_valid and prev_timer_valid and lap_ms + 500 < prev_ms
         teleported = (prev_pos - pos) > 0.05 and not line_crossed
 
