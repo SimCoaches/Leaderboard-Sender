@@ -104,6 +104,47 @@ Every finished run - completed or failed - is appended to `sector_runs.csv`
 M:SS.mmm), each judged sector's time vs. target, and the driver's lead-gen
 questionnaire answers. Questionnaire registrations also land in `leads.csv`.
 
+### Host Stand (`/admin`) and multi-sim control
+
+The iPad page at `/admin` ("Host Stand") controls every simulator on the LAN
+from one page. Tapping a sim card never navigates the browser to that sim
+(it used to, which silently re-targeted every later action); it opens the
+Register form with that sim pre-selected. Register Driver and Manual Lap
+both carry a "Simulator" picker, and a banner at the top says which sim the
+page is served from. Actions on other sims go direct (cross-origin, CORS is
+on) and fall back to `POST /api/sim_proxy` on the host sim (allow-listed
+paths only) if Safari refuses or times out.
+
+Occupied cards have **+5 MIN** (or **+1 LAP** in Laps mode) backed by
+`POST /api/session/extend {minutes|laps}`, which adds to the running timer
+without touching the driver; while the pre-session video is still playing
+the extension is queued and applied when the timer starts. Re-submitting
+the driver already in the seat to `/set_driver` or
+`/api/session/start_remote` is a no-op (`already_active: true`) instead of
+a session restart.
+
+Discovery of other sims is `SimulatorDiscovery.discover()`: UDP presence
+broadcasts (port 5003, every 3 s) merged with the saved list in
+`simulators.json`, probing only those addresses. Nothing scans the subnet
+inside a web request. A full /24 sweep runs in a background thread on
+`POST /api/discover_simulators/scan` (the "Scan network" button in the
+Host Stand settings modal), or automatically, at most every 2 minutes, when
+this PC could not bind the UDP port (`udp_discovery_ok: false` in
+`/api/discover_simulators`). Sweep hits are added to `simulators.json`.
+Manually added sims live on the server, not in the browser.
+
+The Simulator ID combo is persisted in `settings.json` (`simulator_id`).
+Another PC announcing the same ID shows a red warning under the combo, in
+`id_conflicts` of `/api/simulator_info`, and in the Host Stand banner.
+
+Lap submission, session-start and session-end notifications to receivers
+run on daemon threads (`_send_lap_to_receivers` reports back through the
+`lap_send_finished` signal); nothing on the GUI thread waits on a receiver.
+Waitress runs 32 workers; the queue SSE stream is capped at
+`MAX_SSE_CLIENTS`. `main()` reconfigures stdout/stderr to UTF-8 because an
+emoji `print` inside a Qt slot under a cp1252 console raised and PyQt then
+aborted the process.
+
 ### Broadcast Screen (`broadcast/`)
 
 Optional 4th-monitor exterior camera view (chase cam or AC's trackside TV

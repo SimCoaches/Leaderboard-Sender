@@ -620,17 +620,21 @@ def append_lead_to_csv(driver_name, email, phone, answers_by_prompt):
         print(f"WARNING: Could not save lead to CSV: {e}")
         return False
 
-def add_known_simulator(ip, name=None):
+def add_known_simulator(ip, name=None, port=None):
     """Add a simulator to the known list."""
     simulators = load_known_simulators()
     # Check if already exists
     for sim in simulators:
         if sim.get('ip') == ip:
             return False  # Already exists
+    try:
+        port = int(port) if port else PREFERRED_WEB_INTERFACE_PORT
+    except (TypeError, ValueError):
+        port = PREFERRED_WEB_INTERFACE_PORT
     simulators.append({
         'ip': ip,
         'name': name or f'Sim ({ip})',
-        'port': 5001
+        'port': port
     })
     return save_known_simulators(simulators)
 
@@ -2168,6 +2172,91 @@ ADMIN_HTML_CONTENT = r"""
             color: #1e1e1e;
         }
         .sim-card-action.end-session:hover { background: #ff9785; }
+        .sim-card-action.extend {
+            background: #dcdcaa;
+            color: #1e1e1e;
+        }
+        .sim-card-action.extend:hover { background: #e8e8b8; }
+        .sim-card-action.register {
+            background: #007acc;
+            color: #ffffff;
+        }
+        .sim-card-action.register:hover { background: #0098ff; }
+        .sim-card-actions {
+            margin-top: auto;
+            display: flex;
+            gap: 6px;
+        }
+        .sim-card-actions .sim-card-action {
+            flex: 1;
+            margin-top: 0;
+            padding: 12px 6px;
+        }
+        .sim-card-dup {
+            font-size: 11px;
+            color: #f48771;
+            margin-bottom: 6px;
+        }
+
+        /* Which sim this page is served from */
+        .host-banner {
+            margin: 0 0 12px 0;
+            padding: 10px 14px;
+            border-radius: 10px;
+            background: #252526;
+            border: 1px solid #3e3e42;
+            color: #9d9d9d;
+            font-size: 13px;
+            line-height: 1.4;
+        }
+        .host-banner b { color: #ffffff; }
+        .host-banner.conflict {
+            border-color: #f48771;
+            color: #f48771;
+        }
+        .modal-body select {
+            width: 100%;
+            padding: 12px;
+            border: 1px solid #3e3e42;
+            border-radius: 8px;
+            background: #2d2d30;
+            color: #cccccc;
+            font-size: 16px;
+        }
+        .sim-hint {
+            display: block;
+            margin-top: 6px;
+            font-size: 12px;
+            color: #ce9178;
+            line-height: 1.4;
+        }
+        .scan-btn {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #3e3e42;
+            border-radius: 6px;
+            background: #2d2d30;
+            color: #cccccc;
+            font-size: 14px;
+            cursor: pointer;
+            margin-bottom: 12px;
+        }
+        .scan-btn:disabled { color: #6e6e6e; cursor: wait; }
+        .toast {
+            position: fixed;
+            left: 50%;
+            bottom: 96px;
+            transform: translateX(-50%);
+            background: #4ec9b0;
+            color: #1e1e1e;
+            padding: 10px 18px;
+            border-radius: 8px;
+            font-weight: 600;
+            font-size: 14px;
+            display: none;
+            z-index: 2000;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+        }
 
         /* Queue Section */
         .queue-section {
@@ -2452,6 +2541,9 @@ ADMIN_HTML_CONTENT = r"""
     </style>
 </head>
 <body>
+    <!-- Which sim this iPad is talking to -->
+    <div class="host-banner" id="hostBanner">Connecting to this simulator...</div>
+
     <!-- Stats Bar -->
     <div class="stats-bar">
         <div class="stat-item">
@@ -2491,6 +2583,8 @@ ADMIN_HTML_CONTENT = r"""
         <button class="settings-btn" onclick="openSettingsModal()">+</button>
     </div>
 
+    <div class="toast" id="toast"></div>
+
     <!-- Register Driver Modal -->
     <div class="modal-overlay" id="registerModal">
         <div class="modal">
@@ -2499,6 +2593,11 @@ ADMIN_HTML_CONTENT = r"""
                 <button class="modal-close" onclick="closeRegisterModal()">&times;</button>
             </div>
             <div class="modal-body">
+                <div class="input-group">
+                    <label for="targetSim">Simulator</label>
+                    <select id="targetSim"></select>
+                    <small class="sim-hint" id="targetSimHint"></small>
+                </div>
                 <div class="input-group">
                     <label for="driverName">Driver Name</label>
                     <input type="text" id="driverName" placeholder="Enter driver name">
@@ -2528,6 +2627,10 @@ ADMIN_HTML_CONTENT = r"""
             </div>
             <div class="modal-body">
                 <div class="input-group">
+                    <label for="manualTargetSim">Simulator</label>
+                    <select id="manualTargetSim"></select>
+                </div>
+                <div class="input-group">
                     <label for="manualDriverName">Driver Name</label>
                     <input type="text" id="manualDriverName" placeholder="Enter driver name">
                 </div>
@@ -2551,6 +2654,7 @@ ADMIN_HTML_CONTENT = r"""
             </div>
             <div class="modal-body">
                 <p style="color: #9d9d9d; font-size: 13px; margin-bottom: 12px;" id="discoveryStatus">Searching for simulators...</p>
+                <button class="scan-btn" id="scanBtn" onclick="scanNetwork()">🔍 Scan network for simulators</button>
                 <div class="sim-config-list" id="manualSimList">
                     <!-- Manual entries appear here -->
                 </div>
@@ -2594,6 +2698,146 @@ ADMIN_HTML_CONTENT = r"""
         let currentSimulatorIp = null;
         let queueData = { queue: [], active_sessions: {} };
         let editingSimulator = null;
+        let knownSimulators = [];      // saved on the server (simulators.json)
+        let hostSim = null;            // the sim this page is served from
+        let idConflicts = [];          // IPs sharing the host sim's Simulator ID
+        let scanInProgress = false;
+        let udpDiscoveryOk = null;     // false = this PC can't hear sim announcements
+        let scanPollTimer = null;
+        let lastTargetIp = null;       // sim the last registration went to
+
+        // ============================================
+        // TALK TO ANY SIM FROM THIS ONE PAGE
+        // ============================================
+
+        function fetchWithTimeout(url, options = {}, timeoutMs = 6000) {
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+            return fetch(url, { ...options, signal: controller.signal })
+                .finally(() => clearTimeout(timeoutId));
+        }
+
+        function isCurrentSim(sim) {
+            if (!sim) return false;
+            if (sim.is_current) return true;
+            return !!sim.ip && sim.ip === window.location.hostname;
+        }
+
+        function findSim(ip) {
+            return allSimulatorsForDisplay().find(s => s.ip === ip) || null;
+        }
+
+        function simName(sim) {
+            return sim ? (sim.simulator_name || sim.name || `Sim (${sim.ip})`) : 'Unknown sim';
+        }
+
+        // POST to a sim. Direct cross-origin call first; if Safari refuses it
+        // or it times out, relay through the host sim so it still lands on
+        // the sim that was picked.
+        async function postToSim(sim, path, payload, timeoutMs = 8000) {
+            const port = sim.port || 5001;
+            const headers = { 'Content-Type': 'application/json' };
+            const body = JSON.stringify(payload || {});
+            if (isCurrentSim(sim)) {
+                const r = await fetchWithTimeout(path, { method: 'POST', headers, body }, timeoutMs);
+                return r.json();
+            }
+            try {
+                const r = await fetchWithTimeout(`http://${sim.ip}:${port}${path}`,
+                    { method: 'POST', headers, body, mode: 'cors' }, timeoutMs);
+                return await r.json();
+            } catch (directErr) {
+                console.warn(`Direct call to ${sim.ip} failed (${directErr.message}); relaying via host sim`);
+                const r = await fetchWithTimeout('/api/sim_proxy', {
+                    method: 'POST', headers,
+                    body: JSON.stringify({ ip: sim.ip, port, path, payload: payload || {} })
+                }, timeoutMs + 2000);
+                return r.json();
+            }
+        }
+
+        function showToast(message, ms = 2500) {
+            const el = document.getElementById('toast');
+            if (!el) return;
+            el.textContent = message;
+            el.style.display = 'block';
+            clearTimeout(el._hideTimer);
+            el._hideTimer = setTimeout(() => { el.style.display = 'none'; }, ms);
+        }
+
+        function allSimulatorsForDisplay() {
+            const all = [...discoveredSimulators];
+            getManualSimulators().forEach(manual => {
+                if (!all.some(s => s.ip === manual.ip)) {
+                    all.push({
+                        simulator_id: manual.simulator_id || 99,
+                        simulator_name: manual.name || `Sim (${manual.ip})`,
+                        ip: manual.ip,
+                        port: manual.port || 5001,
+                        current_driver: null,
+                        is_manual: true
+                    });
+                }
+            });
+            all.sort((a, b) => (a.simulator_id || 0) - (b.simulator_id || 0) || String(a.ip).localeCompare(String(b.ip)));
+            return all;
+        }
+
+        function renderHostBanner() {
+            const banner = document.getElementById('hostBanner');
+            if (!banner) return;
+            const host = hostSim || discoveredSimulators.find(isCurrentSim);
+            if (!host) {
+                banner.textContent = 'Connecting to this simulator...';
+                banner.className = 'host-banner';
+                return;
+            }
+            if (idConflicts.length) {
+                banner.className = 'host-banner conflict';
+                banner.innerHTML = `⚠️ <b>Simulator ID clash:</b> this PC (${host.ip}) and ${idConflicts.map(escapeHtml).join(', ')} `
+                    + `are all set to ID ${escapeHtml(String(host.simulator_id))}. Change the Simulator ID on one of them in the desktop app so the cards can be told apart.`;
+                return;
+            }
+            banner.className = 'host-banner';
+            banner.innerHTML = `This iPad is connected to <b>${escapeHtml(simName(host))}</b> (${escapeHtml(host.ip)}). `
+                + `Every action asks which sim it is for, so you never leave this page.`;
+        }
+
+        function populateSimSelect(selectId, hintId, preferredIp) {
+            const select = document.getElementById(selectId);
+            const hint = hintId ? document.getElementById(hintId) : null;
+            if (!select) return;
+            const sims = allSimulatorsForDisplay();
+            select.innerHTML = '';
+            sims.forEach(sim => {
+                const opt = document.createElement('option');
+                opt.value = sim.ip;
+                const online = sim.reachable !== false;
+                const driver = sim.current_driver && sim.current_driver.trim();
+                opt.textContent = `${simName(sim)} — ${driver ? driver + ' driving' : 'available'}${online ? '' : ' (offline)'}`;
+                opt.disabled = !online;
+                select.appendChild(opt);
+            });
+            const wanted = preferredIp || lastTargetIp || (hostSim && hostSim.ip);
+            if (wanted && sims.some(s => s.ip === wanted && s.reachable !== false)) {
+                select.value = wanted;
+            } else {
+                const first = sims.find(s => s.reachable !== false);
+                if (first) select.value = first.ip;
+            }
+            const updateHint = () => {
+                if (!hint) return;
+                const sim = findSim(select.value);
+                if (sim && sim.current_driver && sim.current_driver.trim()) {
+                    hint.textContent = `⚠️ ${sim.current_driver} is driving on ${simName(sim)}. Registering a new name ends their session. `
+                        + `To give them more time, use ${sim.laps_active ? '+1 LAP' : '+5 MIN'} on their card instead.`;
+                } else {
+                    hint.textContent = '';
+                }
+            };
+            select.onchange = updateHint;
+            updateHint();
+        }
 
         // ============================================
         // SIMULATOR CARDS
@@ -2601,10 +2845,15 @@ ADMIN_HTML_CONTENT = r"""
 
         async function discoverSimulators() {
             try {
-                const response = await fetch('/api/discover_simulators');
+                const response = await fetchWithTimeout('/api/discover_simulators', {}, 8000);
                 const data = await response.json();
                 discoveredSimulators = data.simulators || [];
                 currentSimulatorIp = data.current_ip;
+                scanInProgress = !!data.scan_in_progress;
+                udpDiscoveryOk = data.udp_discovery_ok;
+                idConflicts = data.id_conflicts || [];
+                hostSim = discoveredSimulators.find(isCurrentSim) || hostSim;
+                renderHostBanner();
                 return discoveredSimulators;
             } catch (e) {
                 console.error('Error discovering simulators:', e);
@@ -2614,7 +2863,7 @@ ADMIN_HTML_CONTENT = r"""
 
         async function refreshSimulatorInfo(ip, port = 5001) {
             const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller.abort(), 1500);
+            const timeoutId = setTimeout(() => controller.abort(), 2500);
             try {
                 const response = await fetch(`http://${ip}:${port}/api/simulator_info`, {
                     mode: 'cors', signal: controller.signal
@@ -2632,15 +2881,21 @@ ADMIN_HTML_CONTENT = r"""
         }
 
         async function refreshSimulators() {
-            if (discoveredSimulators.length === 0) return;
+            if (discoveredSimulators.length === 0) {
+                await initializeSimulators();
+                return;
+            }
 
             const refreshPromises = discoveredSimulators.map(async (sim) => {
-                if (sim.is_current) {
+                if (isCurrentSim(sim)) {
                     try {
-                        const response = await fetch('/api/simulator_info');
+                        const response = await fetchWithTimeout('/api/simulator_info', {}, 4000);
                         if (response.ok) {
                             const data = await response.json();
-                            return { ...sim, ...data, is_current: true, reachable: true };
+                            const merged = { ...sim, ...data, is_current: true, reachable: true };
+                            hostSim = merged;
+                            idConflicts = data.id_conflicts || [];
+                            return merged;
                         }
                     } catch (e) {}
                     return sim;
@@ -2654,6 +2909,7 @@ ADMIN_HTML_CONTENT = r"""
             });
 
             discoveredSimulators = await Promise.all(refreshPromises);
+            renderHostBanner();
             renderSimulatorCards();
             updateStats();
         }
@@ -2662,32 +2918,21 @@ ADMIN_HTML_CONTENT = r"""
             const grid = document.getElementById('simsGrid');
             if (!grid) return;
 
-            const manualSims = getManualSimulators();
-            const allSimulators = [...discoveredSimulators];
-
-            manualSims.forEach(manual => {
-                if (!allSimulators.some(s => s.ip === manual.ip)) {
-                    allSimulators.push({
-                        simulator_id: manual.simulator_id || 99,
-                        simulator_name: manual.name || `Sim (${manual.ip})`,
-                        ip: manual.ip,
-                        port: manual.port || 5001,
-                        current_driver: null,
-                        is_manual: true
-                    });
-                }
-            });
-
-            allSimulators.sort((a, b) => (a.simulator_id || 0) - (b.simulator_id || 0));
+            const allSimulators = allSimulatorsForDisplay();
 
             if (allSimulators.length === 0) {
                 grid.innerHTML = '<div style="color: #6e6e6e; text-align: center; padding: 20px;">No simulators found</div>';
                 return;
             }
 
+            // Two cards with the same Simulator ID can't be told apart; flag them
+            const idCounts = {};
+            allSimulators.forEach(s => { idCounts[s.simulator_id] = (idCounts[s.simulator_id] || 0) + 1; });
+
             grid.innerHTML = allSimulators.map(sim => {
-                const hasDriver = sim.current_driver && sim.current_driver.trim();
+                const hasDriver = !!(sim.current_driver && sim.current_driver.trim());
                 const isReachable = sim.reachable !== false;
+                const duplicateId = idCounts[sim.simulator_id] > 1;
 
                 // Determine card state
                 let cardClass = 'available';
@@ -2722,62 +2967,75 @@ ADMIN_HTML_CONTENT = r"""
 
                 // Check if queue has someone waiting
                 const hasQueueWaiting = queueData.queue && queueData.queue.length > 0 && !queueData.queue[0].assigned_to;
+                const extendLabel = sim.laps_active ? '+1 LAP' : '+5 MIN';
+
+                let actions;
+                if (!isReachable) {
+                    actions = '<button class="sim-card-action" disabled style="background:#3e3e42;color:#6e6e6e;">OFFLINE</button>';
+                } else if (hasDriver) {
+                    actions = `<button class="sim-card-action extend" onclick="event.stopPropagation(); extendSessionOnSim('${sim.ip}')">${extendLabel}</button>`
+                            + `<button class="sim-card-action end-session" onclick="event.stopPropagation(); endSessionOnSim('${sim.ip}')">END</button>`;
+                } else {
+                    actions = `<button class="sim-card-action seat-next" onclick="event.stopPropagation(); seatNextGuest('${sim.ip}')" ${hasQueueWaiting ? '' : 'disabled'}>SEAT NEXT</button>`
+                            + `<button class="sim-card-action register" onclick="event.stopPropagation(); openRegisterModal('${sim.ip}')">REGISTER</button>`;
+                }
 
                 return `
-                    <div class="sim-card ${cardClass}" onclick="onSimCardClick('${sim.ip}', ${sim.port || 5001}, ${hasDriver}, ${isReachable})">
+                    <div class="sim-card ${cardClass}" onclick="onSimCardClick('${sim.ip}')">
                         <div class="sim-card-header">
-                            <span class="sim-card-name">${escapeHtml(sim.simulator_name)}</span>
+                            <span class="sim-card-name">${escapeHtml(simName(sim))}${isCurrentSim(sim) ? ' <span style="color:#6e6e6e;font-weight:400;font-size:11px;">(this iPad)</span>' : ''}</span>
                             <span class="sim-card-status ${isReachable ? '' : 'offline'}"></span>
                         </div>
+                        ${duplicateId ? `<div class="sim-card-dup">⚠️ Duplicate ID — ${escapeHtml(sim.ip)}</div>` : ''}
                         <div class="sim-card-driver ${hasDriver ? '' : 'available-text'}">
                             ${hasDriver ? escapeHtml(sim.current_driver) : 'AVAILABLE'}
                         </div>
                         ${timerDisplay ? `<div class="sim-card-timer">${timerDisplay}</div>` : ''}
                         ${lapsDisplay ? `<div class="sim-card-laps">${lapsDisplay}</div>` : ''}
-                        ${isReachable ? (
-                            hasDriver
-                                ? `<button class="sim-card-action end-session" onclick="event.stopPropagation(); endSessionOnSim('${sim.ip}')">END</button>`
-                                : `<button class="sim-card-action seat-next" onclick="event.stopPropagation(); seatNextGuest('${sim.ip}')" ${hasQueueWaiting ? '' : 'disabled'}>SEAT NEXT</button>`
-                        ) : '<button class="sim-card-action" disabled style="background:#3e3e42;color:#6e6e6e;">OFFLINE</button>'}
+                        <div class="sim-card-actions">${actions}</div>
                     </div>
                 `;
             }).join('');
         }
 
-        function onSimCardClick(ip, port, hasDriver, isReachable) {
-            if (!isReachable) {
-                alert(`Cannot connect to simulator at ${ip}`);
+        // Tapping a card no longer navigates the iPad to that sim's page (which
+        // silently made every later action target that sim). It opens the
+        // register form with that sim pre-selected instead.
+        function onSimCardClick(ip) {
+            const sim = findSim(ip);
+            if (!sim || sim.reachable === false) {
+                showToast(`Cannot reach ${simName(sim) || ip}`);
                 return;
             }
-            // Long press could open edit menu - for now just navigate
-            if (ip !== currentSimulatorIp) {
-                window.location.href = `http://${ip}:${port}/admin`;
-            }
+            openRegisterModal(ip);
         }
 
         async function seatNextGuest(simIp) {
             const queue = queueData.queue || [];
             const nextGuest = queue.find(g => !g.assigned_to);
             if (!nextGuest) {
-                alert('No guests waiting in queue');
+                showToast('No guests waiting in queue');
                 return;
             }
 
-            const sim = discoveredSimulators.find(s => s.ip === simIp);
-            const simName = sim ? sim.simulator_name : `Sim at ${simIp}`;
-            const simPort = sim ? (sim.port || 5001) : 5001;
+            const sim = findSim(simIp);
+            if (!sim) {
+                showToast('Simulator not found');
+                return;
+            }
+            const simLabelText = simName(sim);
 
             try {
                 // Step 1: Assign guest to simulator
-                const assignResponse = await fetch('/api/queue/assign', {
+                const assignResponse = await fetchWithTimeout('/api/queue/assign', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
                         queue_id: nextGuest.id,
                         simulator_ip: simIp,
-                        simulator_name: simName
+                        simulator_name: simLabelText
                     })
-                });
+                }, 8000);
                 const assignData = await assignResponse.json();
 
                 if (!assignData.success) {
@@ -2786,25 +3044,21 @@ ADMIN_HTML_CONTENT = r"""
                 }
 
                 // Step 2: Start session on that simulator
-                const startResponse = await fetch(`http://${simIp}:${simPort}/api/session/start_remote`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        driver_name: nextGuest.name,
-                        queue_id: nextGuest.id,
-                        driver_email: nextGuest.email || assignData.email || '',
-                        driver_phone: nextGuest.phone || assignData.phone || ''
-                    })
+                const startData = await postToSim(sim, '/api/session/start_remote', {
+                    driver_name: nextGuest.name,
+                    queue_id: nextGuest.id,
+                    driver_email: nextGuest.email || assignData.email || '',
+                    driver_phone: nextGuest.phone || assignData.phone || ''
                 });
-                const startData = await startResponse.json();
 
                 if (startData.success) {
                     // Remove from queue after successful start
-                    await fetch('/api/queue/remove', {
+                    await fetchWithTimeout('/api/queue/remove', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ id: nextGuest.id })
-                    });
+                    }, 6000);
+                    showToast(`${nextGuest.name} seated on ${simLabelText}`);
                     refreshQueue();
                     refreshSimulators();
                 } else {
@@ -2812,26 +3066,44 @@ ADMIN_HTML_CONTENT = r"""
                 }
             } catch (e) {
                 console.error('Error seating guest:', e);
-                alert('Failed to connect to simulator');
+                alert(`Failed to connect to ${simLabelText}`);
             }
         }
 
         async function endSessionOnSim(simIp) {
+            const sim = findSim(simIp);
+            if (!sim) return;
             try {
-                const sim = discoveredSimulators.find(s => s.ip === simIp);
-                const simPort = sim ? (sim.port || 5001) : 5001;
-                const response = await fetch(`http://${simIp}:${simPort}/api/session/force_end`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' }
-                });
-                const data = await response.json();
+                const data = await postToSim(sim, '/api/session/force_end', {});
                 if (data.success) {
+                    showToast(`Session ended on ${simName(sim)}`);
                     refreshSimulators();
                     refreshQueue();
+                } else {
+                    alert('Could not end session: ' + (data.error || 'Unknown error'));
                 }
             } catch (e) {
                 console.error('Error ending session:', e);
-                alert('Failed to end session');
+                alert(`Failed to reach ${simName(sim)}`);
+            }
+        }
+
+        // Give the current driver more time without re-registering their name
+        async function extendSessionOnSim(simIp) {
+            const sim = findSim(simIp);
+            if (!sim) return;
+            const payload = sim.laps_active ? { laps: 1 } : { minutes: 5 };
+            try {
+                const data = await postToSim(sim, '/api/session/extend', payload);
+                if (data.success) {
+                    showToast(`${simName(sim)}: ${data.driver_name || 'driver'} +${sim.laps_active ? '1 lap' : '5 min'}`);
+                    refreshSimulators();
+                } else {
+                    alert('Could not extend: ' + (data.error || 'Unknown error'));
+                }
+            } catch (e) {
+                console.error('Error extending session:', e);
+                alert(`Failed to reach ${simName(sim)}`);
             }
         }
 
@@ -2914,7 +3186,8 @@ ADMIN_HTML_CONTENT = r"""
         // MODAL FUNCTIONS
         // ============================================
 
-        function openRegisterModal() {
+        function openRegisterModal(preferredIp) {
+            populateSimSelect('targetSim', 'targetSimHint', preferredIp || null);
             document.getElementById('registerModal').classList.add('active');
             document.getElementById('driverName').focus();
             loadSettings(); // Check if email is required
@@ -2925,6 +3198,7 @@ ADMIN_HTML_CONTENT = r"""
         }
 
         function openManualLapModal() {
+            populateSimSelect('manualTargetSim', null, null);
             document.getElementById('manualLapModal').classList.add('active');
             document.getElementById('manualDriverName').focus();
         }
@@ -2958,12 +3232,19 @@ ADMIN_HTML_CONTENT = r"""
         // DRIVER REGISTRATION
         // ============================================
 
-        function updateDriver() {
+        async function updateDriver() {
             const driverName = document.getElementById('driverName').value.trim();
             const driverEmailInput = document.getElementById('driverEmail');
             const driverEmail = driverEmailInput?.value?.trim() || '';
             const driverPhone = document.getElementById('driverPhone')?.value?.trim() || '';
             const statusEl = document.getElementById('registerStatus');
+
+            const sim = findSim(document.getElementById('targetSim').value);
+            if (!sim) {
+                statusEl.textContent = 'Pick which simulator this driver is for';
+                statusEl.className = 'status error';
+                return;
+            }
 
             if (!driverName) {
                 statusEl.textContent = 'Please enter a driver name';
@@ -2997,33 +3278,37 @@ ADMIN_HTML_CONTENT = r"""
                 }
             }
 
-            fetch('/set_driver', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload)
-            })
-            .then(r => r.json())
-            .then(data => {
+            statusEl.textContent = `Sending to ${simName(sim)}...`;
+            statusEl.className = 'status success';
+
+            try {
+                const data = await postToSim(sim, '/set_driver', payload);
                 if (data.success) {
-                    statusEl.textContent = 'Driver registered successfully!';
+                    lastTargetIp = sim.ip;
+                    if (data.already_active) {
+                        statusEl.textContent = `${driverName} is already driving on ${simName(sim)}. Use ${sim.laps_active ? '+1 LAP' : '+5 MIN'} on the card to extend them.`;
+                        statusEl.className = 'status error';
+                        return;
+                    }
+                    statusEl.textContent = `✅ ${driverName} registered on ${simName(sim)}`;
                     statusEl.className = 'status success';
                     document.getElementById('driverName').value = '';
                     document.getElementById('driverPhone').value = '';
                     document.getElementById('driverEmail').value = '';
+                    showToast(`${driverName} → ${simName(sim)}`);
                     setTimeout(() => {
                         closeRegisterModal();
                         statusEl.className = 'status';
                         refreshSimulators();
                     }, 1500);
                 } else {
-                    statusEl.textContent = 'Failed to register driver';
+                    statusEl.textContent = data.error || `Failed to register on ${simName(sim)}`;
                     statusEl.className = 'status error';
                 }
-            })
-            .catch(e => {
-                statusEl.textContent = 'Error connecting to server';
+            } catch (e) {
+                statusEl.textContent = `Could not reach ${simName(sim)} (${e.message})`;
                 statusEl.className = 'status error';
-            });
+            }
         }
 
         // ============================================
@@ -3045,10 +3330,17 @@ ADMIN_HTML_CONTENT = r"""
             }
         }
 
-        function submitManualLapTime() {
+        async function submitManualLapTime() {
             const driverName = document.getElementById('manualDriverName').value.trim();
             const lapTimeInput = document.getElementById('manualLapTime').value.trim();
             const statusEl = document.getElementById('manualStatus');
+
+            const sim = findSim(document.getElementById('manualTargetSim').value);
+            if (!sim) {
+                statusEl.textContent = 'Pick which simulator this lap is for';
+                statusEl.className = 'status error';
+                return;
+            }
 
             if (!driverName) {
                 statusEl.textContent = 'Please enter a driver name';
@@ -3069,15 +3361,13 @@ ADMIN_HTML_CONTENT = r"""
                 return;
             }
 
-            fetch('/api/manual_lap', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ driver_name: driverName, lap_time: lapTimeSeconds })
-            })
-            .then(r => r.json())
-            .then(data => {
+            statusEl.textContent = `Sending to ${simName(sim)}...`;
+            statusEl.className = 'status success';
+
+            try {
+                const data = await postToSim(sim, '/api/manual_lap', { driver_name: driverName, lap_time: lapTimeSeconds });
                 if (data.success) {
-                    statusEl.textContent = `Lap time ${data.formatted_time} sent!`;
+                    statusEl.textContent = `Lap time ${data.formatted_time} sent via ${simName(sim)}!`;
                     statusEl.className = 'status success';
                     document.getElementById('manualLapTime').value = '';
                     setTimeout(() => {
@@ -3085,31 +3375,61 @@ ADMIN_HTML_CONTENT = r"""
                         statusEl.className = 'status';
                     }, 1500);
                 } else {
-                    statusEl.textContent = data.message || 'Failed to send lap time';
+                    statusEl.textContent = data.message || data.error || 'Failed to send lap time';
                     statusEl.className = 'status error';
                 }
-            })
-            .catch(e => {
-                statusEl.textContent = 'Error connecting to server';
+            } catch (e) {
+                statusEl.textContent = `Could not reach ${simName(sim)} (${e.message})`;
                 statusEl.className = 'status error';
-            });
+            }
         }
 
         // ============================================
         // SIMULATOR SETTINGS
         // ============================================
 
+        // Manually added simulators live on the server (simulators.json), not
+        // in this browser: localStorage is per sim address, so the list used
+        // to vanish whenever the iPad opened a different sim's page.
         function getManualSimulators() {
-            try {
-                const stored = localStorage.getItem(STORAGE_KEY);
-                return stored ? JSON.parse(stored) : [];
-            } catch (e) { return []; }
+            return knownSimulators;
         }
 
-        function saveManualSimulators(simulators) {
+        async function fetchKnownSimulators() {
+            const r = await fetchWithTimeout('/api/known_simulators', {}, 4000);
+            const data = await r.json();
+            knownSimulators = (data.known_simulators || []).map(s => ({
+                ip: s.ip,
+                name: s.name || `Sim (${s.ip})`,
+                port: s.port || 5001
+            }));
+            return knownSimulators;
+        }
+
+        async function loadKnownSimulators() {
             try {
-                localStorage.setItem(STORAGE_KEY, JSON.stringify(simulators));
+                await fetchKnownSimulators();
+            } catch (e) {
+                console.warn('Could not load known simulators:', e);
+            }
+            // One-time migration of entries an older page kept in this browser
+            try {
+                const stored = JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]');
+                if (Array.isArray(stored) && stored.length) {
+                    for (const s of stored) {
+                        if (s && s.ip && !knownSimulators.some(k => k.ip === s.ip)) {
+                            await fetchWithTimeout('/api/known_simulators', {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ ip: s.ip, name: s.name })
+                            }, 4000);
+                        }
+                    }
+                    localStorage.removeItem(STORAGE_KEY);
+                    await fetchKnownSimulators();
+                }
             } catch (e) {}
+            return knownSimulators;
         }
 
         function renderManualSimulatorList() {
@@ -3121,13 +3441,13 @@ ADMIN_HTML_CONTENT = r"""
                 return;
             }
 
-            list.innerHTML = manualSims.map((sim, idx) => `
+            list.innerHTML = manualSims.map(sim => `
                 <div class="sim-config-item">
                     <div class="info">
                         <strong>${escapeHtml(sim.name)}</strong>
-                        <small>${sim.ip}:${sim.port || 5001}</small>
+                        <small>${escapeHtml(sim.ip)}:${sim.port || 5001}</small>
                     </div>
-                    <button class="remove-btn" onclick="removeManualSimulator(${idx})">Remove</button>
+                    <button class="remove-btn" onclick="removeManualSimulator('${escapeHtml(sim.ip)}')">Remove</button>
                 </div>
             `).join('');
         }
@@ -3141,43 +3461,32 @@ ADMIN_HTML_CONTENT = r"""
                 return;
             }
 
-            const manualSims = getManualSimulators();
-            if (manualSims.some(s => s.ip === ip)) {
+            if (getManualSimulators().some(s => s.ip === ip)) {
                 alert('This simulator is already added');
                 return;
             }
 
-            manualSims.push({ ip, name, port: 5001 });
-            saveManualSimulators(manualSims);
-
             try {
-                await fetch('/api/known_simulators', {
+                await fetchWithTimeout('/api/known_simulators', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ ip, name })
-                });
-            } catch (e) {}
+                }, 4000);
+            } catch (e) {
+                alert('Could not save the simulator');
+                return;
+            }
 
             document.getElementById('manualSimIp').value = '';
             document.getElementById('manualSimName').value = '';
-            renderManualSimulatorList();
-            initializeSimulators();
+            await initializeSimulators();
         }
 
-        async function removeManualSimulator(index) {
-            const manualSims = getManualSimulators();
-            const removed = manualSims[index];
-            manualSims.splice(index, 1);
-            saveManualSimulators(manualSims);
-
-            if (removed && removed.ip) {
-                try {
-                    await fetch(`/api/known_simulators/${removed.ip}`, { method: 'DELETE' });
-                } catch (e) {}
-            }
-
-            renderManualSimulatorList();
-            initializeSimulators();
+        async function removeManualSimulator(ip) {
+            try {
+                await fetchWithTimeout(`/api/known_simulators/${ip}`, { method: 'DELETE' }, 4000);
+            } catch (e) {}
+            await initializeSimulators();
         }
 
         async function saveSimulatorEdit() {
@@ -3190,30 +3499,22 @@ ADMIN_HTML_CONTENT = r"""
                 return;
             }
 
-            const manualSims = getManualSimulators();
-            const existingIndex = manualSims.findIndex(s => s.ip === oldIp);
-
-            if (existingIndex >= 0) {
-                manualSims[existingIndex] = { ip: newIp, name: newName || `Sim (${newIp})`, port: 5001 };
-            } else {
-                manualSims.push({ ip: newIp, name: newName || `Sim (${newIp})`, port: 5001 });
-            }
-
-            if (oldIp && oldIp !== newIp) {
-                try { await fetch(`/api/known_simulators/${oldIp}`, { method: 'DELETE' }); } catch (e) {}
-            }
-
             try {
-                await fetch('/api/known_simulators', {
+                if (oldIp) {
+                    await fetchWithTimeout(`/api/known_simulators/${oldIp}`, { method: 'DELETE' }, 4000);
+                }
+                await fetchWithTimeout('/api/known_simulators', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ ip: newIp, name: newName })
-                });
-            } catch (e) {}
+                    body: JSON.stringify({ ip: newIp, name: newName || `Sim (${newIp})` })
+                }, 4000);
+            } catch (e) {
+                alert('Could not save the simulator');
+                return;
+            }
 
-            saveManualSimulators(manualSims);
             closeEditModal();
-            initializeSimulators();
+            await initializeSimulators();
         }
 
         // ============================================
@@ -3267,22 +3568,53 @@ ADMIN_HTML_CONTENT = r"""
 
         async function initializeSimulators() {
             const statusEl = document.getElementById('discoveryStatus');
-            if (statusEl) statusEl.textContent = 'Searching for simulators...';
+            if (statusEl && discoveredSimulators.length === 0) statusEl.textContent = 'Searching for simulators...';
 
+            await loadKnownSimulators();
             const simulators = await discoverSimulators();
 
             if (statusEl) {
                 const total = simulators.length;
                 const online = simulators.filter(s => s.reachable !== false).length;
+                let text;
                 if (total <= 1) {
-                    statusEl.textContent = 'Only this simulator found. Add others below.';
+                    text = 'Only this simulator found. Other sims appear within a few seconds of starting; add one by IP or scan below.';
                 } else {
-                    statusEl.textContent = `Found ${total} simulators (${online} online)`;
+                    text = `Found ${total} simulators (${online} online)`;
                 }
+                if (udpDiscoveryOk === false) text += ' Automatic discovery is off on this PC (UDP port 5003 busy), so sims come from the saved list and network scans.';
+                if (scanInProgress) text += ' — scanning the network...';
+                statusEl.textContent = text;
             }
 
+            renderManualSimulatorList();
             renderSimulatorCards();
             updateStats();
+        }
+
+        // Full subnet sweep, on request only. Runs in the background on the
+        // host sim; this just polls until it reports done.
+        async function scanNetwork() {
+            const btn = document.getElementById('scanBtn');
+            try {
+                await fetchWithTimeout('/api/discover_simulators/scan', { method: 'POST' }, 4000);
+            } catch (e) {
+                showToast('Could not start the scan');
+                return;
+            }
+            scanInProgress = true;
+            if (btn) { btn.disabled = true; btn.textContent = 'Scanning... (about 20 seconds)'; }
+            let polls = 0;
+            clearInterval(scanPollTimer);
+            scanPollTimer = setInterval(async () => {
+                polls++;
+                await initializeSimulators();
+                if (!scanInProgress || polls > 20) {
+                    clearInterval(scanPollTimer);
+                    if (btn) { btn.disabled = false; btn.textContent = '🔍 Scan network for simulators'; }
+                    showToast(`Scan finished: ${discoveredSimulators.length} simulator(s)`);
+                }
+            }, 4000);
         }
 
         // Start polling
@@ -3290,14 +3622,15 @@ ADMIN_HTML_CONTENT = r"""
             initializeSimulators();
             refreshQueue();
 
-            // Refresh simulators every 2 seconds
-            setInterval(refreshSimulators, 2000);
+            // Refresh simulator cards every 5 seconds (each one is a call to
+            // every other sim, so 2 s across several iPads was real load)
+            setInterval(refreshSimulators, 5000);
 
             // Refresh queue every 5 seconds
             setInterval(refreshQueue, 5000);
 
-            // Full discovery every 30 seconds
-            setInterval(initializeSimulators, 30000);
+            // Re-discover every 15 seconds (cheap now: no subnet scan)
+            setInterval(initializeSimulators, 15000);
         });
 
         // Close modals on overlay click
@@ -4143,6 +4476,7 @@ from flask import Response, stream_with_context
 # Track last known queue state for change detection
 _sse_last_queue_hash = None
 _sse_clients_connected = 0
+MAX_SSE_CLIENTS = 6
 
 def get_queue_data_for_sse():
     """Fetch queue data from receiver for SSE broadcast using pooled connection"""
@@ -4176,6 +4510,11 @@ def get_queue_data_for_sse():
 def queue_stream():
     """Server-Sent Events endpoint for real-time queue updates"""
     global _sse_clients_connected
+
+    # Each stream pins a Waitress worker for as long as the page is open, so
+    # cap them; the queue-display page falls back to polling on a 503.
+    if _sse_clients_connected >= MAX_SSE_CLIENTS:
+        return jsonify({'success': False, 'error': 'Too many live viewers; poll /api/queue instead'}), 503
 
     def generate():
         global _sse_last_queue_hash, _sse_clients_connected
@@ -4269,6 +4608,22 @@ def get_driver():
         return jsonify({'driver_name': main_window.driver_name.text()})
     return jsonify({'driver_name': ''})
 
+def _current_driver_already_active(driver_name):
+    """True when `driver_name` is the driver already in this sim's seat.
+
+    Staff used to re-submit a name to "extend" someone, which restarted the
+    session (timer reset, video replayed). A repeat is now a no-op; the
+    Host Stand offers a real Extend button instead.
+    """
+    if not main_window or not getattr(main_window, 'session_active', False):
+        return False
+    try:
+        current = (main_window.driver_name.text() or '').strip()
+    except Exception:
+        return False
+    return bool(current) and current.casefold() == str(driver_name).strip().casefold()
+
+
 @app.route('/set_driver', methods=['POST'])
 def set_driver():
     import datetime as dt
@@ -4315,6 +4670,11 @@ def set_driver():
                 if answer not in q['options']:
                     return jsonify({'success': False, 'error': f"Please answer: {q['prompt']}"}), 400
                 answers_by_prompt[q['prompt']] = answer
+
+        if _current_driver_already_active(driver_name):
+            print(f"[{dt.datetime.now().strftime('%H:%M:%S.%f')[:-3]}] {driver_name} is already driving; not restarting the session")
+            return jsonify({'success': True, 'driver_name': driver_name, 'already_active': True,
+                            'message': f'{driver_name} is already driving on this simulator'})
 
         if main_window:
             # Store contact fields before changing the driver so session-start
@@ -4679,6 +5039,10 @@ def start_remote_session():
             driver_email = ""
             driver_phone = ""
 
+        if _current_driver_already_active(driver_name):
+            return jsonify({'success': True, 'driver_name': driver_name, 'already_active': True,
+                            'message': f'{driver_name} is already driving on this simulator'})
+
         if main_window:
             # Store queue ID for session tracking
             main_window.assigned_queue_id = queue_id
@@ -4696,6 +5060,83 @@ def start_remote_session():
         return jsonify({'success': False, 'error': 'Server not ready'}), 500
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/session/extend', methods=['POST'])
+def extend_session_api():
+    """Give the current driver more time (or laps) without touching the name.
+
+    Body: {"minutes": 5} in Time mode, {"laps": 1} in Laps mode. Refuses when
+    nobody is in the seat so a stray tap can't start a phantom session.
+    """
+    global main_window, ui_bridge
+    data = request.get_json() or {}
+    try:
+        minutes = int(data.get('minutes') or 0)
+        laps = int(data.get('laps') or 0)
+    except (TypeError, ValueError):
+        return jsonify({'success': False, 'error': 'minutes and laps must be whole numbers'}), 400
+    if minutes <= 0 and laps <= 0:
+        return jsonify({'success': False, 'error': 'Nothing to extend'}), 400
+    if minutes > 180 or laps > 100:
+        return jsonify({'success': False, 'error': 'Extension too large'}), 400
+    if not (main_window and ui_bridge):
+        return jsonify({'success': False, 'error': 'Server not ready'}), 500
+    driver_name = (main_window.driver_name.text() or '').strip()
+    if not getattr(main_window, 'session_active', False) or not driver_name:
+        return jsonify({'success': False, 'error': 'No active session to extend'}), 409
+    ui_bridge.extend_session.emit(minutes, laps)
+    return jsonify({'success': True, 'driver_name': driver_name, 'minutes': minutes, 'laps': laps})
+
+
+SIM_PROXY_ALLOWED_PATHS = {
+    '/set_driver',
+    '/api/manual_lap',
+    '/api/session/start_remote',
+    '/api/session/force_end',
+    '/api/session/extend',
+}
+
+
+@app.route('/api/sim_proxy', methods=['POST'])
+def sim_proxy():
+    """Relay a Host Stand action to another simulator.
+
+    The iPad talks to every sim from one page. It tries the other sim
+    directly first; if Safari refuses the cross-origin call, or it times
+    out, it comes through here so the action still lands on the right sim.
+    """
+    data = request.get_json() or {}
+    ip = str(data.get('ip') or '').strip()
+    path = str(data.get('path') or '').strip()
+    try:
+        port = int(data.get('port') or PREFERRED_WEB_INTERFACE_PORT)
+    except (TypeError, ValueError):
+        port = PREFERRED_WEB_INTERFACE_PORT
+    import re
+    if not re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', ip):
+        return jsonify({'success': False, 'error': 'Invalid simulator IP'}), 400
+    if path not in SIM_PROXY_ALLOWED_PATHS:
+        return jsonify({'success': False, 'error': 'Path not allowed'}), 400
+    try:
+        response = requests.post(f'http://{ip}:{port}{path}', json=data.get('payload') or {}, timeout=6)
+        try:
+            body = response.json()
+        except ValueError:
+            body = {'success': False, 'error': f'HTTP {response.status_code}'}
+        return jsonify(body), response.status_code
+    except requests.Timeout:
+        return jsonify({'success': False, 'error': f'Sim at {ip} did not answer in time'}), 504
+    except Exception as e:
+        return jsonify({'success': False, 'error': f'Could not reach sim at {ip}: {e}'}), 502
+
+
+@app.route('/api/discover_simulators/scan', methods=['POST'])
+def discover_simulators_scan():
+    """Start a background sweep of the subnet (explicit "Scan network" only)."""
+    started = SimulatorDiscovery.start_full_scan()
+    return jsonify({'success': True, 'started': started,
+                    'scan_in_progress': SimulatorDiscovery.scan_in_progress()})
+
 
 @app.route('/api/session/force_end', methods=['POST'])
 def force_end_session():
@@ -4746,7 +5187,9 @@ def simulator_info():
             'timer_active': timer_active,
             'timer_seconds_left': timer_seconds_left,
             'laps_active': laps_active,
-            'laps_progress': laps_progress
+            'laps_progress': laps_progress,
+            'session_active': bool(getattr(main_window, 'session_active', False)),
+            'id_conflicts': main_window.get_sim_id_conflicts(),
         })
     return jsonify({
         'simulator_id': 1,
@@ -4805,25 +5248,38 @@ def discover_simulators():
             'timer_active': timer_active,
             'timer_seconds_left': timer_seconds_left,
             'laps_active': laps_active,
-            'laps_progress': laps_progress
+            'laps_progress': laps_progress,
+            'session_active': bool(getattr(main_window, 'session_active', False)),
+            'id_conflicts': main_window.get_sim_id_conflicts(),
         }
-    
-    # Discover other simulators
+
+    # Other simulators: UDP announcements + known list (no subnet scan here)
     discovered = SimulatorDiscovery.discover()
-    
+
+    # If this PC can't listen for UDP announcements (port reserved/in use),
+    # the only way to find the others is a sweep: run one in the background,
+    # at most once per SCAN_RESULT_TTL, so the cards still fill in by themselves.
+    listener = getattr(main_window, 'discovery_listener', None) if main_window else None
+    udp_ok = getattr(listener, 'bind_ok', None) if listener else None
+    if udp_ok is False and not SimulatorDiscovery.scan_in_progress()             and time.time() - SimulatorDiscovery._scan_time > SimulatorDiscovery.SCAN_RESULT_TTL:
+        SimulatorDiscovery.start_full_scan()
+
     # Mark which is current and filter out self
     simulators = [current_sim]
     for sim in discovered:
         if sim['ip'] != current_ip:
             sim['is_current'] = False
             simulators.append(sim)
-    
-    # Sort by simulator_id
-    simulators.sort(key=lambda x: x.get('simulator_id', 0))
-    
+
+    # Sort by simulator_id, then IP so identical IDs keep a stable order
+    simulators.sort(key=lambda x: (x.get('simulator_id', 0), x.get('ip', '')))
+
     return jsonify({
         'simulators': simulators,
-        'current_ip': current_ip
+        'current_ip': current_ip,
+        'scan_in_progress': SimulatorDiscovery.scan_in_progress(),
+        'udp_discovery_ok': udp_ok,
+        'id_conflicts': current_sim.get('id_conflicts', []),
     })
 
 @app.route('/api/known_simulators', methods=['GET'])
@@ -5019,7 +5475,7 @@ def run_flask():
         app.run(host='0.0.0.0', port=web_port, threaded=True, use_reloader=False)
         return
 
-    print(f"[Flask] Starting production server with Waitress on port {web_port} (8 threads)...")
+    print(f"[Flask] Starting production server with Waitress on port {web_port} (32 threads)...")
     print("[Flask] Enterprise features enabled:")
     print("[Flask]   - Correlation IDs for request tracing")
     print("[Flask]   - Slow request detection (>2s)")
@@ -5028,8 +5484,10 @@ def run_flask():
     print("[Flask]   - Heartbeat monitoring (10s interval)")
     print("[Flask]   - SSE for real-time updates")
 
-    serve(app, host='0.0.0.0', port=web_port, threads=8,
-          connection_limit=100, channel_timeout=30)
+    # 32 workers: every open queue-display page holds one for its SSE stream
+    # and several iPads poll at once, so 8 ran dry and registrations queued.
+    serve(app, host='0.0.0.0', port=web_port, threads=32,
+          connection_limit=200, channel_timeout=30)
 
 def run_beamng_udp_listener():
     """Listen for direct UDP lap data from BeamNG Lua mod - instant lap detection"""
@@ -5173,21 +5631,51 @@ class UIBridge(QObject):
     driver_registered = pyqtSignal(str)
     manual_lap_submitted = pyqtSignal(float, str)  # lap_time, driver_name
     force_end_session = pyqtSignal()  # Force end current session
+    extend_session = pyqtSignal(int, int)  # minutes, laps to add to the running session
 
 class SimulatorDiscovery:
-    """Discovers other simulators via HTTP probe on port 5001"""
-    PROBE_TIMEOUT = 1.0  # 1 second per host (increased for reliability)
-    KNOWN_TIMEOUT = 2.0  # 2 seconds for known simulators (higher priority)
-    MAX_WORKERS = 50     # Parallel connections
-    CACHE_TTL = 5        # seconds (reduced - UDP discovery is primary now)
-    
-    _cache = []
-    _cache_time = 0
-    
+    """Finds the other simulators on the LAN.
+
+    The fast path (`discover`) never scans the subnet: it merges the UDP
+    presence broadcasts every Sender emits every 3 s with the saved known
+    list, probing only those specific addresses. A full /24 sweep is still
+    available (`start_full_scan`) but runs in its own background thread on
+    explicit request, never inside a web request. The old in-request sweep
+    took ~30 s, pinned a web worker for all of it, and ran on every Host
+    Stand page load, which is why other sims "didn't show up".
+    """
+    PROBE_TIMEOUT = 1.0     # per port during a full sweep
+    KNOWN_TIMEOUT = 1.5     # per port for a saved simulator
+    MAX_WORKERS = 50        # parallel connections during a sweep
+    SCAN_RESULT_TTL = 120   # seconds a sweep result stays merged into discover()
+
+    _scan_results = {}      # ip -> simulator_info from the last sweep
+    _scan_time = 0
+    _scan_in_progress = False
+    _scan_lock = threading.Lock()
+
     @staticmethod
-    def probe_host(ip, timeout=1.0):
-        """Probe a single host for simulator"""
-        for port in get_simulator_probe_ports():
+    def _port_open(ip, port, timeout):
+        try:
+            with socket.create_connection((ip, port), timeout=timeout):
+                return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def probe_host(ip, timeout=1.0, ports=None):
+        """Fetch simulator_info from one host.
+
+        A cheap TCP connect decides whether an HTTP request is worth making
+        on each port, so a dead address costs milliseconds, not 6 seconds.
+        """
+        for port in (ports or get_simulator_probe_ports()):
+            try:
+                port = int(port)
+            except (TypeError, ValueError):
+                continue
+            if not SimulatorDiscovery._port_open(ip, port, timeout):
+                continue
             try:
                 response = requests.get(
                     f'http://{ip}:{port}/api/simulator_info',
@@ -5195,73 +5683,144 @@ class SimulatorDiscovery:
                 )
                 if response.ok:
                     data = response.json()
+                    # Anything else answering on this port (another app, a
+                    # printer's web UI) must not become a "simulator".
+                    if not isinstance(data, dict) or 'simulator_id' not in data or 'simulator_name' not in data:
+                        continue
                     data['ip'] = ip
                     data['port'] = data.get('port', port)
                     data['reachable'] = True
                     return data
-            except:
+            except Exception:
                 pass
         return None
-    
+
+    @staticmethod
+    def _udp_simulators(local_ip):
+        """Sims heard on the discovery broadcast in the last 15 s."""
+        listener = getattr(main_window, 'discovery_listener', None) if main_window else None
+        if not listener:
+            return []
+        sims = []
+        try:
+            for sim in listener.get_known_simulators():
+                ip = sim.get('ip')
+                if not ip or ip == local_ip:
+                    continue
+                entry = dict(sim)
+                entry.pop('last_seen', None)
+                try:
+                    entry['port'] = int(entry.get('port') or PREFERRED_WEB_INTERFACE_PORT)
+                except (TypeError, ValueError):
+                    entry['port'] = PREFERRED_WEB_INTERFACE_PORT
+                entry['reachable'] = True
+                entry['source'] = 'udp'
+                sims.append(entry)
+        except Exception as e:
+            print(f"[Discovery] UDP list error: {e}")
+        return sims
+
     @staticmethod
     def discover():
-        """Scan local subnet and known simulators via HTTP"""
+        """Fast, non-scanning discovery: UDP-announced sims + known list."""
         from concurrent.futures import ThreadPoolExecutor
-        
-        # Return cached results if still valid
-        if SimulatorDiscovery._cache and (time.time() - SimulatorDiscovery._cache_time) < SimulatorDiscovery.CACHE_TTL:
-            return SimulatorDiscovery._cache
-        
+
         local_ip = get_local_ip()
-        subnet_prefix = '.'.join(local_ip.split('.')[:-1])  # e.g., "192.168.0"
-        
         discovered = {}
-        
-        # First, probe known simulators with higher timeout (priority)
-        known_sims = load_known_simulators()
-        for known in known_sims:
-            ip = known.get('ip')
-            if ip:
-                result = SimulatorDiscovery.probe_host(ip, SimulatorDiscovery.KNOWN_TIMEOUT)
-                if result:
-                    discovered[ip] = result
-                else:
-                    # Add as unreachable so it still appears in the list
-                    discovered[ip] = {
-                        'ip': ip,
-                        'port': known.get('port', 5001),
-                        'simulator_name': known.get('name', f'Sim ({ip})'),
-                        'simulator_id': 99,
-                        'reachable': False,
-                        'is_known': True
-                    }
-        
-        # Generate list of IPs to scan (excluding .0 and .255)
-        ips_to_scan = [f"{subnet_prefix}.{i}" for i in range(1, 255)]
-        # Exclude already-probed known simulators
-        known_ips = set(k.get('ip') for k in known_sims)
-        ips_to_scan = [ip for ip in ips_to_scan if ip not in known_ips]
-        
+        for sim in SimulatorDiscovery._udp_simulators(local_ip):
+            discovered[sim['ip']] = sim
+
+        # Saved simulators not currently heard on UDP: probe just those.
+        known_sims = [k for k in load_known_simulators()
+                      if k.get('ip') and k['ip'] != local_ip and k['ip'] not in discovered]
+        if known_sims:
+            def probe_known(known):
+                ports = [known.get('port') or PREFERRED_WEB_INTERFACE_PORT] + WEB_INTERFACE_FALLBACK_PORTS
+                return known, SimulatorDiscovery.probe_host(known['ip'], SimulatorDiscovery.KNOWN_TIMEOUT, ports)
+
+            try:
+                with ThreadPoolExecutor(max_workers=min(8, len(known_sims))) as executor:
+                    for known, result in executor.map(probe_known, known_sims):
+                        ip = known['ip']
+                        if result:
+                            result['is_known'] = True
+                            result['source'] = 'known'
+                            discovered[ip] = result
+                        else:
+                            discovered[ip] = {
+                                'ip': ip,
+                                'port': known.get('port', PREFERRED_WEB_INTERFACE_PORT),
+                                'simulator_name': known.get('name', f'Sim ({ip})'),
+                                'simulator_id': 99,
+                                'current_driver': None,
+                                'reachable': False,
+                                'is_known': True,
+                                'source': 'known',
+                            }
+            except Exception as e:
+                print(f"[Discovery] Known-simulator probe error: {e}")
+
+        # Anything a recent sweep found that isn't announcing itself
+        if time.time() - SimulatorDiscovery._scan_time < SimulatorDiscovery.SCAN_RESULT_TTL:
+            for ip, sim in list(SimulatorDiscovery._scan_results.items()):
+                if ip != local_ip and ip not in discovered:
+                    entry = dict(sim)
+                    entry['source'] = 'scan'
+                    discovered[ip] = entry
+
+        return list(discovered.values())
+
+    @staticmethod
+    def scan_in_progress():
+        return SimulatorDiscovery._scan_in_progress
+
+    @staticmethod
+    def start_full_scan():
+        """Kick off a background sweep of the local /24.
+
+        Returns False if a sweep is already running.
+        """
+        with SimulatorDiscovery._scan_lock:
+            if SimulatorDiscovery._scan_in_progress:
+                return False
+            SimulatorDiscovery._scan_in_progress = True
+        threading.Thread(target=SimulatorDiscovery._run_full_scan,
+                         name="sim-full-scan", daemon=True).start()
+        return True
+
+    @staticmethod
+    def _run_full_scan():
+        from concurrent.futures import ThreadPoolExecutor
+
+        started = time.time()
         try:
-            # Scan subnet in parallel
+            local_ip = get_local_ip()
+            subnet_prefix = '.'.join(local_ip.split('.')[:-1])
+            ips_to_scan = [f"{subnet_prefix}.{i}" for i in range(1, 255)]
+            ips_to_scan = [ip for ip in ips_to_scan if ip != local_ip]
+
+            found = {}
             with ThreadPoolExecutor(max_workers=SimulatorDiscovery.MAX_WORKERS) as executor:
-                results = list(executor.map(
-                    lambda ip: SimulatorDiscovery.probe_host(ip, SimulatorDiscovery.PROBE_TIMEOUT),
-                    ips_to_scan
-                ))
-            
-            for result in results:
-                if result and result.get('ip'):
-                    discovered[result['ip']] = result
-                    
+                for result in executor.map(
+                        lambda ip: SimulatorDiscovery.probe_host(ip, SimulatorDiscovery.PROBE_TIMEOUT),
+                        ips_to_scan):
+                    if result and result.get('ip'):
+                        found[result['ip']] = result
+
+            SimulatorDiscovery._scan_results = found
+            SimulatorDiscovery._scan_time = time.time()
+            print(f"[Discovery] Full scan found {len(found)} simulator(s) in {time.time() - started:.1f}s")
+
+            # Remember what the sweep found so the fast path knows it next time
+            for ip, sim in found.items():
+                try:
+                    add_known_simulator(ip, sim.get('simulator_name') or f'Sim ({ip})', sim.get('port'))
+                except Exception:
+                    pass
         except Exception as e:
-            print(f"SimulatorDiscovery error: {e}")
-        
-        # Update cache
-        SimulatorDiscovery._cache = list(discovered.values())
-        SimulatorDiscovery._cache_time = time.time()
-        
-        return SimulatorDiscovery._cache
+            print(f"[Discovery] Full scan error: {e}")
+        finally:
+            SimulatorDiscovery._scan_in_progress = False
 
 
 # ============================================================================
@@ -5655,6 +6214,7 @@ class SimulatorBroadcastListener(QThread):
         self._running = True
         self._known_simulators = {}  # ip -> last_seen_time
         self.local_ip = get_local_ip()
+        self.bind_ok = None  # None until run() has tried; False = automatic discovery is off
     
     def stop(self):
         self._running = False
@@ -5667,9 +6227,13 @@ class SimulatorBroadcastListener(QThread):
         
         try:
             sock.bind(('0.0.0.0', DISCOVERY_PORT))
+            self.bind_ok = True
             print(f"[Discovery] UDP listener started on port {DISCOVERY_PORT}")
         except Exception as e:
+            self.bind_ok = False
             print(f"[Discovery] Failed to bind UDP port {DISCOVERY_PORT}: {e}")
+            print("[Discovery] Automatic simulator discovery is OFF on this PC "
+                  "(port in use or reserved). Other sims are found from the saved list or a network scan.")
             return
         
         while self._running:
@@ -7912,9 +8476,14 @@ class LapTimeSenderWindow(QMainWindow):
         "BeamNG.drive": BeamNGMonitor,
         "EA Sports F1": F1Monitor,
     }
-    
+
+    # Result of a background lap POST, delivered back on the GUI thread
+    lap_send_finished = pyqtSignal(object)
+
     def __init__(self):
         super().__init__()
+        self.lap_send_finished.connect(self._on_lap_send_finished)
+        self.pending_extension_minutes = 0
         self.current_monitor = None
         self.local_ip = get_local_ip()
         self.web_port = select_web_interface_port()
@@ -7963,6 +8532,7 @@ class LapTimeSenderWindow(QMainWindow):
         ui_bridge.driver_registered.connect(self.update_driver_name)
         ui_bridge.manual_lap_submitted.connect(self.on_manual_lap_submitted)
         ui_bridge.force_end_session.connect(self.end_session)
+        ui_bridge.extend_session.connect(self.extend_current_session)
         self.web_thread = threading.Thread(target=run_flask, daemon=True)
         self.web_thread.start()
         
@@ -8003,6 +8573,14 @@ class LapTimeSenderWindow(QMainWindow):
     def _load_saved_settings(self):
         """Load and apply saved application settings"""
         settings = load_app_settings()
+
+        # Restore the simulator ID first: mDNS, the discovery broadcast and
+        # every leaderboard submission key off it.
+        saved_id = settings.get('simulator_id')
+        if saved_id is not None and hasattr(self, 'simulator_id'):
+            idx = self.simulator_id.findText(str(saved_id))
+            if idx >= 0:
+                self.simulator_id.setCurrentIndex(idx)
 
         # Restore pre-session video path
         if settings.get('pre_session_video_path'):
@@ -8595,8 +9173,16 @@ class LapTimeSenderWindow(QMainWindow):
         simulator_row.addWidget(self.simulator_id)
         simulator_row.addWidget(game_label)
         simulator_row.addWidget(self.game_selector, 1)
-        
+
         racing_section_layout.addLayout(simulator_row)
+
+        # Shown when another PC on the network announces the same Simulator ID
+        self.sim_id_conflict_label = QLabel("")
+        self.sim_id_conflict_label.setWordWrap(True)
+        self.sim_id_conflict_label.setStyleSheet(
+            "color: #f48771; font-size: 11px; font-weight: 600; padding: 2px 0;")
+        self.sim_id_conflict_label.hide()
+        racing_section_layout.addWidget(self.sim_id_conflict_label)
         config_row.addWidget(racing_section, stretch=2)
         
         card_layout.addLayout(config_row)
@@ -9890,64 +10476,91 @@ class LapTimeSenderWindow(QMainWindow):
             self.status_label.setText("📤 Sending lap time to server...")
             self.status_label.setStyleSheet("color: #0066cc; background-color: #f0f0f0; padding: 10px; border-radius: 5px; font-size: 12px;")
 
-            # Send to all servers CONCURRENTLY for speed and reliability
-            headers = {'Content-Type': 'application/json'}
-            success_count = 0
-            failed_urls = []
+            # Send off the GUI thread. The old in-line send blocked the window
+            # for up to 10 s per lap when a receiver was slow, which stalled
+            # the overlay, the video and the next registration.
+            threading.Thread(
+                target=self._send_lap_to_receivers,
+                args=(list(server_urls), dict(data), float(lap_time or 0)),
+                name="lap-send",
+                daemon=True,
+            ).start()
+        except Exception as e:
+            self.show_error(f"❌ Error preparing data: {str(e)}")
+            
+    def _send_lap_to_receivers(self, server_urls, data, lap_time):
+        """Worker thread: POST one lap to every receiver in parallel."""
+        headers = {'Content-Type': 'application/json'}
+        success_count = 0
+        failed_urls = []
+        finished = set()
 
-            def send_to_receiver(server_url):
-                """Send lap time to a single receiver. Returns (url, success, error_msg)"""
-                try:
-                    response = requests.post(
-                        server_url,
-                        json=data,
-                        headers=headers,
-                        timeout=5
-                    )
-                    if response.status_code == 200:
-                        return (server_url, True, None)
-                    else:
-                        return (server_url, False, f"HTTP {response.status_code}")
-                except requests.exceptions.Timeout:
-                    return (server_url, False, "timeout")
-                except requests.exceptions.ConnectionError:
-                    return (server_url, False, "connection error")
-                except Exception as e:
-                    return (server_url, False, str(e))
+        def send_to_receiver(server_url):
+            """Send lap time to a single receiver. Returns (url, success, error_msg)"""
+            try:
+                response = requests.post(server_url, json=data, headers=headers, timeout=5)
+                if response.status_code == 200:
+                    return (server_url, True, None)
+                return (server_url, False, f"HTTP {response.status_code}")
+            except requests.exceptions.Timeout:
+                return (server_url, False, "timeout")
+            except requests.exceptions.ConnectionError:
+                return (server_url, False, "connection error")
+            except Exception as e:
+                return (server_url, False, str(e))
 
-            # Use ThreadPoolExecutor to send to all receivers in parallel
+        if server_urls:
             # Max 50 workers to avoid overwhelming the system even with 200+ receivers
             max_workers = min(50, len(server_urls))
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = {executor.submit(send_to_receiver, url): url for url in server_urls}
-                for future in as_completed(futures, timeout=10):
-                    try:
-                        url, success, error_msg = future.result()
+            try:
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    futures = {executor.submit(send_to_receiver, url): url for url in server_urls}
+                    for future in as_completed(futures, timeout=10):
+                        url = futures[future]
+                        finished.add(url)
+                        try:
+                            _, success, error_msg = future.result()
+                        except Exception as e:
+                            success, error_msg = False, str(e)
                         if success:
                             success_count += 1
                             print(f"✓ Sent to {url}")
                         else:
                             failed_urls.append(url)
                             print(f"✗ Failed to send to {url}: {error_msg}")
-                    except Exception as e:
-                        url = futures[future]
-                        failed_urls.append(url)
-                        print(f"✗ Exception sending to {url}: {e}")
+            except Exception as e:
+                print(f"✗ Lap send did not finish cleanly: {e}")
+        for url in server_urls:
+            if url not in finished and url not in failed_urls:
+                failed_urls.append(url)
 
-            # Report results
-            total_urls = len(server_urls)
-            if success_count == total_urls:
+        self.lap_send_finished.emit({
+            'data': data,
+            'lap_time': lap_time,
+            'success_count': success_count,
+            'total': len(server_urls),
+            'failed_urls': failed_urls,
+        })
+
+    def _on_lap_send_finished(self, result):
+        """GUI thread: report the outcome of a background lap send."""
+        try:
+            lap_time = float(result.get('lap_time', 0))
+            success_count = int(result.get('success_count', 0))
+            total_urls = int(result.get('total', 0))
+            data = result.get('data') or {}
+            if total_urls and success_count == total_urls:
                 self.show_success(f"✅ Lap time {lap_time:.3f}s sent successfully!")
             elif success_count > 0:
                 self.show_success(f"✅ Lap time {lap_time:.3f}s sent to {success_count}/{total_urls} receivers")
             else:
                 # All failed - add to retry queue
-                if data not in self.failed_lap_times:
+                if data and data not in self.failed_lap_times:
                     self.failed_lap_times.append(data)
                 self.show_error(f"❌ Failed to send to all {total_urls} receiver(s). Will retry automatically.")
         except Exception as e:
-            self.show_error(f"❌ Error preparing data: {str(e)}")
-            
+            self.show_error(f"❌ Error reporting lap send: {e}")
+
     def show_success(self, message):
         if "Lap time" in message:
             # Extract lap time for the last lap time display
@@ -10119,11 +10732,24 @@ class LapTimeSenderWindow(QMainWindow):
         """Called when the simulator ID dropdown changes."""
         try:
             sim_id = int(new_id)
+        except (TypeError, ValueError):
+            return
+        # Persist it: before this every PC came back as "Sim 1" after a
+        # reboot, so the Host Stand showed identical cards and sim1.local
+        # pointed at whichever machine answered first.
+        try:
+            settings = load_app_settings()
+            settings['simulator_id'] = sim_id
+            save_app_settings(settings)
+        except Exception as e:
+            print(f"[Settings] Could not save simulator ID: {e}")
+        try:
             # Update mDNS service with new simulator ID
             self.mdns_hostname = mdns_service.update_simulator_id(sim_id, self.web_port)
             self._update_mobile_url_display()
         except Exception as e:
             print(f"[mDNS] Error updating simulator ID: {e}")
+        self._update_sim_id_conflict_ui()
 
     def closeEvent(self, event):
         if self.current_monitor:
@@ -10180,6 +10806,7 @@ class LapTimeSenderWindow(QMainWindow):
         
         # Reset session state for new driver BEFORE starting video/timer
         self.timer_started = False
+        self.pending_extension_minutes = 0
         if hasattr(self, 'rotation_mode_selector') and self.rotation_mode_selector.currentText() == "Laps":
             self.lap_rotation_count = 0
             self.lap_count_started = False
@@ -10268,6 +10895,76 @@ class LapTimeSenderWindow(QMainWindow):
         """Called immediately when UDP broadcast discovers a new/updated simulator"""
         # Immediately refresh the UI with all known simulators from UDP listener
         self._refresh_from_udp_discovery()
+        self._update_sim_id_conflict_ui()
+
+    def get_sim_id_conflicts(self):
+        """IPs of other simulators announcing the same Simulator ID as this one."""
+        listener = getattr(self, 'discovery_listener', None)
+        if not listener or not hasattr(self, 'simulator_id'):
+            return []
+        try:
+            my_id = int(self.simulator_id.currentText())
+        except (TypeError, ValueError):
+            return []
+        conflicts = []
+        try:
+            for sim in listener.get_known_simulators():
+                try:
+                    if int(sim.get('simulator_id', -1)) == my_id and sim.get('ip') != self.local_ip:
+                        conflicts.append(sim.get('ip'))
+                except (TypeError, ValueError):
+                    continue
+        except Exception:
+            pass
+        return sorted(conflicts)
+
+    def _update_sim_id_conflict_ui(self):
+        """Red warning under the Simulator ID box while another PC uses the same ID."""
+        if not hasattr(self, 'sim_id_conflict_label'):
+            return
+        conflicts = self.get_sim_id_conflicts()
+        if conflicts:
+            self.sim_id_conflict_label.setText(
+                f"⚠️ Simulator ID {self.simulator_id.currentText()} is also used by {', '.join(conflicts)}. "
+                f"Give each sim its own ID or the Host Stand cannot tell them apart.")
+            self.sim_id_conflict_label.show()
+            self.simulator_id.setStyleSheet("QComboBox { border: 2px solid #f48771; }")
+        else:
+            self.sim_id_conflict_label.hide()
+            self.simulator_id.setStyleSheet("")
+
+    def extend_current_session(self, minutes=0, laps=0):
+        """Give the current driver more time or laps without restarting anything.
+
+        Host Stand's "+5 MIN" / "+1 LAP" button lands here via UIBridge.
+        Before this existed staff re-registered the driver's name to extend
+        them, which restarted the session and, on a multi-sim rig, often hit
+        the wrong sim.
+        """
+        if not getattr(self, 'session_active', False):
+            print("[EXTEND] Ignored: no active session")
+            return False
+        mode = self.rotation_mode_selector.currentText() if hasattr(self, 'rotation_mode_selector') else "Time"
+        driver = self.driver_name.text().strip() if hasattr(self, 'driver_name') else ""
+        if mode == "Time" and minutes > 0:
+            now = int(time.time())
+            if getattr(self, 'timer_started', False) and getattr(self, 'timer_end_timestamp', 0) > 0:
+                self.timer_end_timestamp = max(int(self.timer_end_timestamp), now) + minutes * 60
+                print(f"[EXTEND] +{minutes} min for {driver}; now ends at {self.timer_end_timestamp}")
+            else:
+                # Timer hasn't started yet (pre-session video still playing):
+                # applied the moment start_session_timer runs.
+                self.pending_extension_minutes = int(getattr(self, 'pending_extension_minutes', 0) or 0) + minutes
+                print(f"[EXTEND] +{minutes} min for {driver} queued until the timer starts")
+            self.show_success(f"⏱️ Session extended by {minutes} min for {driver}")
+            return True
+        if mode == "Laps" and laps > 0:
+            self.lap_rotation_target = int(getattr(self, 'lap_rotation_target', 0) or 0) + laps
+            print(f"[EXTEND] +{laps} lap(s) for {driver}; target now {self.lap_rotation_target}")
+            self.show_success(f"🏁 Session extended by {laps} lap(s) for {driver}")
+            return True
+        print(f"[EXTEND] Nothing to apply (mode={mode}, minutes={minutes}, laps={laps})")
+        return False
     
     def _refresh_from_udp_discovery(self):
         """Refresh simulator list using UDP-discovered simulators (instant, no network scan)"""
@@ -11134,67 +11831,80 @@ class LapTimeSenderWindow(QMainWindow):
                 self.timer_end_timestamp = int(time.time()) + (5 * 60)
                 self.timer_started = True  # Mark timer as actually started
                 print(f"⏱️ Session timer started: 5 minutes (fallback)")
+            extra = int(getattr(self, 'pending_extension_minutes', 0) or 0)
+            if extra > 0:
+                self.timer_end_timestamp += extra * 60
+                self.pending_extension_minutes = 0
+                print(f"⏱️ Applied pending extension: +{extra} min")
+
+    def _receiver_urls(self):
+        """Receiver base URLs from the saved (comma-separated) setting."""
+        current = getattr(self, 'current_server_url', '') or ''
+        return [u.strip() for u in str(current).split(',') if u.strip()]
+
+    def _post_to_receivers_async(self, path, data, label, on_any_ok=None):
+        """POST `data` to `path` on every receiver from a daemon thread.
+
+        These calls used to run on the GUI thread with a 2 s timeout each, so
+        a slow or stale receiver address froze the window (and the waiting
+        overlay / video with it) right as a driver was being seated.
+        """
+        urls = self._receiver_urls()
+        if not urls:
+            return
+
+        def worker():
+            any_ok = False
+            for server_url in urls:
+                try:
+                    response = requests.post(f"{server_url}{path}", json=data, timeout=2.0)
+                    if response.ok:
+                        any_ok = True
+                        print(f"[QUEUE] {label} reported to {server_url}")
+                except Exception as e:
+                    print(f"[QUEUE] Could not notify {server_url} of {label}: {e}")
+            if any_ok and on_any_ok:
+                try:
+                    on_any_ok()
+                except Exception:
+                    pass
+
+        threading.Thread(target=worker, name=f"notify-{label}", daemon=True).start()
 
     def _notify_session_started(self):
         """Notify the receiver that a session has started (for queue wait time tracking)"""
         try:
-            if hasattr(self, 'current_server_url') and self.current_server_url:
-                driver_name = self.driver_name.text() if hasattr(self, 'driver_name') else ""
-                queue_id = getattr(self, 'assigned_queue_id', None)
-                data = {
-                    'simulator_ip': get_local_ip(),
-                    'driver_name': driver_name,
-                    'queue_id': queue_id or '',
-                    'session_id': getattr(self, 'current_session_id', ''),
-                    'email': getattr(self, 'last_driver_email', ''),
-                    'phone': getattr(self, 'last_driver_phone', ''),
-                    'survey_answers': dict(getattr(self, 'last_survey_answers', {}) or {})
-                }
-                # current_server_url may hold several comma-separated receivers
-                any_ok = False
-                for server_url in [u.strip() for u in str(self.current_server_url).split(',') if u.strip()]:
-                    try:
-                        response = requests.post(
-                            f"{server_url}/api/session/started",
-                            json=data,
-                            timeout=2.0
-                        )
-                        if response.ok:
-                            any_ok = True
-                    except Exception as e:
-                        print(f"[QUEUE] Could not notify {server_url} of session start: {e}")
-                if any_ok:
-                    print(f"[QUEUE] Session start reported to receiver(s)")
-                    # Clear assigned queue ID after session starts
-                    self.assigned_queue_id = None
+            driver_name = self.driver_name.text() if hasattr(self, 'driver_name') else ""
+            queue_id = getattr(self, 'assigned_queue_id', None)
+            data = {
+                'simulator_ip': get_local_ip(),
+                'driver_name': driver_name,
+                'queue_id': queue_id or '',
+                'session_id': getattr(self, 'current_session_id', ''),
+                'email': getattr(self, 'last_driver_email', ''),
+                'phone': getattr(self, 'last_driver_phone', ''),
+                'survey_answers': dict(getattr(self, 'last_survey_answers', {}) or {})
+            }
+
+            def clear_queue_id():
+                # Clear assigned queue ID once a receiver has the session start
+                self.assigned_queue_id = None
+
+            self._post_to_receivers_async('/api/session/started', data, 'session start', clear_queue_id)
         except Exception as e:
             print(f"[QUEUE] Could not notify receiver of session start: {e}")
 
     def _notify_session_ended(self):
         """Notify the receiver that a session has ended (for queue wait time tracking)"""
         try:
-            if hasattr(self, 'current_server_url') and self.current_server_url:
-                # Calculate session duration
-                duration = 0
-                if hasattr(self, 'session_start_timestamp') and self.session_start_timestamp > 0:
-                    duration = int(time.time()) - self.session_start_timestamp
-
-                data = {
-                    'simulator_ip': get_local_ip(),
-                    'duration_seconds': duration
-                }
-                # current_server_url may hold several comma-separated receivers
-                for server_url in [u.strip() for u in str(self.current_server_url).split(',') if u.strip()]:
-                    try:
-                        response = requests.post(
-                            f"{server_url}/api/session/ended",
-                            json=data,
-                            timeout=2.0
-                        )
-                        if response.ok:
-                            print(f"[QUEUE] Session end reported to {server_url} (duration: {duration}s)")
-                    except Exception as e:
-                        print(f"[QUEUE] Could not notify {server_url} of session end: {e}")
+            duration = 0
+            if hasattr(self, 'session_start_timestamp') and self.session_start_timestamp > 0:
+                duration = int(time.time()) - self.session_start_timestamp
+            data = {
+                'simulator_ip': get_local_ip(),
+                'duration_seconds': duration
+            }
+            self._post_to_receivers_async('/api/session/ended', data, f'session end ({duration}s)')
         except Exception as e:
             print(f"[QUEUE] Could not notify receiver of session end: {e}")
 
@@ -11628,6 +12338,18 @@ class LapTimeSenderWindow(QMainWindow):
             return False
 
 def main():
+    # Console output is UTF-8 with replacement, never strict cp1252: an emoji
+    # in a print() inside a Qt slot used to raise UnicodeEncodeError when
+    # stdout was a redirected file, and PyQt aborts the whole process on an
+    # unhandled slot exception (the Sender vanished the moment a driver was
+    # registered). Windowed builds have no stdout, so this is a no-op there.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if stream is not None and hasattr(stream, 'reconfigure'):
+                stream.reconfigure(encoding='utf-8', errors='replace')
+        except Exception:
+            pass
+
     app = QApplication(sys.argv)
 
     # Load SMS configuration for queue notifications
