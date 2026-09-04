@@ -20,7 +20,8 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                             QHBoxLayout, QLabel, QLineEdit, QPushButton,
                             QMessageBox, QFormLayout, QComboBox, QGridLayout, QFrame,
                             QCheckBox, QTableWidget, QTableWidgetItem, QDialog,
-                            QAbstractItemView, QHeaderView, QScrollArea)
+                            QAbstractItemView, QHeaderView, QScrollArea,
+                            QTabWidget)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QObject, QUrl
 from PyQt6.QtGui import QImage, QPixmap, QIcon, QFont, QColor
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
@@ -8755,426 +8756,75 @@ class LapTimeSenderWindow(QMainWindow):
             }
         """)
 
-        # Central widget setup
+        # ------------------------------------------------------------------
+        # Layout: header -> EVENT MODE switch (Top 10 vs Sector Challenge)
+        # with only that mode's settings showing -> live strip -> tabs for
+        # everything that is the same in both modes. Every widget keeps the
+        # attribute name the rest of the app uses.
+        # ------------------------------------------------------------------
         central_widget = QWidget()
+        central_widget.setObjectName("centralRoot")
         self.setCentralWidget(central_widget)
+        central_widget.setStyleSheet(self._ui_stylesheet())
         main_layout = QVBoxLayout(central_widget)
-        main_layout.setContentsMargins(8, 8, 8, 8)  # Compact margins
-        main_layout.setSpacing(6)  # Tighter spacing between sections
-        
-        # Create a "card" container with modern dark styling
-        card = QWidget()
-        # Scope style to this container only to avoid bleeding into children
-        card.setObjectName("mainCard")
-        card.setStyleSheet("""
-            #mainCard {
-                background-color: #252526;
-                border-radius: 8px;
-                border: 1px solid #3e3e42;
-            }
-        """)
-        card_layout = QVBoxLayout(card)
-        card_layout.setContentsMargins(10, 10, 10, 10)  # Compact margins
-        card_layout.setSpacing(6)  # Tighter spacing between sections
-        
-        # Title with subtitle for clarity
-        title_widget = QWidget()
-        title_layout = QVBoxLayout(title_widget)
-        title_layout.setContentsMargins(0, 0, 0, 0)
-        title_layout.setSpacing(2)
-        
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
+
+        page = QWidget()
+        page.setObjectName("page")
+        page_layout = QVBoxLayout(page)
+        page_layout.setContentsMargins(14, 12, 14, 14)
+        page_layout.setSpacing(10)
+
+        # ===== HEADER: identity + game connection ==========================
+        header, header_layout = self._card("headerCard", QHBoxLayout)
+        header_layout.setSpacing(14)
+
+        title_col = QVBoxLayout()
+        title_col.setSpacing(0)
         title = QLabel("🏁 Lap Time Sender")
-        title.setStyleSheet("""
-            QLabel {
-                font-size: 20px;
-                font-weight: 700;
-                color: #cccccc;
-                margin-bottom: 2px;
-                font-family: 'Segoe UI', 'Arial', sans-serif;
-            }
-        """)
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        title_layout.addWidget(title)
-        
-        subtitle = QLabel("Professional Racing Telemetry & Leaderboard Interface")
-        subtitle.setStyleSheet("""
-            QLabel {
-                font-size: 11px;
-                color: #9d9d9d;
-                font-style: italic;
-                margin-bottom: 2px;
-                font-family: 'Segoe UI', 'Arial', sans-serif;
-            }
-        """)
-        subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        subtitle.setWordWrap(True)
-        title_layout.addWidget(subtitle)
-        
-        card_layout.addWidget(title_widget)
-        
-        # === TOP ROW: Mobile Interface (left) + Live Status (right) ===
-        top_row = QHBoxLayout()
-        top_row.setSpacing(8)
-        
-        # LEFT: Mobile Interface section
-        mobile_section = QWidget()
-        mobile_section.setObjectName("mobileSection")
-        mobile_section.setStyleSheet("""
-            #mobileSection {
-                background-color: #2d2d30;
-                border-radius: 6px;
-                border: 1px solid #3e3e42;
-            }
-        """)
-        mobile_layout = QHBoxLayout(mobile_section)
-        mobile_layout.setContentsMargins(10, 8, 10, 8)
-        mobile_layout.setSpacing(8)
-        
-        # Mobile info text container
-        info_text_layout = QVBoxLayout()
-        info_text_layout.setSpacing(2)
-        
-        # URL info label - stored as instance variable for dynamic updates
-        self.url_info_label = QLabel(f"📱 Mobile Interface: http://{get_local_ip()}:{self.web_port}")
-        self.url_info_label.setStyleSheet("""
-            QLabel {
-                color: #cccccc;
-                font-size: 11px;
-                font-weight: 600;
-                font-family: 'Segoe UI', 'Arial', sans-serif;
-            }
-        """)
-        self.url_info_label.setWordWrap(True)
+        title.setObjectName("appTitle")
+        subtitle = QLabel("Sends this simulator's laps to the leaderboard")
+        subtitle.setObjectName("appSubtitle")
+        title_col.addWidget(title)
+        title_col.addWidget(subtitle)
+        header_layout.addLayout(title_col, 1)
 
-        access_info = QLabel("✨ Scan QR or type the address above")
-        access_info.setStyleSheet("""
-            QLabel {
-                color: #9d9d9d;
-                font-size: 10px;
-                font-family: 'Segoe UI', 'Arial', sans-serif;
-            }
-        """)
-        access_info.setWordWrap(True)
-
-        # Available pages info
-        pages_info = QLabel(
-            "<b style='color:#007acc;'>📋 Available Pages:</b><br>"
-            "&nbsp;&nbsp;<b>/</b> — Registration &nbsp;•&nbsp; "
-            "<b>/admin</b> — Dashboard &nbsp;•&nbsp; "
-            "<b>/queue</b> — Queue"
-        )
-        pages_info.setStyleSheet("""
-            QLabel {
-                color: #9d9d9d;
-                font-size: 9px;
-                font-family: 'Segoe UI', 'Arial', sans-serif;
-                margin-top: 4px;
-            }
-        """)
-        pages_info.setWordWrap(True)
-
-        info_text_layout.addWidget(self.url_info_label)
-        info_text_layout.addWidget(access_info)
-        info_text_layout.addWidget(pages_info)
-        mobile_layout.addLayout(info_text_layout, stretch=1)
-
-        # QR code - stored as instance variable for dynamic updates
-        qr_code = self.generate_qr_code(f"http://{get_local_ip()}:{self.web_port}")
-        self.qr_label = QLabel()
-        self.qr_label.setPixmap(qr_code)
-        self.qr_label.setFixedSize(170, 170)  # Fixed size for consistent display
-        self.qr_label.setScaledContents(False)  # Don't scale - keep QR code sharp
-        self.qr_label.setStyleSheet("""
-            QLabel {
-                background-color: #ffffff;
-                padding: 5px;
-                border-radius: 6px;
-                border: 1px solid #3e3e42;
-            }
-        """)
-        self.qr_label.setToolTip("Scan with phone/tablet to access driver interface")
-        self.qr_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        mobile_layout.addWidget(self.qr_label)
-        
-        top_row.addWidget(mobile_section, stretch=3)
-        
-        # RIGHT: Live Racing Status section (compact)
-        status_section = QWidget()
-        status_section.setObjectName("statusSection")
-        status_section.setStyleSheet("""
-            #statusSection {
-                background-color: #2d2d30;
-                border-radius: 6px;
-                border: 1px solid #3e3e42;
-            }
-        """)
-        status_layout = QVBoxLayout(status_section)
-        status_layout.setContentsMargins(10, 6, 10, 6)
-        status_layout.setSpacing(4)
-        
-        # Status header
-        status_header = QLabel("📊 Live Racing Status")
-        status_header.setStyleSheet("""
-            QLabel {
-                font-weight: 700;
-                font-size: 12px;
-                color: #cccccc;
-                font-family: 'Segoe UI', 'Arial', sans-serif;
-            }
-        """)
-        status_layout.addWidget(status_header)
-        
-        # Game connection status
-        game_status_row = QHBoxLayout()
-        game_status_row.setSpacing(4)
-        status_title = QLabel("Game:")
-        status_title.setStyleSheet("""
-            QLabel {
-                font-weight: 600;
-                color: #9d9d9d;
-                font-size: 11px;
-                font-family: 'Segoe UI', 'Arial', sans-serif;
-            }
-        """)
-        status_title.setFixedWidth(40)
-        game_status_row.addWidget(status_title)
-        
-        self.game_status = QLabel("Initializing...")
-        self.game_status.setWordWrap(True)
-        self.game_status.setStyleSheet("""
-            QLabel {
-                color: #cccccc;
-                font-size: 11px;
-                padding: 4px 8px;
-                background-color: #1e1e1e;
-                border-radius: 4px;
-                font-family: 'Segoe UI', 'Arial', sans-serif;
-            }
-        """)
-        game_status_row.addWidget(self.game_status, 1)
-        status_layout.addLayout(game_status_row)
-        
-        # Last lap time display
-        lap_time_row = QHBoxLayout()
-        lap_time_row.setSpacing(4)
-        lap_time_title = QLabel("Lap:")
-        lap_time_title.setStyleSheet("""
-            QLabel {
-                font-weight: 600;
-                color: #9d9d9d;
-                font-size: 11px;
-                font-family: 'Segoe UI', 'Arial', sans-serif;
-            }
-        """)
-        lap_time_title.setFixedWidth(40)
-        lap_time_row.addWidget(lap_time_title)
-        
-        self.status_label = QLabel("Waiting...")
-        self.status_label.setStyleSheet("""
-            QLabel {
-                color: #cccccc;
-                font-size: 12px;
-                font-weight: 700;
-                padding: 4px 8px;
-                background-color: #1e1e1e;
-                border-radius: 4px;
-                font-family: 'Consolas', 'Monaco', monospace;
-            }
-        """)
-        self.status_label.setToolTip("Shows the most recent lap time sent to the leaderboard")
-        lap_time_row.addWidget(self.status_label, 1)
-        status_layout.addLayout(lap_time_row)
-        
-        # Waiting screen button
-        self.toggle_waiting_screen_btn = QPushButton("Show Waiting Screen")
-        self.toggle_waiting_screen_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #007acc;
-                color: #ffffff;
-                border: none;
-                padding: 4px 10px;
-                border-radius: 4px;
-                font-weight: 600;
-                font-size: 10px;
-                font-family: 'Segoe UI', 'Arial', sans-serif;
-            }
-            QPushButton:hover {
-                background-color: #0098ff;
-            }
-        """)
-        self.toggle_waiting_screen_btn.clicked.connect(self.toggle_waiting_screen)
-        self.toggle_waiting_screen_btn.setToolTip("Show/hide the full-screen waiting overlay")
-        status_layout.addWidget(self.toggle_waiting_screen_btn)
-        
-        top_row.addWidget(status_section, stretch=2)
-        
-        card_layout.addLayout(top_row)
-        
-        # === CONFIG ROW: Server Connection (left) + Racing Config (right) ===
-        config_row = QHBoxLayout()
-        config_row.setSpacing(8)
-        
-        # LEFT: Server Configuration Section
-        server_section = QWidget()
-        server_section.setObjectName("serverSection")
-        server_section.setStyleSheet("""
-            #serverSection {
-                background-color: #2d2d30;
-                border-radius: 6px;
-                border: 1px solid #3e3e42;
-            }
-        """)
-        server_section_layout = QVBoxLayout(server_section)
-        server_section_layout.setContentsMargins(10, 8, 10, 8)
-        server_section_layout.setSpacing(6)
-        
-        server_header = QLabel("🌐 Leaderboard Server Connection")
-        server_header.setStyleSheet("""
-            QLabel {
-                font-weight: 700;
-                font-size: 12px;
-                color: #cccccc;
-                font-family: 'Segoe UI', 'Arial', sans-serif;
-            }
-        """)
-        server_section_layout.addWidget(server_header)
-        
-        # Server URL input row
-        server_url_row = QHBoxLayout()
-        server_url_row.setSpacing(6)
-        
-        url_label = QLabel("Server URL:")
-        url_label.setStyleSheet("""
-            QLabel {
-                font-weight: 600;
-                font-size: 11px;
-                color: #9d9d9d;
-                font-family: 'Segoe UI', 'Arial', sans-serif;
-            }
-        """)
-        url_label.setFixedWidth(65)
-        url_label.setToolTip("Address of the leaderboard server where lap times will be sent")
-        server_url_row.addWidget(url_label)
-        
-        self.server_url = QLineEdit(self.current_server_url)
-        self.server_url.textChanged.connect(self.on_server_url_changed)
-        self.server_url.setToolTip("Enter receiver URL(s). Use commas for multiple receivers:\nhttp://192.168.1.100:5000, http://192.168.1.101:5000")
-        self.server_url.setStyleSheet("""
-            QLineEdit {
-                background-color: #1e1e1e;
-                border: 1px solid #3e3e42;
-                color: #cccccc;
-                font-family: 'Consolas', 'Monaco', monospace;
-                font-size: 11px;
-                padding: 4px 6px;
-            }
-            QLineEdit:focus {
-                background-color: #1e1e1e;
-                border: 1px solid #007acc;
-                color: #ffffff;
-            }
-            QLineEdit::placeholder {
-                color: #6e6e6e;
-            }
-        """)
-        server_url_row.addWidget(self.server_url, 1)
-        
-        test_connection_btn = QPushButton("Test")
-        test_connection_btn.setFixedWidth(50)
-        test_connection_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #4ec9b0;
-                color: #1e1e1e;
-                border: none;
-                padding: 5px 8px;
-                border-radius: 4px;
-                font-weight: 600;
-                font-size: 10px;
-                font-family: 'Segoe UI', 'Arial', sans-serif;
-            }
-            QPushButton:hover {
-                background-color: #6fd9c4;
-            }
-        """)
-        test_connection_btn.setObjectName("test-connection")
-        test_connection_btn.clicked.connect(self.test_and_save_connection)
-        test_connection_btn.setToolTip("Test if the server is reachable and save URL if successful")
-        server_url_row.addWidget(test_connection_btn)
-        
-        server_section_layout.addLayout(server_url_row)
-        config_row.addWidget(server_section, stretch=3)
-        
-        # RIGHT: Racing Configuration Section
-        racing_section = QWidget()
-        racing_section.setObjectName("racingSection")
-        racing_section.setStyleSheet("""
-            #racingSection {
-                background-color: #2d2d30;
-                border-radius: 6px;
-                border: 1px solid #3e3e42;
-            }
-        """)
-        racing_section_layout = QVBoxLayout(racing_section)
-        racing_section_layout.setContentsMargins(10, 8, 10, 8)
-        racing_section_layout.setSpacing(6)
-        
-        racing_header = QLabel("🏁 Racing Simulator Configuration")
-        racing_header.setStyleSheet("""
-            QLabel {
-                font-weight: 700;
-                font-size: 12px;
-                color: #cccccc;
-                font-family: 'Segoe UI', 'Arial', sans-serif;
-            }
-        """)
-        racing_section_layout.addWidget(racing_header)
-        
-        # Simulator configuration row
+        sim_col = QVBoxLayout()
+        sim_col.setSpacing(4)
         simulator_row = QHBoxLayout()
         simulator_row.setSpacing(6)
-        
-        simulator_id_label = QLabel("Simulator ID:")
-        simulator_id_label.setStyleSheet("""
-            QLabel {
-                font-weight: 600;
-                font-size: 11px;
-                color: #9d9d9d;
-                font-family: 'Segoe UI', 'Arial', sans-serif;
-            }
-        """)
-        simulator_id_label.setFixedWidth(70)
-        simulator_id_label.setToolTip("Unique identifier for this racing setup (1-99)")
-        
+        simulator_id_label = QLabel("This is")
+        simulator_id_label.setObjectName("fieldLabel")
+        simulator_id_label.setToolTip("Unique number for this racing simulator (1-99). Every sim at the event needs its own.")
         self.simulator_id = QComboBox()
         self.simulator_id.addItems([str(i) for i in range(1, 100)])
-        self.simulator_id.setFixedWidth(50)
+        self.simulator_id.setFixedWidth(64)
         self.simulator_id.setToolTip("Select a unique ID number for this racing simulator")
         self.simulator_id.currentTextChanged.connect(self._on_simulator_id_changed)
-
-        game_label = QLabel("Racing Game:")
-        game_label.setStyleSheet("""
-            QLabel {
-                font-weight: 600;
-                font-size: 11px;
-                color: #9d9d9d;
-                font-family: 'Segoe UI', 'Arial', sans-serif;
-            }
-        """)
-        game_label.setFixedWidth(75)
+        sim_word = QLabel("Sim")
+        sim_word.setObjectName("fieldLabel")
+        game_label = QLabel("running")
+        game_label.setObjectName("fieldLabel")
         game_label.setToolTip("Select which racing simulator you'll be using")
-        
         self.game_selector = QComboBox()
         for game_name in self.AVAILABLE_GAMES.keys():
             self.game_selector.addItem(game_name)
         self.game_selector.currentTextChanged.connect(self.on_game_changed)
         self.game_selector.setToolTip("Choose between supported racing simulators")
-        
+        self.game_selector.setMinimumWidth(150)
         simulator_row.addWidget(simulator_id_label)
+        simulator_row.addWidget(sim_word)
         simulator_row.addWidget(self.simulator_id)
         simulator_row.addWidget(game_label)
-        simulator_row.addWidget(self.game_selector, 1)
+        simulator_row.addWidget(self.game_selector)
+        sim_col.addLayout(simulator_row)
 
-        racing_section_layout.addLayout(simulator_row)
+        # Game connection state, right under the game it refers to
+        self.game_status = QLabel("Initializing...")
+        self.game_status.setObjectName("gameStatus")
+        self.game_status.setWordWrap(True)
+        sim_col.addWidget(self.game_status)
 
         # Shown when another PC on the network announces the same Simulator ID
         self.sim_id_conflict_label = QLabel("")
@@ -9182,182 +8832,153 @@ class LapTimeSenderWindow(QMainWindow):
         self.sim_id_conflict_label.setStyleSheet(
             "color: #f48771; font-size: 11px; font-weight: 600; padding: 2px 0;")
         self.sim_id_conflict_label.hide()
-        racing_section_layout.addWidget(self.sim_id_conflict_label)
-        config_row.addWidget(racing_section, stretch=2)
-        
-        card_layout.addLayout(config_row)
+        sim_col.addWidget(self.sim_id_conflict_label)
+        header_layout.addLayout(sim_col)
+        page_layout.addWidget(header)
 
-        # Network Simulators Section - Auto-discovered, read-only display
-        simulators_section = QWidget()
-        simulators_section.setObjectName("simulatorsSection")
-        simulators_section.setStyleSheet("""
-            #simulatorsSection {
-                background-color: #2d2d30;
-                border-radius: 6px;
-                border: 1px solid #3e3e42;
-            }
-        """)
-        simulators_layout = QVBoxLayout(simulators_section)
-        simulators_layout.setContentsMargins(10, 6, 10, 6)
-        simulators_layout.setSpacing(4)
-        
-        # Header row with title and explanation on same line
-        sim_header_row = QHBoxLayout()
-        sim_header_row.setSpacing(8)
-        
-        sim_header = QLabel("🖥️ Network Simulators")
-        sim_header.setStyleSheet("""
-            QLabel {
-                font-weight: 700;
-                font-size: 12px;
-                color: #cccccc;
-                font-family: 'Segoe UI', 'Arial', sans-serif;
-            }
-        """)
-        sim_header_row.addWidget(sim_header)
-        
-        sim_explanation = QLabel("Auto-discovered simulators on your network")
-        sim_explanation.setStyleSheet("""
-            QLabel {
-                font-size: 10px;
-                color: #9d9d9d;
-            }
-        """)
-        sim_header_row.addWidget(sim_explanation)
-        sim_header_row.addStretch()
-        simulators_layout.addLayout(sim_header_row)
-        
-        # List of discovered simulators
-        self.simulators_list = QVBoxLayout()
-        self.simulators_list.setSpacing(2)
-        simulators_layout.addLayout(self.simulators_list)
-        
-        card_layout.addWidget(simulators_section)
-        
-        # Populate the list initially and start auto-refresh
-        QTimer.singleShot(500, self.refresh_network_simulators_ui)
-        
-        # Auto-refresh simulator list every 5 seconds (UDP discovery updates instantly via signal)
-        self.simulator_refresh_timer = QTimer(self)
-        self.simulator_refresh_timer.timeout.connect(self.refresh_network_simulators_ui)
-        self.simulator_refresh_timer.start(5000)  # 5 seconds (reduced from 10)
+        # ===== EVENT MODE: the one choice that changes what the event is ====
+        mode_card, mode_layout = self._card("modeCard", QVBoxLayout)
+        mode_layout.setSpacing(8)
 
-        # Custom Sectors section (Assetto Corsa sector challenge)
-        sector_section = QWidget()
-        sector_section.setObjectName("sectorSection")
-        sector_section.setStyleSheet("""
-            #sectorSection {
-                background-color: #2d2d30;
-                border-radius: 6px;
-                border: 1px solid #3e3e42;
-            }
-        """)
-        sector_layout = QVBoxLayout(sector_section)
-        sector_layout.setContentsMargins(10, 6, 10, 6)
-        sector_layout.setSpacing(4)
+        mode_heading = QLabel("EVENT MODE")
+        mode_heading.setObjectName("cardHeading")
+        mode_layout.addWidget(mode_heading)
 
-        sector_header_row = QHBoxLayout()
-        sector_title = QLabel("🏁 Custom Sectors (Assetto Corsa)")
-        sector_title.setStyleSheet("font-size: 12px; font-weight: bold; color: #e0e0e0;")
-        sector_header_row.addWidget(sector_title)
-        sector_header_row.addStretch()
+        mode_buttons = QHBoxLayout()
+        mode_buttons.setSpacing(10)
+        self.mode_top10_btn = QPushButton("🏆  TOP 10 LEADERBOARD\nDrivers take turns; best lap times rank on the board")
+        self.mode_sector_btn = QPushButton("⏱️  SECTOR CHALLENGE\nBeat every sector's target time or the run ends")
+        for btn in (self.mode_top10_btn, self.mode_sector_btn):
+            btn.setObjectName("modeButton")
+            btn.setCheckable(True)
+            btn.setMinimumHeight(64)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            mode_buttons.addWidget(btn, 1)
+        self.mode_top10_btn.setToolTip("Standard event: each driver gets a timed or lap-limited turn and their laps go to the Top 10 board")
+        self.mode_sector_btn.setToolTip("Assetto Corsa only: the track is split into sectors with target times; miss one and the car is reset for the next driver")
+        mode_layout.addLayout(mode_buttons)
 
-        # Where a failed driver is put back, and whether the in-game app that
-        # can do it is actually running. Without it the fallback restarts the
-        # AC session, which spawns wherever the session does - the pits in
-        # Practice - so this needs to be visible, not buried in a config file.
+        # The checkbox the rest of the app (and the saved config) keys off;
+        # the two big buttons above drive it.
+        self.sector_challenge_enabled = QCheckBox("Enable Sector Challenge")
+        self.sector_challenge_enabled.setChecked(bool(self.sector_config.get('enabled')))
+        self.sector_challenge_enabled.toggled.connect(self.on_sector_challenge_toggled)
+        self.sector_challenge_enabled.hide()
+
+        # --- Top 10 panel ------------------------------------------------
+        top10_panel = QWidget()
+        top10_layout = QVBoxLayout(top10_panel)
+        top10_layout.setContentsMargins(0, 4, 0, 0)
+        top10_layout.setSpacing(6)
+        top10_help = QLabel("Each driver registers on the iPad, drives their turn, and every lap is sent to the "
+                            "leaderboard. Set how long a turn lasts:")
+        top10_help.setObjectName("helpText")
+        top10_help.setWordWrap(True)
+        top10_layout.addWidget(top10_help)
+
+        rotation_row = QHBoxLayout()
+        rotation_row.setSpacing(8)
+        rotation_mode_label = QLabel("Turn length by")
+        rotation_mode_label.setObjectName("fieldLabel")
+        rotation_mode_label.setToolTip("Switch between time-based and lap-based driver rotation")
+        self.rotation_mode_selector = QComboBox()
+        self.rotation_mode_selector.addItems(["Time", "Laps"])
+        self.rotation_mode_selector.setToolTip("Choose rotation mode: by time or by laps")
+        self.rotation_mode_selector.setFixedWidth(90)
+        rotation_row.addWidget(rotation_mode_label)
+        rotation_row.addWidget(self.rotation_mode_selector)
+
+        self.minutes_label = QLabel("Minutes per driver")
+        self.minutes_label.setObjectName("fieldLabel")
+        self.driver_timer_minutes = QLineEdit("55")
+        self.driver_timer_minutes.setFixedWidth(64)
+        self.driver_timer_minutes.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.driver_timer_minutes.setToolTip("Duration in minutes for each driver's turn")
+        rotation_row.addWidget(self.minutes_label)
+        rotation_row.addWidget(self.driver_timer_minutes)
+
+        self.lap_count_label = QLabel("Laps per driver")
+        self.lap_count_label.setObjectName("fieldLabel")
+        self.lap_target_input = QLineEdit("10")
+        self.lap_target_input.setFixedWidth(64)
+        self.lap_target_input.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lap_target_input.setToolTip("Number of laps before driver swap alert")
+        rotation_row.addWidget(self.lap_count_label)
+        rotation_row.addWidget(self.lap_target_input)
+
+        rotation_row.addStretch(1)
+        apply_rotation_btn = QPushButton("Apply")
+        apply_rotation_btn.setObjectName("primaryButton")
+        apply_rotation_btn.setToolTip("Apply the turn length (also applies the sign-up and screen settings)")
+        apply_rotation_btn.clicked.connect(self.on_update_driver_settings)
+        rotation_row.addWidget(apply_rotation_btn)
+        top10_layout.addLayout(rotation_row)
+
+        # Hidden legacy timer widgets other code still references
+        self.timer_label = QLabel()
+        self.timer_label.setVisible(False)
+        self.driver_timer_enabled = QPushButton()
+        self.driver_timer_enabled.setVisible(False)
+        # Time input shares its slot with laps, switched by mode
+        self.time_count_label = self.minutes_label
+        self.time_target_input = self.driver_timer_minutes
+        self.rotation_mode_selector.currentTextChanged.connect(self.on_rotation_mode_changed)
+        self.on_rotation_mode_changed(self.rotation_mode_selector.currentText())
+        mode_layout.addWidget(top10_panel)
+
+        # --- Sector Challenge panel --------------------------------------
+        sector_panel = QWidget()
+        sector_layout = QVBoxLayout(sector_panel)
+        sector_layout.setContentsMargins(0, 4, 0, 0)
+        sector_layout.setSpacing(6)
+
+        # Live line: is the in-game reset app there, and is the challenge armed?
         self.csp_status_label = QLabel("Reset: checking...")
-        self.csp_status_label.setStyleSheet("font-size: 11px; color: #9d9d9d;")
+        self.csp_status_label.setObjectName("statusLine")
+        self.csp_status_label.setWordWrap(True)
         self.csp_status_label.setToolTip(
             "Whether the LeaderboardSector CSP app is running in Assetto Corsa.\n"
             "Connected: the car is teleported to the spawn chosen here.\n"
             "Not found: AC's session is restarted instead (Ctrl+O), which puts\n"
             "the car wherever that session type spawns - usually the pits."
         )
-        sector_header_row.addWidget(self.csp_status_label)
-
-        self.teleport_spawn_combo = QComboBox()
-        self.teleport_spawn_combo.addItem("Reset to: Before start/finish", "HOTLAP_START")
-        self.teleport_spawn_combo.addItem("Reset to: Starting grid", "START")
-        self.teleport_spawn_combo.addItem("Reset to: Pits", "PIT")
-        self.teleport_spawn_combo.setStyleSheet("font-size: 11px; color: #e0e0e0;")
-        self.teleport_spawn_combo.setToolTip(
-            "Where a driver is put after missing a sector. 'Before start/finish'\n"
-            "starts the next driver immediately. Needs the CSP app - see the\n"
-            "status to the left."
-        )
-        spawn_index = self.teleport_spawn_combo.findData(
-            self.sector_config.get('teleport_spawn', 'HOTLAP_START'))
-        if spawn_index >= 0:
-            self.teleport_spawn_combo.setCurrentIndex(spawn_index)
-        self.teleport_spawn_combo.currentIndexChanged.connect(self.on_teleport_spawn_changed)
-        sector_header_row.addWidget(self.teleport_spawn_combo)
-
-        # Poll the companion app's heartbeat so the label reflects reality
+        sector_layout.addWidget(self.csp_status_label)
         self._csp_status_timer = QTimer(self)
         self._csp_status_timer.timeout.connect(self._update_csp_status)
         self._csp_status_timer.start(2000)
-        self._update_csp_status()
-
-        self.ignore_out_lap_checkbox = QCheckBox("Ignore out lap")
-        self.ignore_out_lap_checkbox.setStyleSheet("font-size: 11px; color: #e0e0e0;")
-        self.ignore_out_lap_checkbox.setChecked(bool(self.sector_config.get('ignore_out_lap', True)))
-        self.ignore_out_lap_checkbox.setToolTip(
-            "On (recommended): timing starts when the car crosses the start/finish line,\n"
-            "so driving out of the pits is not scored.\n"
-            "Off: timing starts as soon as the car rolls, which counts the out lap."
-        )
-        self.ignore_out_lap_checkbox.toggled.connect(self.on_ignore_out_lap_toggled)
-        sector_header_row.addWidget(self.ignore_out_lap_checkbox)
-
-        self.sector_challenge_enabled = QCheckBox("Enable Sector Challenge")
-        self.sector_challenge_enabled.setStyleSheet("font-size: 11px; color: #e0e0e0;")
-        self.sector_challenge_enabled.setChecked(bool(self.sector_config.get('enabled')))
-        self.sector_challenge_enabled.toggled.connect(self.on_sector_challenge_toggled)
-        sector_header_row.addWidget(self.sector_challenge_enabled)
-        sector_layout.addLayout(sector_header_row)
 
         sector_help = QLabel(
-            "Each row is one sector: where it STARTS (% of the track) and how long the driver has to "
-            "get through it. A sector runs until the next sector's start; the last sector always ends at "
-            "the finish line, so no 100% row is needed. Target times are plain seconds (30, 90, 145) or "
-            "M:SS.mmm (1:30 or 1:30.500) - both mean the same thing. Miss a target and the run ends: the "
-            "car teleports back to start/finish (LeaderboardSector CSP app; Ctrl+O fallback without it) "
-            "and the waiting screen comes up for the next driver."
+            "One row per sector: where it starts (% of the track) and the time allowed to get through it. "
+            "The last sector runs to the finish line. Miss a target and the run ends: the car goes back to "
+            "the line and the waiting screen comes up for the next driver."
         )
+        sector_help.setObjectName("helpText")
         sector_help.setWordWrap(True)
-        sector_help.setStyleSheet("font-size: 10px; color: #9d9d9d;")
         sector_layout.addWidget(sector_help)
 
         self.sector_table = QTableWidget(0, 3)
-        self.sector_table.setHorizontalHeaderLabels(["Sector Start %", "Target Time", "Covers"])
+        self.sector_table.setHorizontalHeaderLabels(["Sector starts at (%)", "Target time", "Covers"])
         self.sector_table.horizontalHeader().setStretchLastSection(True)
-        self.sector_table.verticalHeader().setDefaultSectionSize(24)
+        self.sector_table.setColumnWidth(0, 170)
+        self.sector_table.setColumnWidth(1, 140)
+        self.sector_table.verticalHeader().setDefaultSectionSize(26)
+        self.sector_table.setMinimumHeight(150)
+        self.sector_table.setToolTip(
+            "Target times are plain seconds (30, 90, 145) or M:SS.mmm (1:30 or 1:30.500).\n"
+            "A sector runs until the next sector's start, so no 100% row is needed."
+        )
         self._sector_table_updating = False
         self.sector_table.itemChanged.connect(self._on_sector_cell_changed)
-        self.sector_table.setStyleSheet("""
-            QTableWidget {
-                background-color: #1e1e1e;
-                color: #e0e0e0;
-                border: 1px solid #3e3e42;
-                font-size: 11px;
-            }
-            QHeaderView::section {
-                background-color: #2d2d30;
-                color: #9d9d9d;
-                border: none;
-                padding: 3px;
-                font-size: 10px;
-            }
-        """)
         sector_layout.addWidget(self.sector_table)
 
         sector_btn_row = QHBoxLayout()
+        sector_btn_row.setSpacing(6)
         add_sector_btn = QPushButton("➕ Add Sector")
         add_sector_btn.clicked.connect(self.on_add_sector_row)
         remove_sector_btn = QPushButton("➖ Remove Selected")
         remove_sector_btn.clicked.connect(self.on_remove_sector_row)
         save_sectors_btn = QPushButton("💾 Save Sectors")
+        save_sectors_btn.setObjectName("primaryButton")
         save_sectors_btn.clicked.connect(self.on_save_sectors)
         preflight_btn = QPushButton("🚦 Preflight Check")
         preflight_btn.setToolTip("Verify this simulator end to end before the event starts")
@@ -9366,596 +8987,295 @@ class LapTimeSenderWindow(QMainWindow):
         reset_car_btn.setToolTip("Put the car back at start/finish now and re-arm the challenge -\n"
                                  "use if an automatic reset didn't happen")
         reset_car_btn.clicked.connect(self.on_reset_car_now)
-        for btn in (add_sector_btn, remove_sector_btn, save_sectors_btn,
-                    preflight_btn, reset_car_btn):
-            btn.setStyleSheet("""
-                QPushButton {
-                    background-color: #3e3e42;
-                    color: #e0e0e0;
-                    border: none;
-                    border-radius: 4px;
-                    padding: 4px 10px;
-                    font-size: 11px;
-                }
-                QPushButton:hover { background-color: #4e4e52; }
-            """)
+        for btn in (add_sector_btn, remove_sector_btn, save_sectors_btn):
             sector_btn_row.addWidget(btn)
-        sector_btn_row.addStretch()
+        sector_btn_row.addStretch(1)
+        sector_btn_row.addWidget(preflight_btn)
+        sector_btn_row.addWidget(reset_car_btn)
         sector_layout.addLayout(sector_btn_row)
-        # Pin content to the top: any extra height the card gives this section
-        # collects below the buttons instead of spreading gaps between rows
-        sector_layout.addStretch()
 
-        card_layout.addWidget(sector_section)
+        sector_opts_row = QHBoxLayout()
+        sector_opts_row.setSpacing(10)
+        spawn_label = QLabel("After a miss, put the car")
+        spawn_label.setObjectName("fieldLabel")
+        self.teleport_spawn_combo = QComboBox()
+        self.teleport_spawn_combo.addItem("Before start/finish (next driver goes straight away)", "HOTLAP_START")
+        self.teleport_spawn_combo.addItem("On the starting grid", "START")
+        self.teleport_spawn_combo.addItem("In the pits", "PIT")
+        self.teleport_spawn_combo.setToolTip(
+            "Where a driver is put after missing a sector. 'Before start/finish'\n"
+            "starts the next driver immediately. Needs the CSP app - see the\n"
+            "status line above."
+        )
+        spawn_index = self.teleport_spawn_combo.findData(
+            self.sector_config.get('teleport_spawn', 'HOTLAP_START'))
+        if spawn_index >= 0:
+            self.teleport_spawn_combo.setCurrentIndex(spawn_index)
+        self.teleport_spawn_combo.currentIndexChanged.connect(self.on_teleport_spawn_changed)
+        sector_opts_row.addWidget(spawn_label)
+        sector_opts_row.addWidget(self.teleport_spawn_combo, 1)
+
+        self.ignore_out_lap_checkbox = QCheckBox("Don't time the out lap")
+        self.ignore_out_lap_checkbox.setChecked(bool(self.sector_config.get('ignore_out_lap', True)))
+        self.ignore_out_lap_checkbox.setToolTip(
+            "On (recommended): timing starts when the car crosses the start/finish line,\n"
+            "so driving out of the pits is not scored.\n"
+            "Off: timing starts as soon as the car rolls, which counts the out lap."
+        )
+        self.ignore_out_lap_checkbox.toggled.connect(self.on_ignore_out_lap_toggled)
+        sector_opts_row.addWidget(self.ignore_out_lap_checkbox)
+        sector_layout.addLayout(sector_opts_row)
+        mode_layout.addWidget(sector_panel)
+        # Only the chosen mode's panel is shown; hidden widgets take no space
+        self._mode_panels = (top10_panel, sector_panel)
+        page_layout.addWidget(mode_card)
+
+        self.mode_top10_btn.clicked.connect(lambda: self._set_event_mode(False))
+        self.mode_sector_btn.clicked.connect(lambda: self._set_event_mode(True))
+        self._set_event_mode(self.sector_challenge_enabled.isChecked(), from_ui=False)
         self._populate_sector_table()
+        self._update_csp_status()
 
-        # Mobile Interface Settings box - Compact
-        ipad_box = QWidget()
-        ipad_box.setObjectName("ipadBox")
-        ipad_box.setStyleSheet("""
-            #ipadBox {
-                background-color: #2d2d30;
-                border-radius: 6px;
-                border: 1px solid #3e3e42;
-            }
-        """)
-        ipad_box_layout = QVBoxLayout(ipad_box)
-        ipad_box_layout.setContentsMargins(10, 6, 10, 6)
-        ipad_box_layout.setSpacing(4)
-        
-        # Header row - compact
-        header_layout = QHBoxLayout()
-        header_layout.setSpacing(6)
-        
-        ipad_section_label = QLabel("📱 Mobile Interface Settings")
-        ipad_section_label.setStyleSheet("""
-            QLabel {
-                font-weight: 700;
-                font-size: 12px;
-                color: #cccccc;
-                font-family: 'Segoe UI', 'Arial', sans-serif;
-            }
-        """)
-        header_layout.addWidget(ipad_section_label)
-        
-        ipad_explanation = QLabel("Configure iPad/tablet experience")
-        ipad_explanation.setStyleSheet("""
-            QLabel {
-                font-size: 10px;
-                color: #9d9d9d;
-                font-style: italic;
-                font-family: 'Segoe UI', 'Arial', sans-serif;
-            }
-        """)
-        header_layout.addWidget(ipad_explanation)
-        
-        self.advanced_toggle_btn = QPushButton("Show Advanced")
-        self.advanced_toggle_btn.setCheckable(True)
-        self.advanced_toggle_btn.setChecked(False)
-        self.advanced_toggle_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #37373d;
-                color: #cccccc;
-                font-weight: 700;
-                padding: 4px 8px;
-                font-size: 10px;
-                border-radius: 4px;
-                border: 1px solid #3e3e42;
-                font-family: 'Segoe UI', 'Arial', sans-serif;
-            }
-            QPushButton:checked {
-                background-color: #007acc;
-                color: #ffffff;
-                border-color: #007acc;
-            }
-            QPushButton:hover {
-                background-color: #454545;
-            }
-        """)
-        self.advanced_toggle_btn.toggled.connect(lambda checked: self.on_toggle_advanced(checked))
-        header_layout.addWidget(self.advanced_toggle_btn)
-        
-        ipad_settings_update = QPushButton("Apply Settings")
-        ipad_settings_update.setMinimumWidth(80)
-        ipad_settings_update.setStyleSheet("""
-            QPushButton {
-                background-color: #4ec9b0;
-                color: #1e1e1e;
-                font-weight: 700;
-                padding: 4px 8px;
-                font-size: 10px;
-                border-radius: 4px;
-                border: none;
-                font-family: 'Segoe UI', 'Arial', sans-serif;
-            }
-            QPushButton:hover {
-                background-color: #6fd9c4;
-            }
-        """)
-        ipad_settings_update.clicked.connect(self.on_update_driver_settings)
-        ipad_settings_update.setToolTip("Apply changes to the mobile web interface settings")
-        header_layout.addStretch(1)
-        header_layout.addWidget(ipad_settings_update)
-        
-        ipad_box_layout.addLayout(header_layout)
-        
-        # Compact grid layout for settings
-        settings_grid = QWidget()
-        grid_layout = QGridLayout(settings_grid)
-        grid_layout.setContentsMargins(0, 0, 0, 0)
-        grid_layout.setHorizontalSpacing(8)
-        grid_layout.setVerticalSpacing(4)
-        
-        # Set column stretch factors
-        grid_layout.setColumnStretch(0, 0)
-        grid_layout.setColumnStretch(1, 4)
-        grid_layout.setColumnStretch(2, 2)
-        grid_layout.setColumnStretch(3, 2)
-        
-        # Row 0: Current driver name
-        name_label = QLabel("Active Driver:")
-        name_label.setMinimumWidth(80)
-        name_label.setMaximumWidth(100)
-        name_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        name_label.setStyleSheet("""
-            QLabel {
-                font-size: 11px;
-                font-weight: 600;
-                color: #cccccc;
-                font-family: 'Segoe UI', 'Arial', sans-serif;
-            }
-        """)
-        name_label.setToolTip("Shows current active driver - change via mobile interface")
-        grid_layout.addWidget(name_label, 0, 0)
-        
+        # ===== LIVE STRIP: who is driving, last lap, waiting screen ========
+        live_card, live_layout = self._card("liveCard", QHBoxLayout)
+        live_layout.setSpacing(12)
+
+        driver_col = QVBoxLayout()
+        driver_col.setSpacing(2)
+        name_label = QLabel("DRIVER IN THE SEAT")
+        name_label.setObjectName("cardHeading")
+        name_label.setToolTip("Shows current active driver - change via the iPad")
         self.driver_name = QLineEdit()
         self.driver_name.setReadOnly(True)
-        self.driver_name.setPlaceholderText("Set via mobile interface above")
+        self.driver_name.setObjectName("driverName")
+        self.driver_name.setPlaceholderText("Nobody yet - register on the iPad")
         self.driver_name.setToolTip("Driver name can only be changed via the mobile web interface")
-        self.driver_name.setMinimumWidth(200)
-        self.driver_name.setStyleSheet("""
-            QLineEdit {
-                background-color: #252526;
-                border: 1px solid #3e3e42;
-                color: #cccccc;
-                font-size: 11px;
-                font-family: 'Segoe UI', 'Arial', sans-serif;
-                font-weight: 600;
-                padding: 4px 8px;
-            }
-            QLineEdit::placeholder {
-                color: #6e6e6e;
-            }
-        """)
-        grid_layout.addWidget(self.driver_name, 0, 1, 1, 3)
-        
-        # Row 1: Lead Gen toggle (compact)
-        email_label = QLabel("Lead Gen:")
-        email_label.setMinimumWidth(80)
-        email_label.setMaximumWidth(100)
-        email_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        email_label.setStyleSheet("""
-            QLabel {
-                font-size: 11px;
-                font-weight: 600;
-                color: #cccccc;
-                font-family: 'Segoe UI', 'Arial', sans-serif;
-            }
-        """)
-        email_label.setToolTip("Require drivers to enter email and phone before racing")
-        grid_layout.addWidget(email_label, 1, 0)
-        
+        driver_col.addWidget(name_label)
+        driver_col.addWidget(self.driver_name)
+        live_layout.addLayout(driver_col, 3)
+
+        lap_col = QVBoxLayout()
+        lap_col.setSpacing(2)
+        lap_time_title = QLabel("LAST LAP SENT")
+        lap_time_title.setObjectName("cardHeading")
+        self.status_label = QLabel("Waiting...")
+        self.status_label.setObjectName("lapStatus")
+        self.status_label.setToolTip("Shows the most recent lap time sent to the leaderboard")
+        self.status_label.setWordWrap(True)
+        lap_col.addWidget(lap_time_title)
+        lap_col.addWidget(self.status_label)
+        live_layout.addLayout(lap_col, 3)
+
+        self.toggle_waiting_screen_btn = QPushButton("Show Waiting Screen")
+        self.toggle_waiting_screen_btn.setObjectName("primaryButton")
+        self.toggle_waiting_screen_btn.setMinimumHeight(40)
+        self.toggle_waiting_screen_btn.clicked.connect(self.toggle_waiting_screen)
+        self.toggle_waiting_screen_btn.setToolTip("Show/hide the full-screen waiting overlay")
+        live_layout.addWidget(self.toggle_waiting_screen_btn, 0, Qt.AlignmentFlag.AlignBottom)
+        page_layout.addWidget(live_card)
+
+        # ===== TABS: settings that are the same in both modes ==============
+        self.settings_tabs = QTabWidget()
+        self.settings_tabs.setObjectName("settingsTabs")
+        self.settings_tabs.setDocumentMode(True)
+
+        # --- Tab 1: Connect & iPad ----------------------------------------
+        connect_tab = QWidget()
+        connect_layout = QVBoxLayout(connect_tab)
+        connect_layout.setContentsMargins(12, 12, 12, 12)
+        connect_layout.setSpacing(10)
+
+        server_heading = QLabel("LEADERBOARD SERVER")
+        server_heading.setObjectName("cardHeading")
+        connect_layout.addWidget(server_heading)
+        server_url_row = QHBoxLayout()
+        server_url_row.setSpacing(6)
+        url_label = QLabel("Send laps to")
+        url_label.setObjectName("fieldLabel")
+        url_label.setToolTip("Address of the leaderboard server where lap times will be sent")
+        server_url_row.addWidget(url_label)
+        self.server_url = QLineEdit(self.current_server_url)
+        self.server_url.textChanged.connect(self.on_server_url_changed)
+        self.server_url.setToolTip("Enter receiver URL(s). Use commas for multiple receivers:\nhttp://192.168.1.100:5000, http://192.168.1.101:5000")
+        self.server_url.setPlaceholderText("Found automatically - or type http://<receiver ip>:5000")
+        server_url_row.addWidget(self.server_url, 1)
+        test_connection_btn = QPushButton("Test")
+        test_connection_btn.setFixedWidth(64)
+        test_connection_btn.setObjectName("test-connection")
+        test_connection_btn.clicked.connect(self.test_and_save_connection)
+        test_connection_btn.setToolTip("Test if the server is reachable and save URL if successful")
+        server_url_row.addWidget(test_connection_btn)
+        connect_layout.addLayout(server_url_row)
+
+        mobile_heading = QLabel("iPAD / PHONE PAGES FOR THIS SIM")
+        mobile_heading.setObjectName("cardHeading")
+        connect_layout.addWidget(mobile_heading)
+        mobile_row = QHBoxLayout()
+        mobile_row.setSpacing(12)
+        mobile_text = QVBoxLayout()
+        mobile_text.setSpacing(4)
+        self.url_info_label = QLabel(f"📱 Mobile Interface: http://{get_local_ip()}:{self.web_port}")
+        self.url_info_label.setObjectName("urlInfo")
+        self.url_info_label.setWordWrap(True)
+        self.url_info_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        mobile_text.addWidget(self.url_info_label)
+        pages_info = QLabel(
+            "<b style='color:#4fc1ff;'>/</b> &nbsp;Driver sign-up for this sim only<br>"
+            "<b style='color:#4fc1ff;'>/admin</b> &nbsp;Host Stand: control every sim from one iPad<br>"
+            "<b style='color:#4fc1ff;'>/queue</b> &nbsp;Guests join the waiting list"
+        )
+        pages_info.setObjectName("helpText")
+        pages_info.setWordWrap(True)
+        mobile_text.addWidget(pages_info)
+        mobile_text.addStretch(1)
+        mobile_row.addLayout(mobile_text, 1)
+        qr_code = self.generate_qr_code(f"http://{get_local_ip()}:{self.web_port}")
+        self.qr_label = QLabel()
+        self.qr_label.setPixmap(qr_code)
+        self.qr_label.setFixedSize(150, 150)
+        self.qr_label.setScaledContents(False)
+        self.qr_label.setObjectName("qrCode")
+        self.qr_label.setToolTip("Scan with phone/tablet to open the sign-up page for this sim")
+        self.qr_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        mobile_row.addWidget(self.qr_label)
+        connect_layout.addLayout(mobile_row)
+
+        sims_heading = QLabel("OTHER SIMS ON THE NETWORK")
+        sims_heading.setObjectName("cardHeading")
+        sims_heading.setToolTip("Found automatically from their announcements; the Host Stand can control all of them")
+        connect_layout.addWidget(sims_heading)
+        self.simulators_list = QVBoxLayout()
+        self.simulators_list.setSpacing(2)
+        connect_layout.addLayout(self.simulators_list)
+        connect_layout.addStretch(1)
+        self.settings_tabs.addTab(connect_tab, "Connect && iPad")
+
+        QTimer.singleShot(500, self.refresh_network_simulators_ui)
+        self.simulator_refresh_timer = QTimer(self)
+        self.simulator_refresh_timer.timeout.connect(self.refresh_network_simulators_ui)
+        self.simulator_refresh_timer.start(5000)
+
+        # --- Tab 2: Driver sign-up ----------------------------------------
+        signup_tab = QWidget()
+        signup_layout = QVBoxLayout(signup_tab)
+        signup_layout.setContentsMargins(12, 12, 12, 12)
+        signup_layout.setSpacing(10)
+        signup_help = QLabel("What a driver has to fill in on the iPad before they can drive. "
+                             "Lead Gen off = name only.")
+        signup_help.setObjectName("helpText")
+        signup_help.setWordWrap(True)
+        signup_layout.addWidget(signup_help)
+
+        lead_row = QHBoxLayout()
+        lead_row.setSpacing(8)
+        email_label = QLabel("Lead Gen")
+        email_label.setObjectName("fieldLabel")
+        email_label.setToolTip("Require drivers to enter contact details before racing")
+        lead_row.addWidget(email_label)
         self.email_field_enabled = QPushButton("Off")
         self.email_field_enabled.setCheckable(True)
         self.email_field_enabled.setChecked(False)
-        self.email_field_enabled.setMinimumWidth(70)
-        self.email_field_enabled.setMaximumWidth(90)
-        self.email_field_enabled.setStyleSheet("""
-            QPushButton {
-                background-color: #37373d;
-                color: #cccccc;
-                border: 1px solid #3e3e42;
-                padding: 4px 6px;
-                border-radius: 4px;
-                font-weight: 600;
-                font-size: 10px;
-                text-align: center;
-                font-family: 'Segoe UI', 'Arial', sans-serif;
-            }
-            QPushButton:checked {
-                background-color: #4ec9b0;
-                color: #1e1e1e;
-                border: 1px solid #4ec9b0;
-            }
-            QPushButton:hover {
-                border: 1px solid #007acc;
-            }
-        """)
+        self.email_field_enabled.setObjectName("toggleButton")
+        self.email_field_enabled.setFixedWidth(70)
         self.email_field_enabled.toggled.connect(self._on_lead_gen_toggled)
         self.email_field_enabled.setText("Off")
-
-        # Lead Gen toggle + survey questions editor share the grid cell
-        self.survey_questions_btn = QPushButton("📋 Questions")
-        self.survey_questions_btn.setToolTip("Edit the survey questions shown on the registration page (saved to leads.csv)")
-        self.survey_questions_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #37373d;
-                color: #cccccc;
-                border: 1px solid #3e3e42;
-                padding: 4px 6px;
-                border-radius: 4px;
-                font-weight: 600;
-                font-size: 10px;
-                font-family: 'Segoe UI', 'Arial', sans-serif;
-            }
-            QPushButton:hover {
-                border: 1px solid #007acc;
-            }
-        """)
-        self.survey_questions_btn.clicked.connect(self.on_edit_survey_questions)
-        lead_gen_cell = QWidget()
-        lead_gen_cell_layout = QHBoxLayout(lead_gen_cell)
-        lead_gen_cell_layout.setContentsMargins(0, 0, 0, 0)
-        lead_gen_cell_layout.setSpacing(4)
-        lead_gen_cell_layout.addWidget(self.email_field_enabled)
-
-        # Which contact fields Lead Gen asks for. Lead Gen off = name only.
-        contact_checkbox_style = "font-size: 11px; color: #cccccc;"
+        lead_row.addWidget(self.email_field_enabled)
+        ask_label = QLabel("ask for")
+        ask_label.setObjectName("fieldLabel")
+        lead_row.addWidget(ask_label)
         self.collect_email_checkbox = QCheckBox("Email")
-        self.collect_email_checkbox.setStyleSheet(contact_checkbox_style)
         self.collect_email_checkbox.setChecked(True)
         self.collect_email_checkbox.setToolTip("Ask drivers for an email address while Lead Gen is on")
         self.collect_email_checkbox.toggled.connect(self._on_contact_fields_toggled)
-        lead_gen_cell_layout.addWidget(self.collect_email_checkbox)
-
+        lead_row.addWidget(self.collect_email_checkbox)
         self.collect_phone_checkbox = QCheckBox("Phone")
-        self.collect_phone_checkbox.setStyleSheet(contact_checkbox_style)
         self.collect_phone_checkbox.setChecked(True)
         self.collect_phone_checkbox.setToolTip("Ask drivers for a phone number while Lead Gen is on")
         self.collect_phone_checkbox.toggled.connect(self._on_contact_fields_toggled)
-        lead_gen_cell_layout.addWidget(self.collect_phone_checkbox)
+        lead_row.addWidget(self.collect_phone_checkbox)
+        self.survey_questions_btn = QPushButton("📋 Survey Questions")
+        self.survey_questions_btn.setToolTip("Edit the survey questions shown on the registration page (saved to leads.csv)")
+        self.survey_questions_btn.clicked.connect(self.on_edit_survey_questions)
+        lead_row.addWidget(self.survey_questions_btn)
+        lead_row.addStretch(1)
+        signup_layout.addLayout(lead_row)
+        signup_layout.addStretch(1)
+        self.settings_tabs.addTab(signup_tab, "Driver Sign-up")
 
-        lead_gen_cell_layout.addWidget(self.survey_questions_btn)
-        grid_layout.addWidget(lead_gen_cell, 1, 1)
-        
-        # Hidden timer widgets for backwards compatibility
-        self.timer_label = QLabel()
-        self.timer_label.setVisible(False)
-        self.driver_timer_enabled = QPushButton()
-        self.driver_timer_enabled.setVisible(False)
-        
-        # Rotation mode label + selector on same row
-        rotation_mode_label = QLabel("Rotation Mode:")
-        rotation_mode_label.setMinimumWidth(80)
-        rotation_mode_label.setMaximumWidth(100)
-        rotation_mode_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        rotation_mode_label.setStyleSheet("""
-            QLabel {
-                font-size: 11px;
-                font-weight: 600;
-                color: #cccccc;
-                font-family: 'Segoe UI', 'Arial', sans-serif;
-            }
-        """)
-        rotation_mode_label.setToolTip("Switch between time-based and lap-based driver rotation")
-        grid_layout.addWidget(rotation_mode_label, 1, 2)
+        # --- Tab 3: Screens & media ---------------------------------------
+        screens_tab = QWidget()
+        screens_layout = QVBoxLayout(screens_tab)
+        screens_layout.setContentsMargins(12, 12, 12, 12)
+        screens_layout.setSpacing(8)
+        grid_layout = QGridLayout()
+        grid_layout.setHorizontalSpacing(8)
+        grid_layout.setVerticalSpacing(8)
+        grid_layout.setColumnStretch(2, 1)
 
-        self.rotation_mode_selector = QComboBox()
-        self.rotation_mode_selector.addItems(["Time", "Laps"])
-        self.rotation_mode_selector.setToolTip("Choose rotation mode: by time or by laps")
-        self.rotation_mode_selector.setStyleSheet("""
-            QComboBox {
-                padding: 4px 6px;
-                font-size: 10px;
-            }
-        """)
-        grid_layout.addWidget(self.rotation_mode_selector, 1, 3)
-        
-        # Row 2: Minutes/Laps input
-        self.minutes_label = QLabel("Minutes:")
-        self.minutes_label.setMinimumWidth(80)
-        self.minutes_label.setMaximumWidth(100)
-        self.minutes_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        self.minutes_label.setStyleSheet("""
-            QLabel {
-                font-size: 11px;
-                color: #cccccc;
-                font-family: 'Segoe UI', 'Arial', sans-serif;
-            }
-        """)
-        grid_layout.addWidget(self.minutes_label, 2, 0)
-        
-        self.driver_timer_minutes = QLineEdit("55")
-        self.driver_timer_minutes.setMinimumWidth(50)
-        self.driver_timer_minutes.setMaximumWidth(70)
-        self.driver_timer_minutes.setStyleSheet("""
-            QLineEdit {
-                background-color: #1e1e1e;
-                border: 1px solid #3e3e42;
-                color: #cccccc;
-                font-size: 11px;
-                text-align: center;
-                font-family: 'Segoe UI', 'Arial', sans-serif;
-                font-weight: 600;
-                padding: 4px 6px;
-            }
-            QLineEdit:focus {
-                border-color: #007acc;
-            }
-        """)
-        self.driver_timer_minutes.setToolTip("Duration in minutes for each driver's turn")
-        grid_layout.addWidget(self.driver_timer_minutes, 2, 1)
-        
-        # Row 3: Background image (Advanced) - Compact
-        bg_label = QLabel("Background:")
-        bg_label.setMinimumWidth(80)
-        bg_label.setMaximumWidth(100)
-        bg_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        bg_label.setStyleSheet("""
-            QLabel {
-                font-size: 11px;
-                font-weight: 600;
-                color: #cccccc;
-                font-family: 'Segoe UI', 'Arial', sans-serif;
-            }
-        """)
-        bg_label.setToolTip("Custom background image for mobile interface")
-        grid_layout.addWidget(bg_label, 3, 0)
-        
+        def grid_label(text, tip, row):
+            lbl = QLabel(text)
+            lbl.setObjectName("fieldLabel")
+            lbl.setToolTip(tip)
+            lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            grid_layout.addWidget(lbl, row, 0)
+            return lbl
+
+        bg_label = grid_label("iPad background", "Custom background image for the sign-up page", 0)
         self.background_image_path = QLineEdit()
-        self.background_image_path.setPlaceholderText("Select custom background image")
-        self.background_image_path.setMinimumWidth(200)
-        self.background_image_path.setStyleSheet("""
-            QLineEdit {
-                background-color: #1e1e1e;
-                border: 1px solid #3e3e42;
-                color: #cccccc;
-                font-size: 10px;
-                font-family: 'Segoe UI', 'Arial', sans-serif;
-                padding: 4px 8px;
-            }
-            QLineEdit::placeholder {
-                color: #6e6e6e;
-            }
-            QLineEdit:focus {
-                border-color: #007acc;
-            }
-        """)
-        grid_layout.addWidget(self.background_image_path, 3, 1, 1, 2)
-        
+        self.background_image_path.setPlaceholderText("Default background")
+        grid_layout.addWidget(self.background_image_path, 0, 1, 1, 2)
         self.select_bg_button = QPushButton("Browse")
-        self.select_bg_button.setMinimumWidth(60)
-        self.select_bg_button.setMaximumWidth(80)
-        self.select_bg_button.setStyleSheet("""
-            QPushButton {
-                background-color: #37373d;
-                color: #cccccc;
-                border: 1px solid #3e3e42;
-                padding: 4px 8px;
-                border-radius: 4px;
-                font-weight: 600;
-                font-size: 10px;
-                text-align: center;
-                font-family: 'Segoe UI', 'Arial', sans-serif;
-            }
-            QPushButton:hover {
-                background-color: #454545;
-                border-color: #007acc;
-            }
-        """)
+        self.select_bg_button.setFixedWidth(80)
         self.select_bg_button.clicked.connect(self.select_background_image)
-        grid_layout.addWidget(self.select_bg_button, 3, 3)
+        grid_layout.addWidget(self.select_bg_button, 0, 3)
 
-        # Row 4: Pre-session video enable (Advanced) - Compact
-        video_enable_label = QLabel("Pre-Session Video:")
-        video_enable_label.setMinimumWidth(80)
-        video_enable_label.setMaximumWidth(100)
-        video_enable_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        video_enable_label.setStyleSheet("""
-            QLabel {
-                font-size: 11px;
-                font-weight: 600;
-                color: #cccccc;
-                font-family: 'Segoe UI', 'Arial', sans-serif;
-            }
-        """)
-        video_enable_label.setToolTip("Require a 1920x1080 video to play on PC after signup")
-        grid_layout.addWidget(video_enable_label, 4, 0)
-
-        self.video_required_toggle = QPushButton("☐ Disabled")
+        video_enable_label = grid_label("Pre-session video", "Play a 1920x1080 video on the sim after sign-up, before the turn starts", 1)
+        self.video_required_toggle = QPushButton("☐ Off")
         self.video_required_toggle.setCheckable(True)
         self.video_required_toggle.setChecked(False)
-        self.video_required_toggle.setMinimumWidth(70)
-        self.video_required_toggle.setMaximumWidth(90)
-        self.video_required_toggle.setStyleSheet("""
-            QPushButton {
-                background-color: #37373d;
-                color: #cccccc;
-                border: 1px solid #3e3e42;
-                padding: 4px 6px;
-                border-radius: 4px;
-                font-weight: 600;
-                font-size: 10px;
-                text-align: center;
-                font-family: 'Segoe UI', 'Arial', sans-serif;
-            }
-            QPushButton:checked {
-                background-color: #4ec9b0;
-                color: #1e1e1e;
-                border: 1px solid #4ec9b0;
-            }
-            QPushButton:hover {
-                border: 1px solid #007acc;
-            }
-        """)
+        self.video_required_toggle.setObjectName("toggleButton")
+        self.video_required_toggle.setFixedWidth(80)
         self.video_required_toggle.setToolTip("Play video on PC when a driver is set")
-        self.video_required_toggle.toggled.connect(lambda checked: self.video_required_toggle.setText("⊠ Enabled" if checked else "☐ Disabled"))
-        grid_layout.addWidget(self.video_required_toggle, 4, 1)
-
+        self.video_required_toggle.toggled.connect(
+            lambda checked: self.video_required_toggle.setText("⊠ On" if checked else "☐ Off"))
+        grid_layout.addWidget(self.video_required_toggle, 1, 1)
         self.video_path_input = QLineEdit()
         self.video_path_input.setPlaceholderText("Select MP4 video")
-        self.video_path_input.setMinimumWidth(200)
-        self.video_path_input.setStyleSheet("""
-            QLineEdit {
-                background-color: #1e1e1e;
-                border: 1px solid #3e3e42;
-                color: #cccccc;
-                font-size: 10px;
-                font-family: 'Segoe UI', 'Arial', sans-serif;
-                padding: 4px 8px;
-            }
-            QLineEdit::placeholder {
-                color: #6e6e6e;
-            }
-            QLineEdit:focus {
-                border-color: #007acc;
-            }
-        """)
-        grid_layout.addWidget(self.video_path_input, 4, 2)
-
+        grid_layout.addWidget(self.video_path_input, 1, 2)
         self.select_video_button = QPushButton("Browse")
-        self.select_video_button.setMinimumWidth(60)
-        self.select_video_button.setMaximumWidth(80)
-        self.select_video_button.setStyleSheet("""
-            QPushButton {
-                background-color: #37373d;
-                color: #cccccc;
-                border: 1px solid #3e3e42;
-                padding: 4px 8px;
-                border-radius: 4px;
-                font-weight: 600;
-                font-size: 10px;
-                text-align: center;
-                font-family: 'Segoe UI', 'Arial', sans-serif;
-            }
-            QPushButton:hover {
-                background-color: #454545;
-                border-color: #007acc;
-            }
-        """)
+        self.select_video_button.setFixedWidth(80)
         self.select_video_button.clicked.connect(self.select_video_file)
-        grid_layout.addWidget(self.select_video_button, 4, 3)
+        grid_layout.addWidget(self.select_video_button, 1, 3)
 
-        # Row 5: Waiting screen media (Advanced) - Compact
-        waiting_media_label = QLabel("Waiting Screen:")
-        waiting_media_label.setMinimumWidth(80)
-        waiting_media_label.setMaximumWidth(100)
-        waiting_media_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        waiting_media_label.setStyleSheet("""
-            QLabel {
-                font-size: 11px;
-                font-weight: 600;
-                color: #cccccc;
-                font-family: 'Segoe UI', 'Arial', sans-serif;
-            }
-        """)
-        waiting_media_label.setToolTip("Custom image or looping video for waiting screen")
-        grid_layout.addWidget(waiting_media_label, 5, 0)
-
+        waiting_media_label = grid_label("Waiting screen", "Custom image or looping video shown between drivers", 2)
         self.waiting_media_path = QLineEdit()
-        self.waiting_media_path.setPlaceholderText("Select JPG/MP4 for waiting screen")
-        self.waiting_media_path.setMinimumWidth(200)
-        self.waiting_media_path.setStyleSheet("""
-            QLineEdit {
-                background-color: #1e1e1e;
-                border: 1px solid #3e3e42;
-                color: #cccccc;
-                font-size: 10px;
-                font-family: 'Segoe UI', 'Arial', sans-serif;
-                padding: 4px 8px;
-            }
-            QLineEdit::placeholder {
-                color: #6e6e6e;
-            }
-            QLineEdit:focus {
-                border-color: #007acc;
-            }
-        """)
-        grid_layout.addWidget(self.waiting_media_path, 5, 1, 1, 2)
-
+        self.waiting_media_path.setPlaceholderText("Default waiting screen (JPG or MP4 to replace)")
+        grid_layout.addWidget(self.waiting_media_path, 2, 1, 1, 2)
         self.select_waiting_media_button = QPushButton("Browse")
-        self.select_waiting_media_button.setMinimumWidth(60)
-        self.select_waiting_media_button.setMaximumWidth(80)
-        self.select_waiting_media_button.setStyleSheet("""
-            QPushButton {
-                background-color: #37373d;
-                color: #cccccc;
-                border: 1px solid #3e3e42;
-                padding: 4px 8px;
-                border-radius: 4px;
-                font-weight: 600;
-                font-size: 10px;
-                text-align: center;
-                font-family: 'Segoe UI', 'Arial', sans-serif;
-            }
-            QPushButton:hover {
-                background-color: #454545;
-                border-color: #007acc;
-            }
-        """)
+        self.select_waiting_media_button.setFixedWidth(80)
         self.select_waiting_media_button.clicked.connect(self.select_waiting_media_file)
-        grid_layout.addWidget(self.select_waiting_media_button, 5, 3)
+        grid_layout.addWidget(self.select_waiting_media_button, 2, 3)
 
-        # Row 6: 4th-screen broadcast mode (Advanced) - drives OBS scenes
-        broadcast_mode_label = QLabel("4th Screen:")
-        broadcast_mode_label.setMinimumWidth(80)
-        broadcast_mode_label.setMaximumWidth(100)
-        broadcast_mode_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        broadcast_mode_label.setStyleSheet("""
-            QLabel {
-                font-size: 11px;
-                color: #cccccc;
-                font-family: 'Segoe UI', 'Arial', sans-serif;
-            }
-        """)
-        broadcast_mode_label.setToolTip("What the OBS broadcast screen shows between drivers")
-        grid_layout.addWidget(broadcast_mode_label, 6, 0)
-
+        broadcast_mode_label = grid_label("4th screen (OBS)", "What the OBS broadcast screen shows between drivers", 3)
         self.broadcast_mode_combo = QComboBox()
         self.broadcast_mode_combo.addItems([
             "Off (always live camera)",
             "Waiting screen between drivers",
             "Replay of last run between drivers",
         ])
-        self.broadcast_mode_combo.setStyleSheet("""
-            QComboBox {
-                background-color: #1e1e1e;
-                border: 1px solid #3e3e42;
-                color: #cccccc;
-                font-size: 10px;
-                font-family: 'Segoe UI', 'Arial', sans-serif;
-                padding: 4px 8px;
-            }
-        """)
         self.broadcast_mode_combo.setToolTip(
             "Requires the OBS broadcast screen setup (see broadcast folder). "
             "While driving, the 4th screen always shows the live TV cameras."
         )
         self.broadcast_mode_combo.setCurrentIndex(1)
         self.broadcast_mode_combo.currentIndexChanged.connect(self._on_broadcast_mode_changed)
-        grid_layout.addWidget(self.broadcast_mode_combo, 6, 1, 1, 2)
+        grid_layout.addWidget(self.broadcast_mode_combo, 3, 1, 1, 2)
 
-        # Row 7: which monitors the waiting screen covers (Advanced). Triple
-        # screen rigs need the side monitors blanked too; a 4th broadcast
-        # monitor must be left alone or the overlay hides the OBS projector.
-        cover_screens_label = QLabel("Cover Screens:")
-        cover_screens_label.setMinimumWidth(80)
-        cover_screens_label.setMaximumWidth(100)
-        cover_screens_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        cover_screens_label.setStyleSheet("""
-            QLabel {
-                font-size: 11px;
-                color: #cccccc;
-                font-family: 'Segoe UI', 'Arial', sans-serif;
-            }
-        """)
-        cover_screens_label.setToolTip(
+        cover_screens_label = grid_label(
+            "Cover screens",
             "Monitors the waiting / Out of Time / Challenge Complete screens cover.\n"
             "Tick the driver's screens (all three on a triple setup). Leave the\n"
-            "broadcast monitor unticked so it keeps showing the OBS feed."
-        )
-        grid_layout.addWidget(cover_screens_label, 7, 0)
-
+            "broadcast monitor unticked so it keeps showing the OBS feed.", 4)
         self.cover_screens_widget = QWidget()
         cover_screens_layout = QHBoxLayout(self.cover_screens_widget)
         cover_screens_layout.setContentsMargins(0, 0, 0, 0)
@@ -9966,7 +9286,6 @@ class LapTimeSenderWindow(QMainWindow):
             geo = screen.geometry()
             is_primary = primary_screen is not None and screen.name() == primary_screen.name()
             box = QCheckBox(f"{index}: {geo.width()}x{geo.height()}" + (" (main)" if is_primary else ""))
-            box.setStyleSheet("font-size: 10px; color: #cccccc;")
             box.setChecked(True)
             if is_primary:
                 # The overlay itself always covers the main screen
@@ -9978,61 +9297,40 @@ class LapTimeSenderWindow(QMainWindow):
             self.cover_screen_checkboxes[screen.name()] = box
             cover_screens_layout.addWidget(box)
         cover_screens_layout.addStretch()
-        grid_layout.addWidget(self.cover_screens_widget, 7, 1, 1, 3)
+        grid_layout.addWidget(self.cover_screens_widget, 4, 1, 1, 3)
+        screens_layout.addLayout(grid_layout)
 
-        # Laps input (only used in Laps mode) - on same row as minutes
-        self.lap_count_label = QLabel("Laps:")
-        self.lap_count_label.setMinimumWidth(40)
-        self.lap_count_label.setMaximumWidth(50)
-        self.lap_count_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        self.lap_count_label.setStyleSheet("""
-            QLabel {
-                font-size: 11px;
-                color: #cccccc;
-                font-family: 'Segoe UI', 'Arial', sans-serif;
-            }
-        """)
-        grid_layout.addWidget(self.lap_count_label, 2, 2)
+        apply_row = QHBoxLayout()
+        apply_row.addStretch(1)
+        ipad_settings_update = QPushButton("Apply")
+        ipad_settings_update.setObjectName("primaryButton")
+        ipad_settings_update.clicked.connect(self.on_update_driver_settings)
+        ipad_settings_update.setToolTip("Apply the screen, video and sign-up settings")
+        apply_row.addWidget(ipad_settings_update)
+        screens_layout.addLayout(apply_row)
+        screens_layout.addStretch(1)
+        self.settings_tabs.addTab(screens_tab, "Screens && Media")
+        page_layout.addWidget(self.settings_tabs)
 
-        self.lap_target_input = QLineEdit("10")
-        self.lap_target_input.setMinimumWidth(50)
-        self.lap_target_input.setMaximumWidth(70)
-        self.lap_target_input.setStyleSheet("""
-            QLineEdit {
-                background-color: #1e1e1e;
-                border: 1px solid #3e3e42;
-                color: #cccccc;
-                font-size: 11px;
-                text-align: center;
-                font-family: 'Segoe UI', 'Arial', sans-serif;
-                font-weight: 600;
-                padding: 4px 6px;
-            }
-            QLineEdit:focus {
-                border-color: #007acc;
-            }
-        """)
-        self.lap_target_input.setToolTip("Number of laps before driver swap alert")
-        grid_layout.addWidget(self.lap_target_input, 2, 3)
+        # Everything used to sit behind a "Show Advanced" toggle; the tabs
+        # replace it. Kept so older call sites keep working.
+        self.advanced_toggle_btn = QPushButton("Show Advanced")
+        self.advanced_toggle_btn.setCheckable(True)
+        self.advanced_toggle_btn.hide()
+        self.advanced_toggle_btn.toggled.connect(lambda checked: self.on_toggle_advanced(checked))
+        self._advanced_rows = []
 
-        # Time input placeholder (shares position with laps, switched by mode)
-        self.time_count_label = self.minutes_label  # Reuse minutes label
-        self.time_target_input = self.driver_timer_minutes  # Reuse driver timer minutes
-
-        # React to mode changes (hide/show appropriate inputs)
-        self.rotation_mode_selector.currentTextChanged.connect(self.on_rotation_mode_changed)
-        self.on_rotation_mode_changed(self.rotation_mode_selector.currentText())
-        
         # Current driver info (hidden)
         self.last_driver_email = ""
         self.last_driver_phone = ""
         self.current_session_id = ""
+
         # Video playback state
         self.pre_session_video_required = False
         self.pre_session_video_path = ""
         self.media_player = None
         self.video_widget = None
-        
+
         # Overlay system
         self.waiting_overlay = WaitingOverlay()
         self.sector_flash = SectorFlashOverlay()
@@ -10040,52 +9338,150 @@ class LapTimeSenderWindow(QMainWindow):
         self.timer_started = False  # Track if session timer has actually started
         self.session_start_timestamp = 0  # Unix timestamp when session started (for queue wait time estimates)
         self.assigned_queue_id = None  # Queue ID of assigned guest (if from queue system)
-        
-        # Set minimum size for the settings grid to ensure proper display
-        settings_grid.setMinimumWidth(400)
-        
-        # Hide advanced rows by default
-        self._advanced_rows = [
-            (bg_label, self.background_image_path, self.select_bg_button),
-            (video_enable_label, self.video_required_toggle, self.video_path_input, self.select_video_button),
-            (waiting_media_label, self.waiting_media_path, self.select_waiting_media_button),
-            (broadcast_mode_label, self.broadcast_mode_combo),
-            (cover_screens_label, self.cover_screens_widget),
-        ]
-        self.set_advanced_visible(False)
-        # Let the grid determine its own height based on contents to avoid crowding
 
-        # Add grid to iPad box
-        ipad_box_layout.addWidget(settings_grid)
+        page_layout.addStretch(1)
 
-        card_layout.addWidget(ipad_box)
-
-        # The page is taller than many screens once every section is present.
-        # A scroll area lets each section keep its natural height instead of
-        # Qt crushing rows into each other when the window is short.
+        # The page can be taller than a small laptop screen; scroll rather
+        # than crush rows together.
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        scroll.setStyleSheet("""
-            QScrollArea { background: transparent; border: none; }
-            QScrollBar:vertical {
-                background: #252526;
-                width: 10px;
-                border-radius: 5px;
-            }
-            QScrollBar::handle:vertical {
-                background: #4e4e52;
-                border-radius: 5px;
-                min-height: 30px;
-            }
-            QScrollBar::handle:vertical:hover { background: #007acc; }
-            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
-        """)
-        scroll.viewport().setStyleSheet("background: transparent;")
-        scroll.setWidget(card)
+        scroll.setWidget(page)
         main_layout.addWidget(scroll)
-        
+
+    def _card(self, object_name, layout_cls):
+        """A rounded panel with the shared card styling."""
+        card = QWidget()
+        card.setObjectName(object_name)
+        card.setProperty("card", True)
+        layout = layout_cls(card)
+        layout.setContentsMargins(14, 10, 14, 12)
+        return card, layout
+
+    def _set_event_mode(self, sector_challenge, from_ui=True):
+        """Switch between Top 10 Leaderboard and Sector Challenge.
+
+        Drives the hidden `sector_challenge_enabled` checkbox the monitor and
+        the saved config key off, and shows only that mode's settings.
+        """
+        sector_challenge = bool(sector_challenge)
+        self.mode_top10_btn.setChecked(not sector_challenge)
+        self.mode_sector_btn.setChecked(sector_challenge)
+        top10_panel, sector_panel = self._mode_panels
+        top10_panel.setVisible(not sector_challenge)
+        sector_panel.setVisible(sector_challenge)
+        if self.sector_challenge_enabled.isChecked() != sector_challenge:
+            self.sector_challenge_enabled.setChecked(sector_challenge)
+        if from_ui:
+            self._update_csp_status()
+
+    @staticmethod
+    def _ui_stylesheet():
+        return """
+            #centralRoot, #page { background-color: #1b1b1d; }
+            QScrollArea { background: transparent; border: none; }
+            QScrollArea > QWidget > QWidget { background: transparent; }
+
+            QWidget[card="true"] {
+                background-color: #252527;
+                border: 1px solid #333336;
+                border-radius: 10px;
+            }
+            #modeCard { border: 1px solid #3a3a3e; }
+
+            #appTitle { font-size: 20px; font-weight: 700; color: #ffffff; }
+            #appSubtitle { font-size: 11px; color: #8a8a8f; }
+            #cardHeading {
+                font-size: 10px; font-weight: 700; letter-spacing: 1px;
+                color: #8a8a8f;
+            }
+            #fieldLabel { font-size: 12px; color: #c9c9cc; }
+            #helpText { font-size: 11px; color: #9d9da2; }
+            #statusLine { font-size: 11px; color: #9d9d9d; }
+            #gameStatus { font-size: 11px; color: #9d9da2; }
+            #urlInfo { font-size: 12px; color: #e0e0e0; font-family: 'Consolas', 'Segoe UI', monospace; }
+            #qrCode { background: white; border-radius: 6px; padding: 4px; }
+            #driverName {
+                font-size: 18px; font-weight: 700; color: #ffffff;
+                background-color: #1e1e20; border: 1px solid #333336;
+                border-radius: 6px; padding: 6px 10px;
+            }
+            #lapStatus {
+                font-size: 16px; font-weight: 600; color: #4ec9b0;
+                background-color: #1e1e20; border: 1px solid #333336;
+                border-radius: 6px; padding: 7px 10px;
+                font-family: 'Consolas', 'Segoe UI', monospace;
+            }
+
+            #modeButton {
+                background-color: #2b2b2e; color: #9d9da2;
+                border: 2px solid #3a3a3e; border-radius: 10px;
+                padding: 8px 14px; font-size: 13px; font-weight: 700; text-align: left;
+            }
+            #modeButton:hover { border-color: #55555a; color: #d0d0d4; }
+            #modeButton:checked {
+                background-color: #123a5c; color: #ffffff; border: 2px solid #4fc1ff;
+            }
+
+            QLineEdit, QComboBox {
+                background-color: #1e1e20; color: #e6e6e6;
+                border: 1px solid #3a3a3e; border-radius: 6px; padding: 5px 8px;
+                font-size: 12px; min-height: 22px;
+            }
+            QLineEdit:focus, QComboBox:focus { border-color: #4fc1ff; }
+            QLineEdit:read-only { color: #ffffff; }
+            QComboBox::drop-down { border: none; width: 22px; }
+            QComboBox QAbstractItemView {
+                background-color: #252527; color: #e6e6e6;
+                selection-background-color: #123a5c; border: 1px solid #3a3a3e;
+            }
+            QCheckBox { font-size: 12px; color: #c9c9cc; spacing: 6px; }
+
+            QPushButton {
+                background-color: #333336; color: #e6e6e6;
+                border: 1px solid #45454a; border-radius: 6px;
+                padding: 6px 12px; font-size: 12px; font-weight: 600;
+            }
+            QPushButton:hover { background-color: #3d3d41; }
+            QPushButton:pressed { background-color: #2a2a2d; }
+            QPushButton:disabled { color: #6e6e72; background-color: #2a2a2d; }
+            #primaryButton { background-color: #0e639c; border-color: #1177bb; color: #ffffff; }
+            #primaryButton:hover { background-color: #1177bb; }
+            #test-connection { background-color: #0e639c; border-color: #1177bb; color: #ffffff; }
+            #toggleButton:checked { background-color: #1f7a4d; border-color: #2a9d63; color: #ffffff; }
+
+            #settingsTabs { background: transparent; }
+            #settingsTabs::pane {
+                background-color: #252527; border: 1px solid #333336;
+                border-radius: 10px; top: -1px;
+            }
+            QTabBar { background: transparent; }
+            QTabBar::tab {
+                background: transparent; color: #8a8a8f; padding: 8px 16px;
+                font-size: 12px; font-weight: 600; border: none;
+                border-bottom: 2px solid transparent; margin-right: 6px;
+            }
+            QTabBar::tab:selected { color: #ffffff; border-bottom: 2px solid #4fc1ff; }
+            QTabBar::tab:hover { color: #d0d0d4; }
+
+            QTableWidget {
+                background-color: #1e1e20; alternate-background-color: #232325;
+                color: #e6e6e6; gridline-color: #333336;
+                border: 1px solid #333336; border-radius: 6px; font-size: 12px;
+            }
+            QTableWidget::item:selected { background-color: #123a5c; color: #ffffff; }
+            QHeaderView::section {
+                background-color: #2b2b2e; color: #9d9da2; padding: 4px 6px;
+                border: none; border-bottom: 1px solid #3a3a3e; font-size: 11px; font-weight: 600;
+            }
+            QTableCornerButton::section { background-color: #2b2b2e; border: none; }
+            QScrollBar:vertical { background: #1b1b1d; width: 10px; margin: 0; }
+            QScrollBar::handle:vertical { background: #45454a; border-radius: 5px; min-height: 24px; }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+            QToolTip { background-color: #2b2b2e; color: #e6e6e6; border: 1px solid #45454a; padding: 4px; }
+        """
+
     def start_monitor(self, game_name):
         """Start monitoring the selected game"""
         try:
