@@ -31,6 +31,8 @@ from io import BytesIO
 import os
 import csv
 
+APP_VERSION = "1.4.3"
+
 def get_runtime_base_path():
     """Return the bundled app base path when frozen, otherwise the source folder."""
     if getattr(sys, 'frozen', False):
@@ -4782,6 +4784,7 @@ def set_driver():
 def get_settings():
     if not main_window:
         return jsonify({
+            'app_version': APP_VERSION,
             'lead_gen_enabled': False,
             'require_email': False,
             'require_phone': False,
@@ -4834,6 +4837,7 @@ def get_settings():
     ]
 
     return jsonify({
+        'app_version': APP_VERSION,
         'lead_gen_enabled': lead_gen_enabled,
         'require_email': is_email_collection_enabled(),
         'require_phone': is_phone_collection_enabled(),
@@ -5958,7 +5962,8 @@ class MDNSService:
                 properties={
                     'path': '/',
                     'simulator_id': str(simulator_id),
-                    'app': 'Lap Time Sender'
+                    'app': 'Lap Time Sender',
+                    'version': APP_VERSION
                 },
                 server=f"{service_name}.local."
             )
@@ -6066,7 +6071,8 @@ class MDNSService:
                     properties={
                         'path': '/',
                         'simulator_id': str(self.current_sim_id),
-                        'app': 'Lap Time Sender'
+                        'app': 'Lap Time Sender',
+                        'version': APP_VERSION
                     },
                     server=f"{service_name}.local."
                 )
@@ -8872,7 +8878,7 @@ class LapTimeSenderWindow(QMainWindow):
 
     def setup_ui(self):
         # Main window settings
-        self.setWindowTitle("Lap Time Sender - Racing Leaderboard Interface")
+        self.setWindowTitle(f"Lap Time Sender v{APP_VERSION} - Racing Leaderboard Interface")
         self.setMinimumSize(940, 720)  # Wider but shorter - compact multi-column layout
         self.resize(980, 760)  # Optimized for modern displays
         self.setWindowIcon(QIcon(os.path.join(get_resources_dir(), 'icon.png')))
@@ -8996,7 +9002,7 @@ class LapTimeSenderWindow(QMainWindow):
 
         title_col = QVBoxLayout()
         title_col.setSpacing(0)
-        title = QLabel("🏁 Lap Time Sender")
+        title = QLabel(f"🏁 Lap Time Sender v{APP_VERSION}")
         title.setObjectName("appTitle")
         subtitle = QLabel("Sends this simulator's laps to the leaderboard")
         subtitle.setObjectName("appSubtitle")
@@ -12086,6 +12092,8 @@ def main():
             pass
 
     app = QApplication(sys.argv)
+    app.setApplicationName("Lap Time Sender")
+    app.setApplicationVersion(APP_VERSION)
 
     # Load SMS configuration for queue notifications
     load_sms_config()

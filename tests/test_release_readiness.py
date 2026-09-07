@@ -89,6 +89,10 @@ class SenderReleaseReadinessTests(unittest.TestCase):
         sender.main_window = self.original_main_window
         sender.ui_bridge = self.original_ui_bridge
 
+    def test_visible_app_version_matches_installer_version(self):
+        setup_script = (ROOT / 'setup.iss').read_text(encoding='utf-8')
+        self.assertIn(f'#define MyAppVersion "{sender.APP_VERSION}"', setup_script)
+
     def test_sector_config_sorts_boundaries_and_rejects_duplicates(self):
         config = sender.normalize_sector_config({
             'enabled': True,
@@ -177,6 +181,7 @@ class SenderReleaseReadinessTests(unittest.TestCase):
             })
 
         self.assertEqual(200, settings.status_code)
+        self.assertEqual(sender.APP_VERSION, settings.get_json()['app_version'])
         self.assertEqual([{
             'id': 0,
             'prompt': 'Favorite manufacturer',
