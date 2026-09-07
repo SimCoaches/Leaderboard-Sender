@@ -68,6 +68,58 @@ def find_resource_file(filename):
             return directory, safe_name
     return None, safe_name
 
+
+CUSTOM_IPAD_LOGO_STEM = 'ipad-customer-logo'
+CUSTOM_IPAD_LOGO_SUFFIXES = {'.png', '.jpg', '.jpeg', '.webp'}
+
+
+def install_custom_ipad_logo(source_path):
+    """Copy a selected customer logo beside the app and return its saved path."""
+    source = Path(str(source_path or '')).expanduser()
+    suffix = source.suffix.lower()
+    if not source.is_file():
+        raise ValueError('The selected logo file does not exist.')
+    if suffix not in CUSTOM_IPAD_LOGO_SUFFIXES:
+        raise ValueError('Logo must be a PNG, JPG, JPEG, or WebP image.')
+    if QImage(str(source)).isNull():
+        raise ValueError('The selected logo is not a readable image.')
+
+    destination_dir = get_app_install_path() / 'resources'
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    destination = destination_dir / f'{CUSTOM_IPAD_LOGO_STEM}{suffix}'
+    if source.resolve() != destination.resolve():
+        shutil.copy2(source, destination)
+    return destination
+
+
+def get_active_ipad_logo_path():
+    """Return the configured customer logo, otherwise the bundled default."""
+    window = globals().get('main_window')
+    if window is not None and hasattr(window, 'logo_image_path'):
+        selected = Path(window.logo_image_path.text().strip())
+        if selected.is_file():
+            return selected
+        # An empty field intentionally means "use the default"; do not revive
+        # an older path from settings before the operator presses Apply.
+    elif 'load_app_settings' in globals():
+        selected = Path(str(load_app_settings().get('logo_image_path', '')).strip())
+        if selected.is_file():
+            return selected
+
+    directory, safe_name = find_resource_file('logo.png')
+    return (Path(directory) / safe_name) if directory else None
+
+
+def get_ipad_logo_revision():
+    """Stable cache-buster used by open registration and queue pages."""
+    logo_path = get_active_ipad_logo_path()
+    if not logo_path:
+        return 'missing'
+    try:
+        return f'{logo_path.name}-{logo_path.stat().st_mtime_ns}'
+    except OSError:
+        return logo_path.name
+
 def get_default_web_background():
     """Return the default mobile page background image.
 
@@ -1903,6 +1955,12 @@ HTML_CONTENT = r"""
                         document.body.style.backgroundImage = 'url("/backgrounds/' + data.background_image + '")';
                     } else {
                         document.body.style.backgroundImage = 'none';
+                    }
+                    // Customer logo (cache-busted so an open iPad updates after Apply)
+                    const companyLogo = document.getElementById('companyLogo');
+                    if (companyLogo) {
+                        const logoUrl = '/logo?v=' + encodeURIComponent(data.logo_revision || 'default');
+                        if (companyLogo.getAttribute('src') !== logoUrl) companyLogo.src = logoUrl;
                     }
                     // Timer/Laps display
                     const timerStatus = document.getElementById('timerStatus');
@@ -3964,6 +4022,10 @@ QUEUE_HTML_CONTENT = r"""
                     } else {
                         document.body.style.backgroundImage = 'none';
                     }
+                    const companyLogo = document.getElementById('companyLogo');
+                    if (companyLogo) {
+                        companyLogo.src = '/logo?v=' + encodeURIComponent(data.logo_revision || 'default');
+                    }
                 })
                 .catch(e => console.error('Error loading settings:', e));
         }
@@ -4714,6 +4776,7 @@ def get_settings():
             'require_email': False,
             'require_phone': False,
             'background_image': get_default_web_background(),
+            'logo_revision': get_ipad_logo_revision(),
             'timer_active': False,
             'timer_seconds_left': 0,
             'rotation_mode': 'Time',
@@ -4765,6 +4828,7 @@ def get_settings():
         'require_email': is_email_collection_enabled(),
         'require_phone': is_phone_collection_enabled(),
         'background_image': background_image,
+        'logo_revision': get_ipad_logo_revision(),
         'timer_active': timer_active,
         'timer_seconds_left': timer_seconds_left,
         'rotation_mode': rotation_mode,
@@ -4782,10 +4846,12 @@ def background_file(filename):
 
 @app.route('/logo')
 def serve_logo():
-    directory, safe_name = find_resource_file('logo.png')
-    if not directory:
+    logo_path = get_active_ipad_logo_path()
+    if not logo_path:
         return ("Logo not found", 404)
-    return send_from_directory(str(directory), safe_name)
+    response = send_from_directory(str(logo_path.parent), logo_path.name)
+    response.headers['Cache-Control'] = 'no-store, max-age=0'
+    return response
 
 @app.route('/api/get_receiver_url', methods=['GET'])
 def get_receiver_url():
@@ -8480,15 +8546,20 @@ class LapTimeSenderWindow(QMainWindow):
 
     # Result of a background lap POST, delivered back on the GUI thread
     lap_send_finished = pyqtSignal(object)
+    retry_delivery_finished = pyqtSignal(object)
 
     def __init__(self):
         super().__init__()
         self.lap_send_finished.connect(self._on_lap_send_finished)
+        self.retry_delivery_finished.connect(self._on_retry_delivery_finished)
         self.pending_extension_minutes = 0
         self.current_monitor = None
         self.local_ip = get_local_ip()
         self.web_port = select_web_interface_port()
-        self.failed_lap_times = []  # Store failed lap times for retry
+        # Pending jobs retain the payload and only the destinations that
+        # failed, so one healthy receiver cannot hide another failed send.
+        self.failed_lap_times = []
+        self.failed_lap_times_lock = threading.Lock()
         self.retry_timer = None
         self.current_server_url = f"http://{self.local_ip}:5000"  # Store current working URL
         self.timer_end_timestamp = 0  # Initialize driver swap timer end timestamp
@@ -8622,6 +8693,11 @@ class LapTimeSenderWindow(QMainWindow):
                 self.background_image_path.clear()
             elif os.path.exists(path):
                 self.background_image_path.setText(path)
+
+        # Restore the customer logo used by the iPad registration/queue pages.
+        logo_path = str(settings.get('logo_image_path', '')).strip()
+        if logo_path and os.path.isfile(logo_path):
+            self.logo_image_path.setText(logo_path)
 
         # Restore pre-session video toggle state
         if 'pre_session_video_required' in settings:
@@ -9220,16 +9296,29 @@ class LapTimeSenderWindow(QMainWindow):
             grid_layout.addWidget(lbl, row, 0)
             return lbl
 
-        bg_label = grid_label("iPad background", "Custom background image for the sign-up page", 0)
+        logo_label = grid_label(
+            "iPad logo",
+            "Customer logo shown on the registration and queue pages; clear the field to restore Sim Coaches",
+            0,
+        )
+        self.logo_image_path = QLineEdit()
+        self.logo_image_path.setPlaceholderText("Default Sim Coaches logo")
+        grid_layout.addWidget(self.logo_image_path, 0, 1, 1, 2)
+        self.select_logo_button = QPushButton("Browse")
+        self.select_logo_button.setFixedWidth(80)
+        self.select_logo_button.clicked.connect(self.select_logo_image)
+        grid_layout.addWidget(self.select_logo_button, 0, 3)
+
+        bg_label = grid_label("iPad background", "Custom background image for the sign-up page", 1)
         self.background_image_path = QLineEdit()
         self.background_image_path.setPlaceholderText("Default background")
-        grid_layout.addWidget(self.background_image_path, 0, 1, 1, 2)
+        grid_layout.addWidget(self.background_image_path, 1, 1, 1, 2)
         self.select_bg_button = QPushButton("Browse")
         self.select_bg_button.setFixedWidth(80)
         self.select_bg_button.clicked.connect(self.select_background_image)
-        grid_layout.addWidget(self.select_bg_button, 0, 3)
+        grid_layout.addWidget(self.select_bg_button, 1, 3)
 
-        video_enable_label = grid_label("Pre-session video", "Play a 1920x1080 video on the sim after sign-up, before the turn starts", 1)
+        video_enable_label = grid_label("Pre-session video", "Play a 1920x1080 video on the sim after sign-up, before the turn starts", 2)
         self.video_required_toggle = QPushButton("☐ Off")
         self.video_required_toggle.setCheckable(True)
         self.video_required_toggle.setChecked(False)
@@ -9238,25 +9327,25 @@ class LapTimeSenderWindow(QMainWindow):
         self.video_required_toggle.setToolTip("Play video on PC when a driver is set")
         self.video_required_toggle.toggled.connect(
             lambda checked: self.video_required_toggle.setText("⊠ On" if checked else "☐ Off"))
-        grid_layout.addWidget(self.video_required_toggle, 1, 1)
+        grid_layout.addWidget(self.video_required_toggle, 2, 1)
         self.video_path_input = QLineEdit()
         self.video_path_input.setPlaceholderText("Select MP4 video")
-        grid_layout.addWidget(self.video_path_input, 1, 2)
+        grid_layout.addWidget(self.video_path_input, 2, 2)
         self.select_video_button = QPushButton("Browse")
         self.select_video_button.setFixedWidth(80)
         self.select_video_button.clicked.connect(self.select_video_file)
-        grid_layout.addWidget(self.select_video_button, 1, 3)
+        grid_layout.addWidget(self.select_video_button, 2, 3)
 
-        waiting_media_label = grid_label("Waiting screen", "Custom image or looping video shown between drivers", 2)
+        waiting_media_label = grid_label("Waiting screen", "Custom image or looping video shown between drivers", 3)
         self.waiting_media_path = QLineEdit()
         self.waiting_media_path.setPlaceholderText("Default waiting screen (JPG or MP4 to replace)")
-        grid_layout.addWidget(self.waiting_media_path, 2, 1, 1, 2)
+        grid_layout.addWidget(self.waiting_media_path, 3, 1, 1, 2)
         self.select_waiting_media_button = QPushButton("Browse")
         self.select_waiting_media_button.setFixedWidth(80)
         self.select_waiting_media_button.clicked.connect(self.select_waiting_media_file)
-        grid_layout.addWidget(self.select_waiting_media_button, 2, 3)
+        grid_layout.addWidget(self.select_waiting_media_button, 3, 3)
 
-        broadcast_mode_label = grid_label("4th screen (OBS)", "What the OBS broadcast screen shows between drivers", 3)
+        broadcast_mode_label = grid_label("4th screen (OBS)", "What the OBS broadcast screen shows between drivers", 4)
         self.broadcast_mode_combo = QComboBox()
         self.broadcast_mode_combo.addItems([
             "Off (always live camera)",
@@ -9269,13 +9358,13 @@ class LapTimeSenderWindow(QMainWindow):
         )
         self.broadcast_mode_combo.setCurrentIndex(1)
         self.broadcast_mode_combo.currentIndexChanged.connect(self._on_broadcast_mode_changed)
-        grid_layout.addWidget(self.broadcast_mode_combo, 3, 1, 1, 2)
+        grid_layout.addWidget(self.broadcast_mode_combo, 4, 1, 1, 2)
 
         cover_screens_label = grid_label(
             "Cover screens",
             "Monitors the waiting / Out of Time / Challenge Complete screens cover.\n"
             "Tick the driver's screens (all three on a triple setup). Leave the\n"
-            "broadcast monitor unticked so it keeps showing the OBS feed.", 4)
+            "broadcast monitor unticked so it keeps showing the OBS feed.", 5)
         self.cover_screens_widget = QWidget()
         cover_screens_layout = QHBoxLayout(self.cover_screens_widget)
         cover_screens_layout.setContentsMargins(0, 0, 0, 0)
@@ -9297,7 +9386,7 @@ class LapTimeSenderWindow(QMainWindow):
             self.cover_screen_checkboxes[screen.name()] = box
             cover_screens_layout.addWidget(box)
         cover_screens_layout.addStretch()
-        grid_layout.addWidget(self.cover_screens_widget, 4, 1, 1, 3)
+        grid_layout.addWidget(self.cover_screens_widget, 5, 1, 1, 3)
         screens_layout.addLayout(grid_layout)
 
         apply_row = QHBoxLayout()
@@ -9715,50 +9804,90 @@ class LapTimeSenderWindow(QMainWindow):
         self.retry_timer.start()
 
     def retry_failed_laps(self):
-        """Attempt to resend any failed lap times"""
-        if self.failed_lap_times:
-            print(f"\nAttempting to resend {len(self.failed_lap_times)} failed lap times...")
-            
-            # Retry against every configured receiver (comma-separated), same
-            # as send_lap_time; success on any receiver clears the lap.
-            server_url_str = self.current_server_url or self.server_url.text().strip()
-            server_urls = [u.strip() for u in str(server_url_str).split(',') if u.strip()]
+        """Retry every failed payload/destination pair independently."""
+        try:
+            with self.failed_lap_times_lock:
+                pending_jobs = self.failed_lap_times
+                self.failed_lap_times = []
 
-            successful_sends = []
-            for lap_data in self.failed_lap_times:
-                sent = False
-                for server_url in server_urls:
+            if not pending_jobs:
+                return
+
+            print(f"\nAttempting to resend {len(pending_jobs)} pending delivery job(s)...")
+            delivered_endpoints = 0
+            for job in pending_jobs:
+                lap_data = dict(job.get('data') or {})
+                failed_urls = []
+                for server_url in job.get('urls', []):
                     try:
-                        headers = {'Content-Type': 'application/json'}
                         response = requests.post(
                             server_url,
                             json=lap_data,
-                            headers=headers,
+                            headers={'Content-Type': 'application/json'},
                             timeout=5
                         )
                         if response.status_code == 200:
-                            sent = True
-                    except:
-                        pass
-                if sent:
-                    successful_sends.append(lap_data)
-                    print(f"Successfully resent lap time: {lap_data['lap_time']:.3f}s")
-                else:
-                    print(f"Failed to resend lap time: {lap_data['lap_time']:.3f}s")
-            
-            # Remove successfully sent lap times from the queue
-            for lap_data in successful_sends:
-                self.failed_lap_times.remove(lap_data)
-            
-            # Update status if any laps were resent
-            if successful_sends:
-                self.show_success(f"✅ Successfully resent {len(successful_sends)} lap time(s)!")
-            
-            if self.failed_lap_times:
-                self.status_label.setText(f"⚠️ {len(self.failed_lap_times)} lap time(s) pending resend...")
-        
-        # Restart the timer
-        self.start_retry_timer()
+                            delivered_endpoints += 1
+                            print(
+                                f"Successfully resent lap time to {server_url}: "
+                                f"{float(lap_data.get('lap_time', 0)):.3f}s"
+                            )
+                        else:
+                            failed_urls.append(server_url)
+                    except Exception:
+                        failed_urls.append(server_url)
+
+                if failed_urls:
+                    self._queue_failed_delivery(lap_data, failed_urls)
+
+            with self.failed_lap_times_lock:
+                remaining_jobs = len(self.failed_lap_times)
+            self.retry_delivery_finished.emit({
+                'attempted_jobs': len(pending_jobs),
+                'delivered_endpoints': delivered_endpoints,
+                'remaining_jobs': remaining_jobs,
+            })
+        finally:
+            self.start_retry_timer()
+
+    @staticmethod
+    def _delivery_identity(data):
+        """Stable identity used to merge retry jobs for the same result."""
+        try:
+            lap_time = f"{float(data.get('lap_time', 0)):.3f}"
+        except (TypeError, ValueError):
+            lap_time = str(data.get('lap_time', ''))
+        return (
+            str(data.get('session_id', '')),
+            str(data.get('simulator_id', '')),
+            lap_time,
+        )
+
+    def _queue_failed_delivery(self, data, failed_urls):
+        """Queue only the receiver URLs that did not acknowledge this result."""
+        urls = list(dict.fromkeys(
+            str(url).strip() for url in failed_urls if str(url).strip()
+        ))
+        if not data or not urls:
+            return
+        identity = self._delivery_identity(data)
+        with self.failed_lap_times_lock:
+            for job in self.failed_lap_times:
+                if self._delivery_identity(job.get('data') or {}) == identity:
+                    job['urls'] = list(dict.fromkeys(job.get('urls', []) + urls))
+                    return
+            self.failed_lap_times.append({'data': dict(data), 'urls': urls})
+
+    def _on_retry_delivery_finished(self, result):
+        """Update Qt widgets on the GUI thread after retrying deliveries."""
+        remaining = int(result.get('remaining_jobs', 0))
+        delivered = int(result.get('delivered_endpoints', 0))
+        if remaining:
+            self.status_label.setText(
+                f"⚠️ {remaining} result delivery job(s) pending resend..."
+            )
+        elif delivered:
+            self.show_success("✅ All pending result destinations received their data.")
 
     def send_lap_time(self, lap_time=None, from_game=True, override_driver="",
                       distance_pct=None, challenge_fail=False):
@@ -9811,12 +9940,20 @@ class LapTimeSenderWindow(QMainWindow):
             # Lead Gen contact data is required for telemetry laps. Manual entries
             # can still be used by staff for corrections without a sign-in record.
             lead_gen_enabled = self.email_field_enabled.isChecked() if hasattr(self, 'email_field_enabled') else False
+            require_email = is_email_collection_enabled()
+            require_phone = is_phone_collection_enabled()
             has_email = bool(getattr(self, 'last_driver_email', ''))
             has_phone = bool(getattr(self, 'last_driver_phone', ''))
             print(f"Lead Gen required: {lead_gen_enabled}, Has email: {has_email}, Has phone: {has_phone}")
-            if lead_gen_enabled and from_game and (not has_email or not has_phone):
+            missing_contact = ((require_email and not has_email) or
+                               (require_phone and not has_phone))
+            if lead_gen_enabled and from_game and missing_contact:
                 print("FAILED: Lead Gen contact info required but not provided (from_game=True)")
-                self.show_error("Lead Gen requires email and phone. Please register via the web interface.")
+                required = " and ".join(
+                    field for field, enabled in (("email", require_email), ("phone", require_phone))
+                    if enabled
+                )
+                self.show_error(f"Lead Gen requires {required}. Please register via the web interface.")
                 return False
 
             # Prepare data with strict type conversion
@@ -9845,9 +9982,10 @@ class LapTimeSenderWindow(QMainWindow):
                 data["phone"] = self.last_driver_phone
 
             # Sector challenge: distance traveled ranks ahead of time on the
-            # receiver when its distance ranking mode is enabled.
+            # receiver when its distance ranking mode is enabled. Preserve the
+            # telemetry precision for ranking; presentation code may round it.
             if distance_pct is not None:
-                data["distance_pct"] = float(round(max(0.0, min(distance_pct, 100.0)), 2))
+                data["distance_pct"] = float(max(0.0, min(distance_pct, 100.0)))
 
             # Lead-gen survey answers (question prompt -> chosen option) so
             # partner receivers can collect the full registration record.
@@ -9945,14 +10083,20 @@ class LapTimeSenderWindow(QMainWindow):
             success_count = int(result.get('success_count', 0))
             total_urls = int(result.get('total', 0))
             data = result.get('data') or {}
+            failed_urls = result.get('failed_urls') or []
+            if not total_urls:
+                self.show_error("❌ No leaderboard receiver URL is configured.")
+                return
+            if failed_urls:
+                self._queue_failed_delivery(data, failed_urls)
             if total_urls and success_count == total_urls:
                 self.show_success(f"✅ Lap time {lap_time:.3f}s sent successfully!")
             elif success_count > 0:
-                self.show_success(f"✅ Lap time {lap_time:.3f}s sent to {success_count}/{total_urls} receivers")
+                self.show_success(
+                    f"✅ Lap time {lap_time:.3f}s sent to {success_count}/{total_urls} receivers; "
+                    "failed destinations are queued for retry"
+                )
             else:
-                # All failed - add to retry queue
-                if data and data not in self.failed_lap_times:
-                    self.failed_lap_times.append(data)
                 self.show_error(f"❌ Failed to send to all {total_urls} receiver(s). Will retry automatically.")
         except Exception as e:
             self.show_error(f"❌ Error reporting lap send: {e}")
@@ -11337,6 +11481,19 @@ class LapTimeSenderWindow(QMainWindow):
             shutil.copy(file_path, destination)
             self.show_success(f"Background image set to: {filename}")
 
+    def select_logo_image(self):
+        """Choose the customer logo displayed on the iPad web pages."""
+        from PyQt6.QtWidgets import QFileDialog
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select iPad Customer Logo",
+            "",
+            "Logo Images (*.png *.jpg *.jpeg *.webp)",
+        )
+        if file_path:
+            self.logo_image_path.setText(file_path)
+            self.show_success("Customer logo selected - click Apply to save it")
+
     def select_video_file(self):
         from PyQt6.QtWidgets import QFileDialog
         file_path, _ = QFileDialog.getOpenFileName(
@@ -11408,6 +11565,18 @@ class LapTimeSenderWindow(QMainWindow):
             self.video_required_toggle.setChecked(False)
             self.show_error("Please select a video file to enable pre-session video")
 
+        # Keep a managed copy so the logo remains available if the original
+        # download or USB file is moved after event setup.
+        logo_path = self.logo_image_path.text().strip()
+        if logo_path:
+            try:
+                installed_logo = install_custom_ipad_logo(logo_path)
+                logo_path = str(installed_logo)
+                self.logo_image_path.setText(logo_path)
+            except (OSError, ValueError) as e:
+                self.show_error(f"Error setting customer logo: {e}")
+                return
+
         # Process background image
         if self.background_image_path.text():
             # Make sure the background image exists
@@ -11437,6 +11606,8 @@ class LapTimeSenderWindow(QMainWindow):
             details.append(f"Timer: {timer_minutes}min")
         if self.background_image_path.text():
             details.append("Custom background")
+        if logo_path:
+            details.append("Customer logo")
         
         if self.pre_session_video_required:
             details.append("Pre-session video ON")
@@ -11444,17 +11615,20 @@ class LapTimeSenderWindow(QMainWindow):
             message += f" ({', '.join(details)})"
 
         # Save all settings to persist across restarts
-        settings = {
+        settings = load_app_settings()
+        settings.update({
             'pre_session_video_path': self.video_path_input.text(),
             'waiting_media_path': self.waiting_media_path.text(),
             'background_image_path': self.background_image_path.text(),
+            'logo_image_path': logo_path,
             'pre_session_video_required': self.video_required_toggle.isChecked(),
             'lead_gen_enabled': lead_gen_enabled,
             'rotation_mode': self.rotation_mode_selector.currentText(),
             'rotation_time': self.time_target_input.text() if hasattr(self, 'time_target_input') else '5',
             'rotation_laps': self.lap_target_input.text() if hasattr(self, 'lap_target_input') else '10',
-            'lead_gen_enabled': self.email_field_enabled.isChecked()
-        }
+            'collect_email': self.collect_email_checkbox.isChecked(),
+            'collect_phone': self.collect_phone_checkbox.isChecked(),
+        })
         save_app_settings(settings)
 
         self.show_success(message)

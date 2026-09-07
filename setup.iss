@@ -1,5 +1,5 @@
 #define MyAppName "Lap Time Sender"
-#define MyAppVersion "1.0"
+#define MyAppVersion "1.4.1"
 #define MyAppPublisher "Sim Coaches LLC"
 #define MyAppURL "https://simcoaches.com/"
 #define MyAppExeName "Lap Time Sender.exe"
@@ -102,4 +102,4 @@ begin
       Result := True;
     end;
   end;
-end; 
+end;

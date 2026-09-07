@@ -2,6 +2,7 @@
 
 from PyInstaller.utils.hooks import collect_all
 import PyQt6.sip
+from pathlib import Path
 
 qrcode_datas, qrcode_binaries, qrcode_hiddenimports = collect_all('qrcode')
 sip_binary = PyQt6.sip.__file__
@@ -21,6 +22,17 @@ a = Analysis(
     noarchive=False,
     optimize=0,
 )
+
+# Qt uses the Windows ICU shim. Some build machines also put a third-party
+# ICU runtime on PATH (for example Poppler); PyInstaller can collect that DLL
+# and place it ahead of System32, which makes Qt6Core fail at startup.
+a.binaries = [
+    entry for entry in a.binaries
+    if not (
+        Path(entry[0]).name.lower().startswith('icu')
+        and Path(entry[0]).name.lower().endswith('.dll')
+    )
+]
 pyz = PYZ(a.pure)
 
 exe = EXE(
