@@ -81,27 +81,51 @@ end
 loadStartPoint()
 
 local function rememberStartPoint()
+  -- Once a point is saved, never replace it just because the car later passes
+  -- this window on a poor line. Re-learn or the manual save button explicitly
+  -- opts the operator into choosing a new point.
+  if savedThisSession then return end
   local car = ac.getCar(0)
   if not car then return end
   local sp = car.splinePosition
-  -- just before the line, and actually moving along the track
-  if sp and sp > 0.985 and sp < 0.999 and car.speedKmh and car.speedKmh > 5 then
+  -- Keep the automatic capture very close to the line. On the Nordschleife,
+  -- the old 98.5%-99.9% window covered hundreds of metres and could remember
+  -- a poor recovery line. Operators can always use "Save current position".
+  if sp and sp > 0.997 and sp < 0.9997 and car.speedKmh and car.speedKmh > 5 then
     gridPos = vec3(car.position.x, car.position.y, car.position.z)
     gridFwd = vec3(car.look.x, car.look.y, car.look.z)
-    if not savedThisSession then
-      saveStartPoint()
-      savedThisSession = true
-      ac.log('LeaderboardSector: start point learned and saved for this track')
-    end
+    saveStartPoint()
+    savedThisSession = true
+    ac.log('LeaderboardSector: start point learned and saved for this track')
   end
 end
 
 local function runCommand(body)
   local action, id, arg = body:match('^(%w+)|(%d+)|(%S+)$')
   id = tonumber(id)
-  if action ~= 'teleport' or not id then return end
+  if not id then return end
   if id <= lastExecutedId then return end  -- already handled, server just hasn't seen the ack yet
   lastExecutedId = id
+
+  if action == 'capture' then
+    local car = ac.getCar(0)
+    if not car then
+      sendAck(id, false, 'Could not read the player car')
+      return
+    end
+    gridPos = vec3(car.position.x, car.position.y, car.position.z)
+    gridFwd = vec3(car.look.x, car.look.y, car.look.z)
+    saveStartPoint()
+    savedThisSession = true
+    lastTeleportText = string.format('Saved current position as start point (command %d)', id)
+    sendAck(id, true, lastTeleportText)
+    return
+  end
+
+  if action ~= 'teleport' then
+    sendAck(id, false, 'Unknown command: ' .. tostring(action))
+    return
+  end
 
   local usedRecalled = false
   local ok, err = pcall(function()
@@ -182,5 +206,15 @@ function script.windowMain(dt)
     gridPos, gridFwd, savedThisSession = nil, nil, false
     pcall(function() storedPoint:set('') end)
     lastTeleportText = 'Start point cleared - drive past the line to set it again'
+  end
+  if ui.button('Save current position as start point') then
+    local car = ac.getCar(0)
+    if car then
+      gridPos = vec3(car.position.x, car.position.y, car.position.z)
+      gridFwd = vec3(car.look.x, car.look.y, car.look.z)
+      saveStartPoint()
+      savedThisSession = true
+      lastTeleportText = 'Saved current car position as the reset point'
+    end
   end
 end

@@ -31,6 +31,19 @@ python lap_time_sender.py
 - The status label will show success/error messages
 - Invalid inputs will be caught and displayed as errors
 
+## Nurburgring Sector Challenge
+
+1. Enable the custom sector challenge and confirm all 13 sector boundaries and target times.
+2. In Assetto Corsa, park the car on the racing line just before start/finish.
+3. In Sender, click **Save Current Car as Start**. The saved point is kept per track layout and is used for automatic resets.
+4. Use **Reset Car Now** once as a pre-event check.
+
+Sector progress advances only when telemetry crosses the next configured boundary in order. Starting or restarting near sector 13 cannot count the earlier sectors. A reset is disarmed before the car moves, so it cannot be recorded as a completed run.
+
+## iPad Registration Branding
+
+In Sender settings, choose **iPad logo > Browse**, select the customer's PNG, JPG, GIF, or WebP image, and click **Apply**. Sender keeps a managed copy and updates open registration and queue pages automatically. Clear the field and apply to restore the bundled Sim Coaches logo.
+
 ## Building the Executable
 
 To rebuild the executable:

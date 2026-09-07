@@ -237,9 +237,11 @@ class SenderReleaseReadinessTests(unittest.TestCase):
         monitor._challenge_update(types.SimpleNamespace(
             normalizedCarPosition=0.01, iCurrentTime=10,
         ))
-        monitor._challenge_update(types.SimpleNamespace(
-            normalizedCarPosition=0.20, iCurrentTime=510,
-        ))
+        for position, lap_ms in ((0.05, 110), (0.10, 210), (0.15, 310),
+                                 (0.20, 510), (0.25, 710), (0.30, 910)):
+            monitor._challenge_update(types.SimpleNamespace(
+                normalizedCarPosition=position, iCurrentTime=lap_ms,
+            ))
         monitor._challenge_update(types.SimpleNamespace(
             normalizedCarPosition=0.30123456, iCurrentTime=1111,
         ))
@@ -248,6 +250,77 @@ class SenderReleaseReadinessTests(unittest.TestCase):
         self.assertEqual(0, failures[0][0])
         self.assertAlmostEqual(30.123456, failures[0][1], places=6)
         self.assertAlmostEqual(1.101, failures[0][2], places=3)
+
+    def test_startup_near_finish_cannot_skip_thirteen_sectors(self):
+        monitor = sender.AssettoCorsaMonitor()
+        completions = []
+        monitor.challenge_completed.connect(completions.append)
+        monitor.set_challenge_config({
+            'enabled': True,
+            'ignore_out_lap': False,
+            'sectors': [
+                {'start_pct': index * (100.0 / 13.0), 'target_time': 60.0}
+                for index in range(13)
+            ],
+        })
+
+        # AC's first HOTLAP_START sample can be near 100%. It may arm a run,
+        # but sitting there must not satisfy the twelve earlier boundaries.
+        monitor._challenge_update(types.SimpleNamespace(
+            normalizedCarPosition=0.990, iCurrentTime=10,
+        ))
+        monitor._challenge_update(types.SimpleNamespace(
+            normalizedCarPosition=0.991, iCurrentTime=30,
+        ))
+        for index in range(15):
+            monitor._challenge_update(types.SimpleNamespace(
+                normalizedCarPosition=0.992 + (index * 0.0001),
+                iCurrentTime=50 + (index * 20),
+            ))
+        monitor._challenge_update(types.SimpleNamespace(
+            normalizedCarPosition=0.010, iCurrentTime=10,
+        ))
+
+        self.assertEqual([], completions)
+        self.assertEqual('running', monitor._chal_state)
+        self.assertEqual(0, monitor._chal_sector)
+
+    def test_valid_sector_boundaries_still_complete_in_sequence(self):
+        monitor = sender.AssettoCorsaMonitor()
+        completions = []
+        monitor.challenge_completed.connect(completions.append)
+        monitor.set_challenge_config({
+            'enabled': True,
+            'ignore_out_lap': True,
+            'sectors': [
+                {'start_pct': 0.0, 'target_time': 20.0},
+                {'start_pct': 50.0, 'target_time': 20.0},
+            ],
+        })
+
+        samples = [(0.99, 990), (0.01, 10)]  # arm at start/finish
+        lap_ms = 10
+        position = 0.01
+        while position < 0.99:
+            position = min(0.99, position + 0.04)
+            lap_ms += 500
+            samples.append((position, lap_ms))
+        samples.append((0.01, 10))  # finish after both sectors
+        for position, lap_ms in samples:
+            monitor._challenge_update(types.SimpleNamespace(
+                normalizedCarPosition=position, iCurrentTime=lap_ms,
+            ))
+
+        self.assertEqual(1, len(completions))
+        self.assertGreater(completions[0], 0.0)
+
+    def test_csp_reset_point_can_be_saved_and_is_not_silently_overwritten(self):
+        companion = (ROOT / 'ac_app' / 'LeaderboardSector' / 'LeaderboardSector.lua').read_text(
+            encoding='utf-8')
+        self.assertIn("if action == 'capture' then", companion)
+        self.assertIn('Save current position as start point', companion)
+        self.assertIn('if savedThisSession then return end', companion)
+        self.assertIn('physics.setCarPosition(0, gridPos, -gridFwd)', companion)
 
     def test_partial_delivery_queues_only_failed_destination_and_merges(self):
         worker = types.SimpleNamespace(

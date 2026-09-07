@@ -4483,14 +4483,24 @@ def ac_app_alive():
     with ac_app_lock:
         return (time.time() - ac_app_state['last_poll']) < 3.0
 
-def ac_app_issue_teleport(spawn):
-    """Queue a teleport command for the CSP app; returns the command id."""
+def ac_app_issue_command(action, argument='CURRENT'):
+    """Queue a one-shot command for the CSP companion app."""
     with ac_app_lock:
         cmd_id = ac_app_state['next_id']
         ac_app_state['next_id'] += 1
-        ac_app_state['command'] = {'id': cmd_id, 'action': 'teleport',
-                                   'spawn': spawn, 'issued': time.time()}
+        ac_app_state['command'] = {'id': cmd_id, 'action': str(action),
+                                   'spawn': str(argument), 'issued': time.time()}
         return cmd_id
+
+
+def ac_app_issue_teleport(spawn):
+    """Queue a teleport command for the CSP app; returns the command id."""
+    return ac_app_issue_command('teleport', spawn)
+
+
+def ac_app_issue_capture_start():
+    """Ask the CSP app to save the car's current position as the reset point."""
+    return ac_app_issue_command('capture', 'CURRENT')
 
 def ac_app_command_done(cmd_id):
     """True once the CSP app acked the command as executed successfully."""
@@ -6737,9 +6747,11 @@ class AssettoCorsaMonitor(GameMonitor):
         # Testing "prev > 0.9 and pos < 0.1" assumed the spline runs right up
         # to 1.0 and that a sample lands in each window; a wrap of more than
         # half the lap is true regardless of where the spline tops out.
-        line_crossed = (prev_pos - pos) > 0.5
+        position_delta = pos - prev_pos
+        line_crossed = position_delta < -0.5
         timer_reset = timer_valid and prev_timer_valid and lap_ms + 500 < prev_ms
-        teleported = (prev_pos - pos) > 0.05 and not line_crossed
+        max_forward_step = 0.050001  # 5% plus float tolerance
+        teleported = abs(position_delta) > max_forward_step and not line_crossed
 
         # Advance the run clock from AC's own timer, one poll at a time. Only
         # sane forward steps count, so a timer that jumps, resets, or stays
@@ -6793,7 +6805,16 @@ class AssettoCorsaMonitor(GameMonitor):
             i = self._chal_sector
             target_ms = sectors[i]['target_time'] * 1000.0
             elapsed_ms = self._chal_sector_elapsed_ms
-            if i < len(sectors) - 1 and pos >= sectors[i + 1]['start_pct'] / 100.0:
+            next_boundary = (sectors[i + 1]['start_pct'] / 100.0
+                             if i < len(sectors) - 1 else None)
+            # A sector only advances when the car physically crosses its next
+            # boundary in the forward direction. Checking only `pos >= boundary`
+            # let an initial HOTLAP_START spawn near 100% cascade through every
+            # Nürburgring sector in a few telemetry polls.
+            boundary_crossed = (next_boundary is not None
+                                and 0.0 <= position_delta <= max_forward_step
+                                and prev_pos < next_boundary <= pos)
+            if boundary_crossed:
                 passed = elapsed_ms <= target_ms
                 self.sector_result.emit(i, elapsed_ms / 1000.0, sectors[i]['target_time'], passed)
                 if passed:
@@ -9063,10 +9084,15 @@ class LapTimeSenderWindow(QMainWindow):
         reset_car_btn.setToolTip("Put the car back at start/finish now and re-arm the challenge -\n"
                                  "use if an automatic reset didn't happen")
         reset_car_btn.clicked.connect(self.on_reset_car_now)
+        capture_start_btn = QPushButton("📍 Save Current Car as Start")
+        capture_start_btn.setToolTip(
+            "Park the car on the racing line just before start/finish, then save that exact spot for future resets")
+        capture_start_btn.clicked.connect(self.on_capture_start_point)
         for btn in (add_sector_btn, remove_sector_btn, save_sectors_btn):
             sector_btn_row.addWidget(btn)
         sector_btn_row.addStretch(1)
         sector_btn_row.addWidget(preflight_btn)
+        sector_btn_row.addWidget(capture_start_btn)
         sector_btn_row.addWidget(reset_car_btn)
         sector_layout.addLayout(sector_btn_row)
 
@@ -10975,6 +11001,11 @@ class LapTimeSenderWindow(QMainWindow):
         monitor = self.current_monitor
         spawn = self.sector_config.get('teleport_spawn', 'HOTLAP_START')
 
+        # Disarm before issuing the move. A position jump from the final part
+        # of the lap back to zero must never be mistaken for a finish.
+        if monitor is not None and hasattr(monitor, 'request_challenge_reset'):
+            monitor.request_challenge_reset()
+
         if ac_app_alive():
             cmd_id = ac_app_issue_teleport(spawn)
             print(f"[Sectors] Manual reset: teleport command {cmd_id} sent (spawn {spawn})")
@@ -10985,9 +11016,24 @@ class LapTimeSenderWindow(QMainWindow):
             self.show_success("🔄 Restarted the Assetto Corsa session "
                               "(CSP app not connected, so the car returns to its session spawn)")
 
-        # Clear any half-finished run so the next driver starts fresh at the line
-        if monitor is not None and hasattr(monitor, 'request_challenge_reset'):
-            monitor.request_challenge_reset()
+    def on_capture_start_point(self):
+        """Save a known-good, operator-selected reset point through the CSP app."""
+        if not ac_app_alive():
+            self.show_error(
+                "LeaderboardSector is not connected. Open/enable the CSP app in Assetto Corsa first.")
+            return
+        cmd_id = ac_app_issue_capture_start()
+        print(f"[Sectors] Capture-start command {cmd_id} sent to CSP app")
+        self.show_success("📍 Saving the car's current position as the reset point...")
+        QTimer.singleShot(1500, lambda: self._verify_ac_capture_start(cmd_id))
+
+    def _verify_ac_capture_start(self, cmd_id):
+        if ac_app_command_done(cmd_id):
+            self.show_success("✅ Start/reset point saved for this Nürburgring layout")
+        else:
+            ac_app_clear_command(cmd_id)
+            self.show_error(
+                "Could not save the start point. Keep Assetto Corsa running and confirm the LeaderboardSector CSP app is connected.")
 
     def _update_csp_status(self):
         """Show whether the in-game CSP app is polling, and what the challenge
@@ -11183,6 +11229,8 @@ class LapTimeSenderWindow(QMainWindow):
     def _reset_car_for_next_driver(self):
         """Put the car back for the next driver. Called once the end-of-run
         screen is already covering the game, so nobody watches it happen."""
+        if self.current_monitor and hasattr(self.current_monitor, 'request_challenge_reset'):
+            self.current_monitor.request_challenge_reset()
         if ac_app_alive():
             spawn = self.sector_config.get('teleport_spawn', 'HOTLAP_START')
             cmd_id = ac_app_issue_teleport(spawn)
