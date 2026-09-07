@@ -107,6 +107,51 @@ class SenderReleaseReadinessTests(unittest.TestCase):
             ]
         }))
 
+    def test_waiting_background_cover_crop_stays_centered_without_distortion(self):
+        # Exact 3440x1440 event artwork must remain pixel-for-pixel centered
+        # on the matching ultrawide monitors shown in the field video.
+        self.assertEqual(
+            (0, 0, 3440, 1440),
+            sender.centered_cover_crop(3440, 1440, 3440, 1440),
+        )
+        # A wider source is cropped equally from the left and right rather
+        # than being stretched by QLabel.setScaledContents().
+        self.assertEqual(
+            (440, 0, 2560, 1440),
+            sender.centered_cover_crop(3440, 1440, 1920, 1080),
+        )
+        # A taller source is cropped equally from the top and bottom.
+        self.assertEqual(
+            (0, 420, 2160, 2160),
+            sender.centered_cover_crop(2160, 3000, 1920, 1920),
+        )
+
+    def test_waiting_overlay_propagates_every_state_to_covered_screens(self):
+        calls = []
+
+        class FakeBlanker:
+            def set_media(self, path):
+                calls.append(('media', path))
+
+            def show_default_content(self):
+                calls.append(('default',))
+
+            def show_session_complete(self, headline, detail, accent):
+                calls.append(('message', headline, detail, accent))
+
+        overlay = types.SimpleNamespace(_blanker_state=('default',))
+        sender.WaitingOverlay._apply_blanker_state(overlay, FakeBlanker())
+        overlay._blanker_state = ('media', 'event-background.png')
+        sender.WaitingOverlay._apply_blanker_state(overlay, FakeBlanker())
+        overlay._blanker_state = ('message', 'Out of Time', 'Next driver', '#f48771')
+        sender.WaitingOverlay._apply_blanker_state(overlay, FakeBlanker())
+
+        self.assertEqual([
+            ('default',),
+            ('media', 'event-background.png'),
+            ('message', 'Out of Time', 'Next driver', '#f48771'),
+        ], calls)
+
     def test_registration_contract_validates_and_preserves_guest_fields(self):
         window = RegistrationWindow()
         sender.main_window = window

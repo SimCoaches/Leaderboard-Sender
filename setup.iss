@@ -1,5 +1,5 @@
 #define MyAppName "Lap Time Sender"
-#define MyAppVersion "1.4.2"
+#define MyAppVersion "1.4.3"
 #define MyAppPublisher "Sim Coaches LLC"
 #define MyAppURL "https://simcoaches.com/"
 #define MyAppExeName "Lap Time Sender.exe"

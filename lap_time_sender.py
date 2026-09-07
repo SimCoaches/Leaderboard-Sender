@@ -21,7 +21,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                             QMessageBox, QFormLayout, QComboBox, QGridLayout, QFrame,
                             QCheckBox, QTableWidget, QTableWidgetItem, QDialog,
                             QAbstractItemView, QHeaderView, QScrollArea,
-                            QTabWidget)
+                            QTabWidget, QSizePolicy)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QObject, QUrl
 from PyQt6.QtGui import QImage, QPixmap, QIcon, QFont, QColor
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
@@ -8148,6 +8148,127 @@ class BroadcastDirector(threading.Thread):
         return True
 
 
+def centered_cover_crop(source_width, source_height, target_width, target_height):
+    """Return a centered source rectangle that covers the target aspect ratio.
+
+    The old waiting-screen path pre-scaled a pixmap and then enabled
+    ``setScaledContents(True)``.  Qt consequently stretched that already-scaled
+    image a second time whenever a monitor, DPI setting, or layout gave the
+    label a slightly different size.  Computing the crop from the untouched
+    source keeps the artwork centered and undistorted on every monitor.
+    """
+    values = (source_width, source_height, target_width, target_height)
+    if any(int(value) <= 0 for value in values):
+        return 0, 0, 0, 0
+
+    source_width = int(source_width)
+    source_height = int(source_height)
+    target_width = int(target_width)
+    target_height = int(target_height)
+    source_ratio = source_width / source_height
+    target_ratio = target_width / target_height
+
+    if source_ratio > target_ratio:
+        crop_height = source_height
+        crop_width = max(1, min(source_width, round(source_height * target_ratio)))
+        crop_x = (source_width - crop_width) // 2
+        crop_y = 0
+    else:
+        crop_width = source_width
+        crop_height = max(1, min(source_height, round(source_width / target_ratio)))
+        crop_x = 0
+        crop_y = (source_height - crop_height) // 2
+    return crop_x, crop_y, crop_width, crop_height
+
+
+class CenteredCoverImage(QLabel):
+    """A resize-aware, centered ``background-size: cover`` image widget."""
+
+    def __init__(self, pixmap=None, parent=None):
+        super().__init__(parent)
+        self._source_pixmap = QPixmap()
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setScaledContents(False)
+        self.setMinimumSize(0, 0)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+        if pixmap is not None:
+            self.set_source_pixmap(pixmap)
+
+    def set_source_pixmap(self, pixmap):
+        self._source_pixmap = pixmap.copy() if pixmap and not pixmap.isNull() else QPixmap()
+        self._refresh_pixmap()
+
+    def _refresh_pixmap(self):
+        target = self.size()
+        source = self._source_pixmap
+        if source.isNull() or target.width() <= 0 or target.height() <= 0:
+            self.clear()
+            return
+        x, y, width, height = centered_cover_crop(
+            source.width(), source.height(), target.width(), target.height())
+        if width <= 0 or height <= 0:
+            self.clear()
+            return
+        cropped = source.copy(x, y, width, height)
+        QLabel.setPixmap(
+            self,
+            cropped.scaled(
+                target,
+                Qt.AspectRatioMode.IgnoreAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            ),
+        )
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._refresh_pixmap()
+
+
+def build_waiting_message(headline, detail, accent, hint=None,
+                          title_size=52, detail_size=22):
+    """Build the shared full-screen message used on every covered monitor."""
+    content_widget = QWidget()
+    content_layout = QVBoxLayout(content_widget)
+    content_layout.setContentsMargins(36, 36, 36, 36)
+    content_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+    title = QLabel(headline)
+    title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    title.setWordWrap(True)
+    title.setFont(QFont("Segoe UI", title_size, QFont.Weight.Bold))
+    title.setStyleSheet(f"color: {accent}; margin-bottom: 20px;")
+    content_layout.addWidget(title)
+
+    subtitle = QLabel(detail)
+    subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    subtitle.setWordWrap(True)
+    subtitle.setFont(QFont("Segoe UI", detail_size))
+    subtitle.setStyleSheet("color: #cccccc; margin-bottom: 16px;")
+    content_layout.addWidget(subtitle)
+
+    if hint:
+        hint_label = QLabel(hint)
+        hint_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        hint_label.setWordWrap(True)
+        hint_label.setFont(QFont("Segoe UI", 14))
+        hint_label.setStyleSheet("color: #9d9d9d; margin-top: 24px;")
+        content_layout.addWidget(hint_label)
+
+    return content_widget
+
+
+WAITING_HEADLINE = "🏁 Racing Session"
+WAITING_DETAIL = (
+    "Waiting for driver to sign up...\n\n"
+    "📱 Use your mobile device to scan the QR code\n"
+    "and register as the active driver"
+)
+WAITING_HINT = "Press ESC to close this overlay"
+SESSION_COMPLETE_HINT = (
+    "Tip: You can manually show/hide the waiting screen from the desktop app."
+)
+
+
 class ScreenBlanker(QWidget):
     """Cover for one extra monitor, showing the same waiting media as the
     main overlay.
@@ -8168,6 +8289,7 @@ class ScreenBlanker(QWidget):
         self.screen_name = screen.name()
         self.media_path = None
         self.media_player = None
+        self.display_state = ('dark',)
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint |
                             Qt.WindowType.WindowStaysOnTopHint |
                             Qt.WindowType.Tool)
@@ -8179,16 +8301,46 @@ class ScreenBlanker(QWidget):
 
     def set_media(self, file_path):
         """Show the given image/video on this screen, or plain dark for None."""
-        if file_path == self.media_path:
+        if self.display_state == ('media', file_path):
             return
         self.clear_media()
         self.media_path = file_path
+        self.display_state = ('media', file_path) if file_path else ('dark',)
         if not file_path:
             return
         if file_path.lower().endswith(self.VIDEO_EXTENSIONS):
             self._setup_video(file_path)
         else:
             self._setup_image(file_path)
+
+    def show_default_content(self):
+        """Show the same waiting prompt as the primary screen."""
+        if self.display_state == ('default',):
+            return
+        self.clear_media()
+        self.display_state = ('default',)
+        self._layout.addWidget(build_waiting_message(
+            WAITING_HEADLINE,
+            WAITING_DETAIL,
+            "#cccccc",
+            WAITING_HINT,
+            title_size=48,
+            detail_size=22,
+        ))
+
+    def show_session_complete(self, headline, detail, accent):
+        """Extend the end-of-run message onto this covered monitor."""
+        state = ('message', headline, detail, accent)
+        if self.display_state == state:
+            return
+        self.clear_media()
+        self.display_state = state
+        self._layout.addWidget(build_waiting_message(
+            headline,
+            detail,
+            accent,
+            SESSION_COMPLETE_HINT,
+        ))
 
     def clear_media(self):
         if self.media_player:
@@ -8199,17 +8351,15 @@ class ScreenBlanker(QWidget):
             if child.widget():
                 child.widget().deleteLater()
         self.media_path = None
+        self.display_state = ('dark',)
 
     def _setup_image(self, file_path):
         pixmap = QPixmap(file_path)
         if pixmap.isNull():
             return
-        label = QLabel()
-        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        label.setScaledContents(True)
-        # Scaled for THIS screen's size, which may differ from the primary
-        label.setPixmap(pixmap.scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatioByExpanding,
-                                      Qt.TransformationMode.SmoothTransformation))
+        # The label owns the original image and recomputes a centered cover
+        # crop whenever this monitor's logical size changes.
+        label = CenteredCoverImage(pixmap)
         self._layout.addWidget(label)
 
     def _setup_video(self, file_path):
@@ -8219,6 +8369,7 @@ class ScreenBlanker(QWidget):
         audio_output.setVolume(0.0)      # main screen carries the sound
         self.media_player.setAudioOutput(audio_output)
         self.media_player.setVideoOutput(video_widget)
+        video_widget.setAspectRatioMode(Qt.AspectRatioMode.KeepAspectRatioByExpanding)
         self._layout.addWidget(video_widget)
 
         def on_status_changed(status):
@@ -8254,15 +8405,34 @@ class WaitingOverlay(QWidget):
         self.video_widget = None
         self.image_label = None
         self._blankers = {}   # screen name -> ScreenBlanker for extra monitors
-        self._blanker_media = None   # what the side screens show right now (None = dark)
+        # Every covered monitor follows the primary overlay's current state.
+        # This fixes the old end-of-run behavior where side screens were
+        # deliberately reduced to plain dark panels.
+        self._blanker_state = ('default',)
         self.setup_ui()
 
-    def _sync_blanker_media(self, file_path):
-        """Side screens show the waiting media when the main screen does, and
-        go dark for the session-over / default screens."""
-        self._blanker_media = file_path
+    def _apply_blanker_state(self, blanker):
+        kind = self._blanker_state[0]
+        if kind == 'media':
+            blanker.set_media(self._blanker_state[1])
+        elif kind == 'message':
+            blanker.show_session_complete(*self._blanker_state[1:])
+        elif kind == 'default':
+            blanker.show_default_content()
+        else:
+            blanker.set_media(None)
+
+    def _sync_blanker_state(self, state):
+        """Put every covered side monitor into the same overlay state."""
+        self._blanker_state = state
         for blanker in self._blankers.values():
-            blanker.set_media(file_path)
+            self._apply_blanker_state(blanker)
+
+    def _refresh_primary_geometry(self):
+        """Follow the current primary monitor geometry and DPI arrangement."""
+        screen = QApplication.primaryScreen()
+        if screen is not None:
+            self.setGeometry(screen.geometry())
 
     def set_covered_screens(self, screen_names):
         """Choose which additional monitors get blanked alongside the primary
@@ -8279,7 +8449,7 @@ class WaitingOverlay(QWidget):
             name = screen.name()
             if name in wanted and name not in self._blankers:
                 blanker = ScreenBlanker(screen)
-                blanker.set_media(self._blanker_media)
+                self._apply_blanker_state(blanker)
                 self._blankers[name] = blanker
                 if self.isVisible():
                     blanker.show()
@@ -8320,48 +8490,17 @@ class WaitingOverlay(QWidget):
         
     def show_default_content(self):
         """Show default waiting screen content when no custom media is set"""
-        # Clear existing content; side screens go dark
+        # Clear existing content and mirror this state to all covered screens.
         self.clear_media()
-        self._sync_blanker_media(None)
-        
-        # Create centered content
-        content_widget = QWidget()
-        content_layout = QVBoxLayout(content_widget)
-        content_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        
-        # Title
-        title = QLabel("🏁 Racing Session")
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        title_font = QFont("Segoe UI", 48, QFont.Weight.Bold)
-        title.setFont(title_font)
-        title.setStyleSheet("color: #cccccc; margin-bottom: 20px;")
-        content_layout.addWidget(title)
-        
-        # Subtitle
-        subtitle = QLabel("Waiting for driver to sign up...")
-        subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        subtitle_font = QFont("Segoe UI", 24)
-        subtitle.setFont(subtitle_font)
-        subtitle.setStyleSheet("color: #9d9d9d; margin-bottom: 40px;")
-        content_layout.addWidget(subtitle)
-        
-        # Instructions
-        instructions = QLabel("📱 Use your mobile device to scan the QR code\nand register as the active driver")
-        instructions.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        instructions_font = QFont("Segoe UI", 18)
-        instructions.setFont(instructions_font)
-        instructions.setStyleSheet("color: #007acc; line-height: 1.5;")
-        content_layout.addWidget(instructions)
-        
-        # Close instruction
-        close_info = QLabel("Press ESC to close this overlay")
-        close_info.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        close_info_font = QFont("Segoe UI", 14)
-        close_info.setFont(close_info_font)
-        close_info.setStyleSheet("color: #6e6e6e; margin-top: 40px;")
-        content_layout.addWidget(close_info)
-        
-        self.layout.addWidget(content_widget)
+        self._sync_blanker_state(('default',))
+        self.layout.addWidget(build_waiting_message(
+            WAITING_HEADLINE,
+            WAITING_DETAIL,
+            "#cccccc",
+            WAITING_HINT,
+            title_size=48,
+            detail_size=22,
+        ))
 
     def show_session_complete(self, headline=None, detail=None, accent=None):
         """Show a prominent end-of-session interstitial.
@@ -8370,38 +8509,19 @@ class WaitingOverlay(QWidget):
         its own wording so a driver is told they ran out of time in a sector
         rather than being dropped to the waiting screen with no explanation.
         """
-        # Stop and clear any media, then show completion message. Side
-        # screens go dark so the message on the main screen is the focus.
+        # Stop and clear any media, then extend the same completion state to
+        # every covered monitor before the simulator is reset behind it.
         self.clear_media()
-        self._sync_blanker_media(None)
-
-        content_widget = QWidget()
-        content_layout = QVBoxLayout(content_widget)
-        content_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
-        title = QLabel(headline or "✅ Session Complete")
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        title_font = QFont("Segoe UI", 52, QFont.Weight.Bold)
-        title.setFont(title_font)
-        title.setStyleSheet(f"color: {accent or '#4ec9b0'}; margin-bottom: 20px;")
-        content_layout.addWidget(title)
-
-        subtitle = QLabel(detail or "Please change driver. Returning to waiting screen...")
-        subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        subtitle.setWordWrap(True)
-        subtitle_font = QFont("Segoe UI", 22)
-        subtitle.setFont(subtitle_font)
-        subtitle.setStyleSheet("color: #cccccc; margin-bottom: 16px;")
-        content_layout.addWidget(subtitle)
-        
-        hint = QLabel("Tip: You can manually show/hide the waiting screen from the desktop app.")
-        hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        hint_font = QFont("Segoe UI", 14)
-        hint.setFont(hint_font)
-        hint.setStyleSheet("color: #9d9d9d;")
-        content_layout.addWidget(hint)
-        
-        self.layout.addWidget(content_widget)
+        headline = headline or "✅ Session Complete"
+        detail = detail or "Please change driver. Returning to waiting screen..."
+        accent = accent or '#4ec9b0'
+        self._sync_blanker_state(('message', headline, detail, accent))
+        self.layout.addWidget(build_waiting_message(
+            headline,
+            detail,
+            accent,
+            SESSION_COMPLETE_HINT,
+        ))
         
     def keyPressEvent(self, event):
         """Handle key press events"""
@@ -8425,14 +8545,16 @@ class WaitingOverlay(QWidget):
             self.setup_video()
         else:
             self.setup_image()
-        # Every covered side screen shows the same media, sized for itself
-        self._sync_blanker_media(file_path)
+        # Every covered screen shows the same media, independently centered
+        # and cropped to that monitor's exact geometry.
+        self._sync_blanker_state(('media', file_path))
             
     def clear_media(self):
         """Clear any existing media widgets"""
         # Stop video if playing
         if self.media_player:
             self.media_player.stop()
+            self.media_player = None
             
         # Remove all widgets from layout
         while self.layout.count():
@@ -8445,19 +8567,12 @@ class WaitingOverlay(QWidget):
         
     def setup_image(self):
         """Setup image display"""
-        self.image_label = QLabel()
-        self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.image_label.setScaledContents(True)
-        
         # Load and display image
         pixmap = QPixmap(self.media_path)
         if not pixmap.isNull():
-            # Scale to fill screen while maintaining aspect ratio
-            screen = QApplication.primaryScreen()
-            screen_size = screen.geometry().size()
-            scaled_pixmap = pixmap.scaled(screen_size, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
-            self.image_label.setPixmap(scaled_pixmap)
-        
+            self.image_label = CenteredCoverImage(pixmap)
+        else:
+            self.image_label = QLabel()
         self.layout.addWidget(self.image_label)
         
     def setup_video(self):
@@ -8471,6 +8586,7 @@ class WaitingOverlay(QWidget):
         audio_output.setVolume(1.0)
         self.media_player.setAudioOutput(audio_output)
         self.media_player.setVideoOutput(self.video_widget)
+        self.video_widget.setAspectRatioMode(Qt.AspectRatioMode.KeepAspectRatioByExpanding)
         
         # Set video to fill the overlay
         self.layout.addWidget(self.video_widget)
@@ -8490,6 +8606,7 @@ class WaitingOverlay(QWidget):
         
     def show(self):
         """Show the overlay (and the side-screen covers) and start video if applicable"""
+        self._refresh_primary_geometry()
         super().show()
         for blanker in self._blankers.values():
             blanker.show()
