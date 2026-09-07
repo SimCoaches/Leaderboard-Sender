@@ -44,10 +44,15 @@ subsystem.
 3. Register again, deliberately park until a sector time expires.
    - Expect, in order:
      - Red ✘ sector flash on the driver's screens
+     - The **Out of Time** screen appears centered on every monitor checked
+       under Advanced → Cover screens; no selected side screen stays on the
+       game or falls back to a plain dark panel
      - Car teleports to just before start/finish (**no** Ctrl+O restart —
        the Sender console should log "Teleport command N sent to CSP app"
        and "CSP teleport confirmed")
-     - Waiting screen comes up; driver cleared
+     - The custom waiting image returns on every checked monitor, fills each
+       screen edge-to-edge, and remains centered without stretching; driver
+       is cleared
    - Next driver registers → crossing the line arms sector 1 fresh.
 4. Pull the CSP app (close AC, or rename the LeaderboardSector folder)
    and fail a sector again → expect the Ctrl+O fallback to restart the
@@ -69,6 +74,12 @@ Sender → Advanced → **4th Screen**:
      If the very first fail shows the Waiting scene instead of a replay,
      that's the documented fallback; the second run should replay.
 3. **Off**: fail a run → 4th monitor just keeps the live camera (parked car).
+
+The 4th OBS screen is separate from **Cover screens**. Leave the broadcast
+monitor unchecked there; check all of the simulator's driver-facing monitors.
+For the three 3440×1440 driver screens shown in the field video, use a
+3440×1440 waiting image. The image is centered and fitted independently on
+each checked monitor.
 
 ## 5. Leaderboard flow + run log (5 min)
 
