@@ -1,0 +1,12 @@
+{
+  "enabled": false,
+  "provider": "textbelt",
+  "textbelt_key": "",
+  "textbelt_sender": "Sim Coaches",
+  "twilio_account_sid": "",
+  "twilio_auth_token": "",
+  "twilio_from_number": "",
+  "message_template": "You are next in line for the simulator. Please return to the registration area.",
+  "headsup_message_template": "You are almost up for the simulator. Please be ready.",
+  "confirmation_message_template": "Registration confirmed. We will notify you when it is your turn."
+}

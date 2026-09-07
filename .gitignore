@@ -21,6 +21,9 @@ Thumbs.db
 # Logs
 *.log
 
+# Local credentials and service configuration
+sms_config.json
+
 # Temp
 *.tmp
 *.bak
