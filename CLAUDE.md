@@ -174,6 +174,11 @@ All OBS calls fail soft; the sim is never blocked.
 3. Main window sends lap to leaderboard server via HTTP POST
 4. Failed submissions queued and retried automatically
 
+For one-off manually scored events, the staff iPad uses `/admin` → **Score Top
+10**. Sender proxies `/api/manual_leaderboard/*` to the configured Receiver;
+the Receiver owns the manual results and display settings. This path does not
+invoke a game monitor or the ordinary lap-submission signal.
+
 ### Key Dependencies
 - PyQt6 (GUI + multimedia for overlay videos)
 - Flask + flask-cors (web interface)
