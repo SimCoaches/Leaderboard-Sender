@@ -178,6 +178,8 @@ For one-off manually scored events, the staff iPad uses `/admin` → **Score Top
 10**. Sender proxies `/api/manual_leaderboard/*` to the configured Receiver;
 the Receiver owns the manual results and display settings. This path does not
 invoke a game monitor or the ordinary lap-submission signal.
+For the NASCAR event, the iPad links Cars Passed and Finishing Position from a
+40th-place start; staff enters either value and the other is calculated.
 
 ### Key Dependencies
 - PyQt6 (GUI + multimedia for overlay videos)

@@ -52,6 +52,11 @@ remove a driver's Cars Passed, Finishing Position, and Lap Time. These entries
 go directly to Receiver's Manual Top 10; the game does not send telemetry or
 lap results for this workflow.
 
+For the NASCAR format, every driver starts 40th. Cars Passed and Finishing
+Position are linked (`Finishing Position = 40 - Cars Passed`), so the iPad
+calculates either value from the other. For example, 12 cars passed is a 28th-
+place finish. Lap Time remains an independent value.
+
 ## Building the Executable
 
 To rebuild the executable:
