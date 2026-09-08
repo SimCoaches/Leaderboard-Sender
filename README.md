@@ -44,6 +44,14 @@ Sector progress advances only when telemetry crosses the next configured boundar
 
 In Sender settings, choose **iPad logo > Browse**, select the customer's PNG, JPG, GIF, or WebP image, and click **Apply**. Sender keeps a managed copy and updates open registration and queue pages automatically. Clear the field and apply to restore the bundled Sim Coaches logo.
 
+## iPad Manual Top 10 Scoring
+
+Open the staff portal at `http://<sender-ip>:5001/admin` and choose **Score Top
+10**. Staff can change the ranking and visible columns, then add, update, or
+remove a driver's Cars Passed, Finishing Position, and Lap Time. These entries
+go directly to Receiver's Manual Top 10; the game does not send telemetry or
+lap results for this workflow.
+
 ## Building the Executable
 
 To rebuild the executable:

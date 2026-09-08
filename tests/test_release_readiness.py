@@ -93,6 +93,76 @@ class SenderReleaseReadinessTests(unittest.TestCase):
         setup_script = (ROOT / 'setup.iss').read_text(encoding='utf-8')
         self.assertIn(f'#define MyAppVersion "{sender.APP_VERSION}"', setup_script)
 
+    def test_staff_ipad_contains_manual_top10_scoring_console(self):
+        html = sender.ADMIN_HTML_CONTENT
+        self.assertIn('id="manualBoardModal"', html)
+        self.assertIn('name="manualRankBy" value="cars_passed"', html)
+        self.assertIn('name="manualRankBy" value="finishing_position"', html)
+        self.assertIn('name="manualRankBy" value="lap_time"', html)
+        self.assertIn('id="manualShowCars"', html)
+        self.assertIn('id="manualShowFinish"', html)
+        self.assertIn('id="manualShowLap"', html)
+        self.assertIn("fetchWithTimeout('/api/manual_leaderboard/result'", html)
+        self.assertIn('entries.slice(0, 10)', html)
+
+    def test_staff_ipad_proxies_manual_settings_results_and_removal(self):
+        calls = []
+
+        def response(payload, status=200):
+            return types.SimpleNamespace(status_code=status, json=lambda: payload)
+
+        def forward(path, data=None, method='POST', timeout=3):
+            calls.append((path, data, method, timeout))
+            if path.startswith('/api/leaderboard/display-config'):
+                return response({'success': True, 'config': {
+                    'ranking_mode': 'cars_passed',
+                    'manual_rank_by': 'finishing_position',
+                    'manual_show_cars_passed': True,
+                    'manual_show_finishing_position': True,
+                    'manual_show_lap_time': True,
+                }}), None
+            if path.startswith('/api/leaderboard?'):
+                return response({'success': True, 'entries': [{
+                    'driver_name': 'Jamie Smith',
+                    'cars_passed': 12,
+                    'finishing_position': 3,
+                    'lap_time': 101.5,
+                }]}), None
+            if path == '/api/manual-results':
+                return response({'success': True, 'entries': []}), None
+            if path == '/api/manual-results/remove':
+                return response({'success': True, 'entries': []}), None
+            raise AssertionError(path)
+
+        client = sender.app.test_client()
+        with mock.patch.object(sender, 'forward_to_receiver', side_effect=forward):
+            state = client.get('/api/manual_leaderboard').get_json()
+            settings = client.post('/api/manual_leaderboard/settings', json={
+                'manual_rank_by': 'finishing_position',
+                'manual_show_cars_passed': True,
+                'manual_show_finishing_position': True,
+                'manual_show_lap_time': False,
+            }).get_json()
+            result = client.post('/api/manual_leaderboard/result', json={
+                'driver_name': 'Jamie Smith',
+                'cars_passed': 12,
+                'finishing_position': 3,
+                'lap_time': 101.5,
+            }).get_json()
+            removed = client.post('/api/manual_leaderboard/remove', json={
+                'driver_name': 'Jamie Smith',
+            }).get_json()
+
+        self.assertEqual('Jamie Smith', state['entries'][0]['driver_name'])
+        self.assertTrue(settings['success'])
+        self.assertTrue(result['success'])
+        self.assertTrue(removed['success'])
+        settings_call = next(call for call in calls if call[0] == '/api/leaderboard/display-config')
+        self.assertEqual('cars_passed', settings_call[1]['ranking_mode'])
+        self.assertEqual('finishing_position', settings_call[1]['manual_rank_by'])
+        self.assertFalse(settings_call[1]['manual_show_lap_time'])
+        self.assertIn(('/api/manual-results/remove', {'driver_name': 'Jamie Smith'}, 'POST', 5), calls)
+
     def test_sector_config_sorts_boundaries_and_rejects_duplicates(self):
         config = sender.normalize_sector_config({
             'enabled': True,

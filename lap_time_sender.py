@@ -31,7 +31,7 @@ from io import BytesIO
 import os
 import csv
 
-APP_VERSION = "1.4.3"
+APP_VERSION = "1.4.4"
 
 def get_runtime_base_path():
     """Return the bundled app base path when frozen, otherwise the source folder."""
@@ -2436,6 +2436,11 @@ ADMIN_HTML_CONTENT = r"""
             color: #cccccc;
         }
         .action-bar .manual-btn:hover { background: #454545; }
+        .action-bar .score-btn {
+            background: #4ec9b0;
+            color: #1e1e1e;
+        }
+        .action-bar .score-btn:hover { background: #5fd9c0; }
         .action-bar .settings-btn {
             background: #3e3e42;
             color: #cccccc;
@@ -2531,6 +2536,65 @@ ADMIN_HTML_CONTENT = r"""
             margin-top: 10px;
         }
         .modal-body button.primary:hover { background: #0098ff; }
+        .modal-body button.danger {
+            width: 100%;
+            padding: 12px;
+            margin-top: 8px;
+            background: transparent;
+            color: #f48771;
+            border: 1px solid #f48771;
+            border-radius: 8px;
+            font-size: 15px;
+            font-weight: 600;
+            cursor: pointer;
+        }
+        .manual-board-modal { max-width: 560px; }
+        .manual-options {
+            margin-bottom: 16px;
+            padding: 12px;
+            background: #2d2d30;
+            border: 1px solid #3e3e42;
+            border-radius: 8px;
+        }
+        .manual-options h4 {
+            color: #cccccc;
+            font-size: 13px;
+            margin-bottom: 8px;
+        }
+        .manual-option-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px 16px;
+            margin-bottom: 10px;
+        }
+        .manual-option-row:last-child { margin-bottom: 0; }
+        .manual-option-row label {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            color: #cccccc;
+            font-size: 13px;
+        }
+        .manual-option-row input { width: 18px; height: 18px; }
+        .manual-preview {
+            margin-top: 18px;
+            overflow-x: auto;
+        }
+        .manual-preview table {
+            width: 100%;
+            border-collapse: collapse;
+            color: #cccccc;
+            font-size: 12px;
+        }
+        .manual-preview th,
+        .manual-preview td {
+            padding: 8px 6px;
+            border-bottom: 1px solid #3e3e42;
+            text-align: center;
+            white-space: nowrap;
+        }
+        .manual-preview th:nth-child(2),
+        .manual-preview td:nth-child(2) { text-align: left; }
 
         .status {
             margin-top: 16px;
@@ -2640,7 +2704,8 @@ ADMIN_HTML_CONTENT = r"""
     <!-- Bottom Action Bar -->
     <div class="action-bar">
         <button class="register-btn" onclick="openRegisterModal()">+ Register Driver</button>
-        <button class="manual-btn" onclick="openManualLapModal()">Manual Lap</button>
+        <button class="score-btn" onclick="openManualBoardModal()">Score Top 10</button>
+        <button class="manual-btn" onclick="openManualLapModal()">Send Sim Lap</button>
         <button class="settings-btn" onclick="openSettingsModal()">+</button>
     </div>
 
@@ -2679,11 +2744,59 @@ ADMIN_HTML_CONTENT = r"""
         </div>
     </div>
 
+    <!-- Manual Top 10 scoring goes straight to the Receiver. No game telemetry. -->
+    <div class="modal-overlay" id="manualBoardModal">
+        <div class="modal manual-board-modal">
+            <div class="modal-header">
+                <h3>Manual Top 10</h3>
+                <button class="modal-close" onclick="closeManualBoardModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p class="sim-hint">Enter event results here on the iPad. They go straight to the Receiver; the game does not need to send telemetry.</p>
+                <div class="manual-options">
+                    <h4>Rank by</h4>
+                    <div class="manual-option-row">
+                        <label><input type="radio" name="manualRankBy" value="cars_passed" onchange="manualBoardSettingsChanged()"> Cars Passed</label>
+                        <label><input type="radio" name="manualRankBy" value="finishing_position" onchange="manualBoardSettingsChanged()"> Finishing Position</label>
+                        <label><input type="radio" name="manualRankBy" value="lap_time" onchange="manualBoardSettingsChanged()"> Lap Time</label>
+                    </div>
+                    <h4>Show columns</h4>
+                    <div class="manual-option-row">
+                        <label><input type="checkbox" id="manualShowCars" onchange="manualBoardSettingsChanged()"> Cars Passed</label>
+                        <label><input type="checkbox" id="manualShowFinish" onchange="manualBoardSettingsChanged()"> Finishing Position</label>
+                        <label><input type="checkbox" id="manualShowLap" onchange="manualBoardSettingsChanged()"> Lap Time</label>
+                    </div>
+                </div>
+                <div class="input-group">
+                    <label for="manualBoardDriver">Driver Name</label>
+                    <input type="text" id="manualBoardDriver" placeholder="Enter driver name" maxlength="80">
+                </div>
+                <div class="input-group">
+                    <label for="manualBoardCars">Cars Passed</label>
+                    <input type="number" id="manualBoardCars" placeholder="e.g., 18" min="0" step="1">
+                </div>
+                <div class="input-group">
+                    <label for="manualBoardFinish">Finishing Position</label>
+                    <input type="number" id="manualBoardFinish" placeholder="e.g., 2" min="1" step="1">
+                </div>
+                <div class="input-group">
+                    <label for="manualBoardLap">Lap Time</label>
+                    <input type="text" id="manualBoardLap" placeholder="e.g., 1:42.500 or 102.500">
+                    <small>Enter M:SS.mmm or total seconds.</small>
+                </div>
+                <button class="primary" onclick="submitManualBoardResult()">Add / Update Result</button>
+                <button class="danger" onclick="removeManualBoardResult()">Remove This Driver</button>
+                <div id="manualBoardStatus" class="status"></div>
+                <div id="manualBoardPreview" class="manual-preview"></div>
+            </div>
+        </div>
+    </div>
+
     <!-- Manual Lap Entry Modal -->
     <div class="modal-overlay" id="manualLapModal">
         <div class="modal">
             <div class="modal-header">
-                <h3>Manual Lap Time</h3>
+                <h3>Manual Simulator Lap</h3>
                 <button class="modal-close" onclick="closeManualLapModal()">&times;</button>
             </div>
             <div class="modal-body">
@@ -3268,6 +3381,16 @@ ADMIN_HTML_CONTENT = r"""
             document.getElementById('manualLapModal').classList.remove('active');
         }
 
+        function openManualBoardModal() {
+            document.getElementById('manualBoardModal').classList.add('active');
+            loadManualBoard();
+            document.getElementById('manualBoardDriver').focus();
+        }
+
+        function closeManualBoardModal() {
+            document.getElementById('manualBoardModal').classList.remove('active');
+        }
+
         function openSettingsModal() {
             document.getElementById('settingsModal').classList.add('active');
             renderManualSimulatorList();
@@ -3443,6 +3566,204 @@ ADMIN_HTML_CONTENT = r"""
                 statusEl.textContent = `Could not reach ${simName(sim)} (${e.message})`;
                 statusEl.className = 'status error';
             }
+        }
+
+        // ============================================
+        // MANUAL TOP 10 - IPAD TO RECEIVER
+        // ============================================
+
+        let manualBoardConfig = {};
+
+        function selectedManualRank() {
+            return document.querySelector('input[name="manualRankBy"]:checked')?.value || 'cars_passed';
+        }
+
+        function syncManualBoardControls() {
+            const rankBy = selectedManualRank();
+            const checks = {
+                cars_passed: document.getElementById('manualShowCars'),
+                finishing_position: document.getElementById('manualShowFinish'),
+                lap_time: document.getElementById('manualShowLap'),
+            };
+            Object.entries(checks).forEach(([key, checkbox]) => {
+                checkbox.disabled = key === rankBy;
+                if (key === rankBy) checkbox.checked = true;
+            });
+        }
+
+        function manualBoardSettingsPayload() {
+            syncManualBoardControls();
+            return {
+                manual_rank_by: selectedManualRank(),
+                manual_show_cars_passed: document.getElementById('manualShowCars').checked,
+                manual_show_finishing_position: document.getElementById('manualShowFinish').checked,
+                manual_show_lap_time: document.getElementById('manualShowLap').checked,
+            };
+        }
+
+        function setManualBoardStatus(message, success) {
+            const status = document.getElementById('manualBoardStatus');
+            status.textContent = message;
+            status.className = `status ${success ? 'success' : 'error'}`;
+        }
+
+        async function loadManualBoard() {
+            try {
+                const response = await fetchWithTimeout('/api/manual_leaderboard', { cache: 'no-store' }, 6000);
+                const data = await response.json();
+                if (!data.success) throw new Error(data.error || 'Receiver unavailable');
+                manualBoardConfig = data.config || {};
+                const rank = manualBoardConfig.manual_rank_by || 'cars_passed';
+                const radio = document.querySelector(`input[name="manualRankBy"][value="${rank}"]`);
+                if (radio) radio.checked = true;
+                document.getElementById('manualShowCars').checked = Boolean(manualBoardConfig.manual_show_cars_passed);
+                document.getElementById('manualShowFinish').checked = Boolean(manualBoardConfig.manual_show_finishing_position);
+                document.getElementById('manualShowLap').checked = Boolean(manualBoardConfig.manual_show_lap_time);
+                syncManualBoardControls();
+                renderManualBoardPreview(data.entries || [], manualBoardConfig);
+                setManualBoardStatus('Connected to the Receiver.', true);
+            } catch (error) {
+                setManualBoardStatus(`Could not load the manual board: ${error.message}`, false);
+            }
+        }
+
+        async function saveManualBoardSettings(showMessage = true) {
+            const payload = manualBoardSettingsPayload();
+            try {
+                const response = await fetchWithTimeout('/api/manual_leaderboard/settings', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload),
+                }, 6000);
+                const data = await response.json();
+                if (!data.success) throw new Error(data.error || 'Settings were rejected');
+                manualBoardConfig = data.config || { ...manualBoardConfig, ...payload };
+                if (showMessage) {
+                    setManualBoardStatus('Board ranking and columns updated.', true);
+                    await loadManualBoard();
+                }
+                return true;
+            } catch (error) {
+                setManualBoardStatus(`Could not update board settings: ${error.message}`, false);
+                return false;
+            }
+        }
+
+        async function manualBoardSettingsChanged() {
+            syncManualBoardControls();
+            await saveManualBoardSettings(true);
+        }
+
+        async function submitManualBoardResult() {
+            const driverName = document.getElementById('manualBoardDriver').value.trim();
+            const carsRaw = document.getElementById('manualBoardCars').value.trim();
+            const finishRaw = document.getElementById('manualBoardFinish').value.trim();
+            const lapRaw = document.getElementById('manualBoardLap').value.trim();
+            const rankBy = selectedManualRank();
+            const rawByRank = {
+                cars_passed: carsRaw,
+                finishing_position: finishRaw,
+                lap_time: lapRaw,
+            };
+            if (!driverName) {
+                setManualBoardStatus('Enter the driver name.', false);
+                return;
+            }
+            if (!rawByRank[rankBy]) {
+                const label = {
+                    cars_passed: 'Cars Passed',
+                    finishing_position: 'Finishing Position',
+                    lap_time: 'Lap Time',
+                }[rankBy];
+                setManualBoardStatus(`Enter ${label}; the board is ranked by it.`, false);
+                return;
+            }
+            if (carsRaw && (!/^\d+$/.test(carsRaw) || Number(carsRaw) > 99999)) {
+                setManualBoardStatus('Cars Passed must be a whole number from 0 to 99999.', false);
+                return;
+            }
+            if (finishRaw && (!/^\d+$/.test(finishRaw) || Number(finishRaw) < 1 || Number(finishRaw) > 99999)) {
+                setManualBoardStatus('Finishing Position must be a whole number from 1 to 99999.', false);
+                return;
+            }
+            const lapSeconds = lapRaw ? parseLapTime(lapRaw) : null;
+            if (lapRaw && (lapSeconds === null || lapSeconds <= 0 || lapSeconds > 86400)) {
+                setManualBoardStatus('Lap Time must be M:SS.mmm or seconds, up to 24 hours.', false);
+                return;
+            }
+            if (!(await saveManualBoardSettings(false))) return;
+
+            try {
+                const response = await fetchWithTimeout('/api/manual_leaderboard/result', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        driver_name: driverName,
+                        cars_passed: carsRaw || null,
+                        finishing_position: finishRaw || null,
+                        lap_time: lapSeconds,
+                    }),
+                }, 6000);
+                const data = await response.json();
+                if (!data.success) throw new Error(data.error || 'Result was rejected');
+                renderManualBoardPreview(data.entries || [], manualBoardConfig);
+                setManualBoardStatus(`Saved ${driverName}.`, true);
+                document.getElementById('manualBoardDriver').value = '';
+                document.getElementById('manualBoardCars').value = '';
+                document.getElementById('manualBoardFinish').value = '';
+                document.getElementById('manualBoardLap').value = '';
+                document.getElementById('manualBoardDriver').focus();
+            } catch (error) {
+                setManualBoardStatus(`Could not save result: ${error.message}`, false);
+            }
+        }
+
+        async function removeManualBoardResult() {
+            const driverName = document.getElementById('manualBoardDriver').value.trim();
+            if (!driverName) {
+                setManualBoardStatus('Enter the driver name to remove.', false);
+                return;
+            }
+            if (!window.confirm(`Remove ${driverName} from the Manual Top 10?`)) return;
+            try {
+                const response = await fetchWithTimeout('/api/manual_leaderboard/remove', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ driver_name: driverName }),
+                }, 6000);
+                const data = await response.json();
+                if (!data.success) throw new Error(data.error || 'Driver was not removed');
+                renderManualBoardPreview(data.entries || [], manualBoardConfig);
+                setManualBoardStatus(`Removed ${driverName}.`, true);
+                document.getElementById('manualBoardDriver').value = '';
+            } catch (error) {
+                setManualBoardStatus(`Could not remove result: ${error.message}`, false);
+            }
+        }
+
+        function renderManualBoardPreview(entries, config) {
+            const preview = document.getElementById('manualBoardPreview');
+            const rankBy = config.manual_rank_by || selectedManualRank();
+            const columns = [
+                ['cars_passed', 'CARS PASSED', config.manual_show_cars_passed],
+                ['finishing_position', 'FINISHING POSITION', config.manual_show_finishing_position],
+                ['lap_time', 'LAP TIME', config.manual_show_lap_time],
+            ].filter(column => column[0] === rankBy || Boolean(column[2]));
+            if (!entries.length) {
+                preview.innerHTML = '<p style="color:#6e6e6e;text-align:center;">No manual results yet.</p>';
+                return;
+            }
+            const headers = ['POS', 'NAME', ...columns.map(column => column[1])];
+            const rows = entries.slice(0, 10).map((entry, index) => {
+                const values = columns.map(column => {
+                    const value = entry[column[0]];
+                    if (value === null || value === undefined || value === '') return '—';
+                    if (column[0] === 'lap_time') return entry.formatted_lap_time || String(value);
+                    return String(value);
+                });
+                return `<tr><td>${index + 1}</td><td>${escapeHtml(entry.driver_name)}</td>${values.map(value => `<td>${escapeHtml(value)}</td>`).join('')}</tr>`;
+            }).join('');
+            preview.innerHTML = `<table><thead><tr>${headers.map(header => `<th>${header}</th>`).join('')}</tr></thead><tbody>${rows}</tbody></table>`;
         }
 
         // ============================================
@@ -4877,6 +5198,78 @@ def get_receiver_url():
             first_url = url.split(',')[0].strip()
             return jsonify({'success': True, 'receiver_url': first_url})
     return jsonify({'success': False, 'error': 'Receiver URL not configured'})
+
+
+def _relay_receiver_json(path, data=None, method='POST', timeout=5):
+    """Relay one staff-console request and preserve the Receiver's response."""
+    response, error = forward_to_receiver(path, data=data, method=method, timeout=timeout)
+    if error:
+        return jsonify({'success': False, 'error': error}), 503
+    try:
+        return jsonify(response.json()), response.status_code
+    except (ValueError, TypeError) as exc:
+        return jsonify({
+            'success': False,
+            'error': f'Receiver returned an invalid response ({type(exc).__name__}).',
+        }), 502
+
+
+@app.route('/api/manual_leaderboard', methods=['GET'])
+def get_manual_leaderboard():
+    """Return manual Top 10 settings and rows for the staff iPad console."""
+    config_response, config_error = forward_to_receiver(
+        '/api/leaderboard/display-config?mode=cars_passed', method='GET', timeout=5)
+    if config_error:
+        return jsonify({'success': False, 'error': config_error}), 503
+    board_response, board_error = forward_to_receiver(
+        '/api/leaderboard?mode=cars_passed', method='GET', timeout=5)
+    if board_error:
+        return jsonify({'success': False, 'error': board_error}), 503
+    try:
+        config_payload = config_response.json()
+        board_payload = board_response.json()
+        if config_response.status_code != 200 or board_response.status_code != 200:
+            error = (config_payload.get('error') or board_payload.get('error') or
+                     'Receiver rejected the manual leaderboard request.')
+            return jsonify({'success': False, 'error': error}), 502
+        return jsonify({
+            'success': True,
+            'config': config_payload.get('config', {}),
+            'entries': board_payload.get('entries', []),
+        })
+    except (ValueError, TypeError) as exc:
+        return jsonify({
+            'success': False,
+            'error': f'Receiver returned an invalid response ({type(exc).__name__}).',
+        }), 502
+
+
+@app.route('/api/manual_leaderboard/settings', methods=['POST'])
+def update_manual_leaderboard_settings():
+    """Apply iPad ranking/column controls directly to the Receiver."""
+    data = request.get_json(silent=True) or {}
+    payload = {
+        'ranking_mode': 'cars_passed',
+        'manual_rank_by': data.get('manual_rank_by'),
+        'manual_show_cars_passed': bool(data.get('manual_show_cars_passed')),
+        'manual_show_finishing_position': bool(data.get('manual_show_finishing_position')),
+        'manual_show_lap_time': bool(data.get('manual_show_lap_time')),
+    }
+    return _relay_receiver_json('/api/leaderboard/display-config', payload, timeout=5)
+
+
+@app.route('/api/manual_leaderboard/result', methods=['POST'])
+def update_manual_leaderboard_result():
+    """Add or update one manually scored result from the staff iPad."""
+    return _relay_receiver_json(
+        '/api/manual-results', request.get_json(silent=True) or {}, timeout=5)
+
+
+@app.route('/api/manual_leaderboard/remove', methods=['POST'])
+def remove_manual_leaderboard_result():
+    """Remove one manually scored result from the staff iPad."""
+    return _relay_receiver_json(
+        '/api/manual-results/remove', request.get_json(silent=True) or {}, timeout=5)
 
 # ============================================
 # QUEUE PROXY ENDPOINTS
@@ -11101,8 +11494,13 @@ class LapTimeSenderWindow(QMainWindow):
                                    'set to Fastest Lap - partial runs will rank by time, '
                                    'not distance. Switch it to Distance Challenge'))
                 else:
+                    mode_label = {
+                        'distance': 'Distance Challenge',
+                        'cars_passed': 'Manual Top 10',
+                        'lap_time': 'Fastest Lap',
+                    }.get(mode, mode)
                     checks.append(('ok', 'Leaderboard ranking mode',
-                                   'Distance Challenge' if mode == 'distance' else 'Fastest Lap'))
+                                   mode_label))
             except Exception as e:
                 checks.append(('fail', 'Leaderboard reachable',
                                f'{server_url} did not answer ({type(e).__name__}) - '
