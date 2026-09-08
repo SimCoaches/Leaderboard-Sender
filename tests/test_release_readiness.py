@@ -104,6 +104,10 @@ class SenderReleaseReadinessTests(unittest.TestCase):
         self.assertIn('id="manualShowLap"', html)
         self.assertIn("fetchWithTimeout('/api/manual_leaderboard/result'", html)
         self.assertIn('entries.slice(0, 10)', html)
+        self.assertIn('const NASCAR_STARTING_POSITION = 40', html)
+        self.assertIn("syncManualNascarPosition('cars_passed')", html)
+        self.assertIn("syncManualNascarPosition('finishing_position')", html)
+        self.assertIn('12 passed = 28th', html)
 
     def test_staff_ipad_proxies_manual_settings_results_and_removal(self):
         calls = []

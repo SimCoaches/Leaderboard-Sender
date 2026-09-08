@@ -31,7 +31,7 @@ from io import BytesIO
 import os
 import csv
 
-APP_VERSION = "1.4.4"
+APP_VERSION = "1.4.5"
 
 def get_runtime_base_path():
     """Return the bundled app base path when frozen, otherwise the source folder."""
@@ -2752,7 +2752,7 @@ ADMIN_HTML_CONTENT = r"""
                 <button class="modal-close" onclick="closeManualBoardModal()">&times;</button>
             </div>
             <div class="modal-body">
-                <p class="sim-hint">Enter event results here on the iPad. They go straight to the Receiver; the game does not need to send telemetry.</p>
+                <p class="sim-hint">All NASCAR drivers start 40th. Enter Cars Passed or Finishing Position and the other value is calculated automatically. Results go straight to the Receiver; the game does not need to send telemetry.</p>
                 <div class="manual-options">
                     <h4>Rank by</h4>
                     <div class="manual-option-row">
@@ -2773,11 +2773,12 @@ ADMIN_HTML_CONTENT = r"""
                 </div>
                 <div class="input-group">
                     <label for="manualBoardCars">Cars Passed</label>
-                    <input type="number" id="manualBoardCars" placeholder="e.g., 18" min="0" step="1">
+                    <input type="number" id="manualBoardCars" placeholder="e.g., 12" min="0" max="39" step="1" oninput="syncManualNascarPosition('cars_passed')">
                 </div>
                 <div class="input-group">
                     <label for="manualBoardFinish">Finishing Position</label>
-                    <input type="number" id="manualBoardFinish" placeholder="e.g., 2" min="1" step="1">
+                    <input type="number" id="manualBoardFinish" placeholder="e.g., 28" min="1" max="40" step="1" oninput="syncManualNascarPosition('finishing_position')">
+                    <small>Starting position: 40th. Example: 12 passed = 28th.</small>
                 </div>
                 <div class="input-group">
                     <label for="manualBoardLap">Lap Time</label>
@@ -3573,6 +3574,28 @@ ADMIN_HTML_CONTENT = r"""
         // ============================================
 
         let manualBoardConfig = {};
+        const NASCAR_STARTING_POSITION = 40;
+
+        function syncManualNascarPosition(source) {
+            const carsInput = document.getElementById('manualBoardCars');
+            const finishInput = document.getElementById('manualBoardFinish');
+            const sourceInput = source === 'cars_passed' ? carsInput : finishInput;
+            const targetInput = source === 'cars_passed' ? finishInput : carsInput;
+            const raw = sourceInput.value.trim();
+            if (!raw) {
+                targetInput.value = '';
+                return;
+            }
+            if (!/^\d+$/.test(raw)) {
+                targetInput.value = '';
+                return;
+            }
+            const value = Number(raw);
+            const valid = source === 'cars_passed'
+                ? value >= 0 && value < NASCAR_STARTING_POSITION
+                : value >= 1 && value <= NASCAR_STARTING_POSITION;
+            targetInput.value = valid ? String(NASCAR_STARTING_POSITION - value) : '';
+        }
 
         function selectedManualRank() {
             return document.querySelector('input[name="manualRankBy"]:checked')?.value || 'cars_passed';
@@ -3678,12 +3701,16 @@ ADMIN_HTML_CONTENT = r"""
                 setManualBoardStatus(`Enter ${label}; the board is ranked by it.`, false);
                 return;
             }
-            if (carsRaw && (!/^\d+$/.test(carsRaw) || Number(carsRaw) > 99999)) {
-                setManualBoardStatus('Cars Passed must be a whole number from 0 to 99999.', false);
+            if (carsRaw && (!/^\d+$/.test(carsRaw) || Number(carsRaw) >= NASCAR_STARTING_POSITION)) {
+                setManualBoardStatus('Cars Passed must be a whole number from 0 to 39.', false);
                 return;
             }
-            if (finishRaw && (!/^\d+$/.test(finishRaw) || Number(finishRaw) < 1 || Number(finishRaw) > 99999)) {
-                setManualBoardStatus('Finishing Position must be a whole number from 1 to 99999.', false);
+            if (finishRaw && (!/^\d+$/.test(finishRaw) || Number(finishRaw) < 1 || Number(finishRaw) > NASCAR_STARTING_POSITION)) {
+                setManualBoardStatus('Finishing Position must be a whole number from 1 to 40.', false);
+                return;
+            }
+            if (carsRaw && finishRaw && Number(carsRaw) + Number(finishRaw) !== NASCAR_STARTING_POSITION) {
+                setManualBoardStatus('Cars Passed and Finishing Position must describe the same result from a 40th-place start.', false);
                 return;
             }
             const lapSeconds = lapRaw ? parseLapTime(lapRaw) : null;
