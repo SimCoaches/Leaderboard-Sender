@@ -1,5 +1,5 @@
 #define MyAppName "Lap Time Sender"
-#define MyAppVersion "1.4.5"
+#define MyAppVersion "1.4.9"
 #define MyAppPublisher "Sim Coaches LLC"
 #define MyAppURL "https://simcoaches.com/"
 #define MyAppExeName "Lap Time Sender.exe"
@@ -32,12 +32,14 @@ WizardStyle=modern
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
+Name: "localnetwork"; Description: "Allow local iPad and simulator connections (Windows administrator prompt)"; GroupDescription: "Local network:"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 Name: "acapp"; Description: "Install Assetto Corsa companion app (sector-challenge teleport + CSP OBS integration)"; GroupDescription: "Assetto Corsa integration:"
 Name: "broadcast"; Description: "Set up 4th-screen broadcast camera (installs OBS Studio + CSP plugin; needs internet and one admin prompt)"; GroupDescription: "Assetto Corsa integration:"; Flags: unchecked
 Name: "broadcast\autostart"; Description: "Start the broadcast screen automatically with Windows"
 
 [Files]
+Source: "support\configure_sender_network.ps1"; DestDir: "{app}\support"; Flags: ignoreversion
 ; Main executable and all files in the dist folder
 Source: "dist\Lap Time Sender\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 ; CSP companion app for Assetto Corsa (user copies it into AC's apps\lua folder)
@@ -52,6 +54,7 @@ Name: "{group}\{cm:UninstallProgram,{#MyAppName}}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
 [Run]
+Filename: "powershell.exe"; Parameters: "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File ""{app}\support\configure_sender_network.ps1"" -AppPath ""{app}\{#MyAppExeName}"""; Verb: "runas"; Flags: shellexec waituntilterminated; Tasks: localnetwork; StatusMsg: "Allowing local iPad and simulator connections..."
 ; AC companion app: copies LeaderboardSector into AC's apps\lua and enables
 ; CSP's OBS integration flag. Steam's folder is user-writable, so no elevation.
 Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\ac_app\install_ac_app.ps1"" -NonInteractive"; Flags: waituntilterminated runhidden; Tasks: acapp; StatusMsg: "Installing Assetto Corsa companion app..."
