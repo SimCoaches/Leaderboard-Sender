@@ -22,7 +22,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                             QMessageBox, QFormLayout, QComboBox, QGridLayout, QFrame,
                             QCheckBox, QTableWidget, QTableWidgetItem, QDialog,
                             QAbstractItemView, QHeaderView, QScrollArea,
-                            QTabWidget, QSizePolicy)
+                            QTabWidget, QSizePolicy, QDoubleSpinBox)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, pyqtSlot, QTimer, QObject, QUrl
 from PyQt6.QtGui import QImage, QPixmap, QIcon, QFont, QColor
 from PyQt6.QtNetwork import QNetworkInterface, QAbstractSocket
@@ -35,8 +35,11 @@ import qrcode
 from io import BytesIO
 import os
 import csv
+import math
+from iracing_brake import KeyboardBrake, validate_return_shortcuts
+from iracing_return import IracingReturnSequence
 
-APP_VERSION = "1.4.9"
+APP_VERSION = "1.5.0"
 
 
 def local_network_interfaces():
@@ -2744,7 +2747,7 @@ ADMIN_HTML_CONTENT = r"""
                     <input type="text" id="driverPhone" placeholder="Enter phone number (required)">
                     <small id="driverPhoneHelp">Required for race result delivery</small>
                 </div>
-                <button class="primary" onclick="updateDriver()">Register</button>
+                <button class="primary" id="registerDriverButton" onclick="updateDriver()">Register</button>
                 <div id="registerStatus" class="status"></div>
             </div>
         </div>
@@ -2886,6 +2889,8 @@ ADMIN_HTML_CONTENT = r"""
         let udpDiscoveryOk = null;     // false = this PC can't hear sim announcements
         let scanPollTimer = null;
         let lastTargetIp = null;       // sim the last registration went to
+        const confirmedRegistrations = new Map();
+        let registrationInProgress = false;
 
         // ============================================
         // TALK TO ANY SIM FROM THIS ONE PAGE
@@ -2918,15 +2923,16 @@ ADMIN_HTML_CONTENT = r"""
             const port = sim.port || 5001;
             const headers = { 'Content-Type': 'application/json' };
             const body = JSON.stringify(payload || {});
-            if (isCurrentSim(sim)) {
-                const r = await fetchWithTimeout(path, { method: 'POST', headers, body }, timeoutMs);
-                return r.json();
-            }
-            const r = await fetchWithTimeout('/api/sim_proxy', {
+            const r = isCurrentSim(sim)
+                ? await fetchWithTimeout(path, { method: 'POST', headers, body }, timeoutMs)
+                : await fetchWithTimeout('/api/sim_proxy', {
                     method: 'POST', headers,
                     body: JSON.stringify({ ip: sim.ip, port, path, payload: payload || {} })
             }, timeoutMs + 2000);
-            return r.json();
+            const result = await r.json();
+            if (result.success && result.applied) rememberRegistration(sim, result);
+            if (result.success && path === '/api/session/force_end') confirmedRegistrations.delete(sim.ip);
+            return result;
         }
 
         function showToast(message, ms = 2500) {
@@ -2938,21 +2944,36 @@ ADMIN_HTML_CONTENT = r"""
             el._hideTimer = setTimeout(() => { el.style.display = 'none'; }, ms);
         }
 
-        function allSimulatorsForDisplay() {
-            const all = [...discoveredSimulators];
-            getManualSimulators().forEach(manual => {
-                if (!all.some(s => s.ip === manual.ip)) {
-                    all.push({
-                        simulator_id: null,
-                        simulator_name: manual.name || `Sim (${manual.ip})`,
-                        ip: manual.ip,
-                        port: manual.port || 5001,
-                        current_driver: null,
-                        reachable: false,
-                        is_manual: true
-                    });
-                }
+        function rememberRegistration(sim, result) {
+            confirmedRegistrations.set(sim.ip, {
+                driver: result.driver_name,
+                appliedAt: result.applied_at,
+                expires: Date.now() + 10000
             });
+            // The target has confirmed the UI change; display it immediately.
+            discoveredSimulators = mergeConfirmedRegistrations(discoveredSimulators);
+            renderSimulatorCards();
+        }
+
+        function mergeConfirmedRegistrations(simulators) {
+            return simulators.map(sim => {
+                const confirmed = confirmedRegistrations.get(sim.ip);
+                if (!confirmed) return sim;
+                // Compare timestamps from the same simulator. An HTTP status
+                // sampled after the acknowledgement supersedes it, even if a
+                // different tablet has since ended or changed the driver.
+                if (Date.now() >= confirmed.expires || sim.state_timestamp >= confirmed.appliedAt) {
+                    confirmedRegistrations.delete(sim.ip);
+                    return sim;
+                }
+                return {...sim, current_driver: confirmed.driver};
+            });
+        }
+
+        function allSimulatorsForDisplay() {
+            // Saved addresses are discovery hints, not connected simulators.
+            // Only confirmed live peers belong in cards and target pickers.
+            const all = discoveredSimulators.filter(sim => sim.is_current || sim.reachable === true);
             all.sort((a, b) => (a.simulator_id || 0) - (b.simulator_id || 0) || String(a.ip).localeCompare(String(b.ip)));
             return all;
         }
@@ -3021,7 +3042,7 @@ ADMIN_HTML_CONTENT = r"""
             try {
                 const response = await fetchWithTimeout('/api/discover_simulators', {}, 8000);
                 const data = await response.json();
-                discoveredSimulators = data.simulators || [];
+                discoveredSimulators = mergeConfirmedRegistrations(data.simulators || []);
                 currentSimulatorIp = data.current_ip;
                 scanInProgress = !!data.scan_in_progress;
                 udpDiscoveryOk = data.udp_discovery_ok;
@@ -3375,6 +3396,7 @@ ADMIN_HTML_CONTENT = r"""
         // ============================================
 
         async function updateDriver() {
+            if (registrationInProgress) return;
             const driverName = document.getElementById('driverName').value.trim();
             const driverEmailInput = document.getElementById('driverEmail');
             const driverEmail = driverEmailInput?.value?.trim() || '';
@@ -3422,6 +3444,9 @@ ADMIN_HTML_CONTENT = r"""
 
             statusEl.textContent = `Sending to ${simName(sim)}...`;
             statusEl.className = 'status success';
+            registrationInProgress = true;
+            const registerButton = document.getElementById('registerDriverButton');
+            registerButton.disabled = true;
 
             try {
                 const data = await postToSim(sim, '/set_driver', payload);
@@ -3450,6 +3475,9 @@ ADMIN_HTML_CONTENT = r"""
             } catch (e) {
                 statusEl.textContent = `Could not reach ${simName(sim)} (${e.message})`;
                 statusEl.className = 'status error';
+            } finally {
+                registrationInProgress = false;
+                registerButton.disabled = false;
             }
         }
 
@@ -5009,13 +5037,44 @@ def _current_driver_already_active(driver_name):
     session (timer reset, video replayed). A repeat is now a no-op; the
     Host Stand offers a real Extend button instead.
     """
-    if not main_window or not getattr(main_window, 'session_active', False):
+    # A driver watching the intro still occupies this seat, even though the
+    # driving timer/session_active flag starts only when the video finishes.
+    # Ending a session clears the driver field.
+    if not main_window:
         return False
     try:
         current = (main_window.driver_name.text() or '').strip()
     except Exception:
         return False
     return bool(current) and current.casefold() == str(driver_name).strip().casefold()
+
+
+class DriverRegistration:
+    """One HTTP registration, applied and acknowledged by the Qt thread."""
+    def __init__(self, **payload):
+        self.payload = payload
+        self.done = threading.Event()
+        self.lock = threading.Lock()
+        self.state = 'queued'
+        self.result = None
+
+
+def apply_driver_registration(timeout=4.0, **payload):
+    if main_window is None or ui_bridge is None:
+        return {'success': False, 'error': 'Simulator interface is not ready'}, 503
+    registration = DriverRegistration(**payload)
+    # Never call Qt widgets directly from an HTTP worker as a fallback.
+    ui_bridge.driver_registration_requested.emit(registration)
+    if registration.done.wait(timeout):
+        return registration.result
+    with registration.lock:
+        if registration.state == 'done':
+            return registration.result
+        if registration.state == 'queued':
+            # A frozen interface must not seat this driver unexpectedly later.
+            registration.state = 'cancelled'
+            return {'success': False, 'error': 'Simulator interface is busy; driver was not changed. Try again.'}, 503
+    return {'success': False, 'error': 'Driver change is still processing. Check the simulator before submitting again.'}, 503
 
 
 @app.route('/set_driver', methods=['POST'])
@@ -5065,36 +5124,14 @@ def set_driver():
                     return jsonify({'success': False, 'error': f"Please answer: {q['prompt']}"}), 400
                 answers_by_prompt[q['prompt']] = answer
 
-        if _current_driver_already_active(driver_name):
-            print(f"[{dt.datetime.now().strftime('%H:%M:%S.%f')[:-3]}] {driver_name} is already driving; not restarting the session")
-            return jsonify({'success': True, 'driver_name': driver_name, 'already_active': True,
-                            'message': f'{driver_name} is already driving on this simulator'})
-
-        if main_window:
-            # Store contact fields before changing the driver so session-start
-            # notifications and partner events carry the right data.
-            main_window.last_driver_email = driver_email or ""
-            main_window.last_driver_phone = driver_phone or ""
-            main_window.last_survey_answers = answers_by_prompt
-
-            # Persist the lead (name/email/phone + survey answers) to leads.csv
-            if is_lead_gen_enabled():
-                append_lead_to_csv(driver_name, driver_email, driver_phone, answers_by_prompt)
-
-            # Emit signal to UI thread to update driver and start video
-            try:
-                if ui_bridge:
-                    print(f"[{dt.datetime.now().strftime('%H:%M:%S.%f')[:-3]}] Emitting signal to UI...")
-                    ui_bridge.driver_registered.emit(driver_name)
-                    print(f"[{dt.datetime.now().strftime('%H:%M:%S.%f')[:-3]}] Signal emitted")
-                else:
-                    # Fallback (not ideal): direct call
-                    main_window.update_driver_name(driver_name)
-            except Exception:
-                main_window.update_driver_name(driver_name)
-            elapsed = (time.time() - start_time) * 1000
-            print(f"[{dt.datetime.now().strftime('%H:%M:%S.%f')[:-3]}] === SET_DRIVER COMPLETE ({elapsed:.0f}ms) ===\n")
-            return jsonify({'success': True, 'driver_name': driver_name})
+        result, status = apply_driver_registration(
+            driver_name=driver_name, driver_email=driver_email, driver_phone=driver_phone,
+            survey_answers=answers_by_prompt, queue_id=None)
+        if result.get('success') and not result.get('already_active') and is_lead_gen_enabled():
+            append_lead_to_csv(driver_name, driver_email, driver_phone, answers_by_prompt)
+        elapsed = (time.time() - start_time) * 1000
+        print(f"[{dt.datetime.now().strftime('%H:%M:%S.%f')[:-3]}] === SET_DRIVER COMPLETE ({elapsed:.0f}ms) ===\n")
+        return jsonify(result), status
     except Exception as e:
         print(f"Error setting driver: {str(e)}")
     return jsonify({'success': False})
@@ -5511,25 +5548,10 @@ def start_remote_session():
             driver_email = ""
             driver_phone = ""
 
-        if _current_driver_already_active(driver_name):
-            return jsonify({'success': True, 'driver_name': driver_name, 'already_active': True,
-                            'message': f'{driver_name} is already driving on this simulator'})
-
-        if main_window:
-            # Store queue ID for session tracking
-            main_window.assigned_queue_id = queue_id
-            main_window.last_driver_email = driver_email or ""
-            main_window.last_driver_phone = driver_phone or ""
-
-            # Use signal to update driver on UI thread (triggers session start)
-            if ui_bridge:
-                ui_bridge.driver_registered.emit(driver_name)
-            else:
-                main_window.update_driver_name(driver_name)
-
-            return jsonify({'success': True, 'driver_name': driver_name})
-
-        return jsonify({'success': False, 'error': 'Server not ready'}), 500
+        result, status = apply_driver_registration(
+            driver_name=driver_name, driver_email=driver_email, driver_phone=driver_phone,
+            survey_answers={}, queue_id=queue_id)
+        return jsonify(result), status
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
@@ -5631,6 +5653,7 @@ def force_end_session():
 @app.route('/api/simulator_info', methods=['GET'])
 def simulator_info():
     """Expose simulator details for multi-simulator discovery"""
+    state_timestamp = time.time()  # Sample start: never label older fields as post-registration.
     if main_window:
         # Get timer info
         timer_active = (hasattr(main_window, 'rotation_mode_selector') and 
@@ -5662,6 +5685,7 @@ def simulator_info():
             'laps_active': laps_active,
             'laps_progress': laps_progress,
             'session_active': bool(getattr(main_window, 'session_active', False)),
+            'state_timestamp': state_timestamp,
             'id_conflicts': main_window.get_sim_id_conflicts(),
         })
     return jsonify({
@@ -5679,7 +5703,8 @@ def simulator_info():
 
 @app.route('/api/discover_simulators', methods=['GET'])
 def discover_simulators():
-    """Discover all simulators on the network via UDP broadcast"""
+    """Return the host and currently reachable simulators on the network."""
+    state_timestamp = time.time()
     # Get current simulator info
     current_ip = get_local_ip()
     current_sim = {
@@ -5690,7 +5715,9 @@ def discover_simulators():
         'current_driver': None,
         'ip': current_ip,
         'port': get_web_interface_port(),
-        'is_current': True
+        'is_current': True,
+        'reachable': True,
+        'connection_state': 'online',
     }
     
     if main_window:
@@ -5720,11 +5747,14 @@ def discover_simulators():
             'ip': current_ip,
             'port': get_web_interface_port(),
             'is_current': True,
+            'reachable': True,
+            'connection_state': 'online',
             'timer_active': timer_active,
             'timer_seconds_left': timer_seconds_left,
             'laps_active': laps_active,
             'laps_progress': laps_progress,
             'session_active': bool(getattr(main_window, 'session_active', False)),
+            'state_timestamp': state_timestamp,
             'id_conflicts': main_window.get_sim_id_conflicts(),
         }
 
@@ -5734,10 +5764,11 @@ def discover_simulators():
     listener = getattr(main_window, 'discovery_listener', None) if main_window else None
     udp_ok = getattr(listener, 'bind_ok', None) if listener else None
 
-    # Mark which is current and filter out self
+    # Saved/offline addresses remain available to background discovery, but
+    # must not become selectable simulator cards on the tablet.
     simulators = [current_sim]
     for sim in discovered:
-        if sim['ip'] != current_ip:
+        if sim['ip'] != current_ip and sim.get('reachable') is True:
             sim['is_current'] = False
             simulators.append(sim)
 
@@ -6105,6 +6136,7 @@ class GameMonitor(QThread):
 class UIBridge(QObject):
     """Bridge signals to ensure Flask thread requests are handled on the UI thread"""
     driver_registered = pyqtSignal(str)
+    driver_registration_requested = pyqtSignal(object)
     manual_lap_submitted = pyqtSignal(float, str)  # lap_time, driver_name
     force_end_session = pyqtSignal()  # Force end current session
     extend_session = pyqtSignal(int, int)  # minutes, laps to add to the running session
@@ -6116,6 +6148,7 @@ class SimulatorDiscovery:
     peer status and identity even when broadcasts are missing or stale.
     """
     MAX_WORKERS = 50
+    STATUS_MAX_AGE = 15  # Never display old online status while probes are delayed.
 
     _scan_results = {}      # ip -> simulator_info from the last sweep
     _scan_time = 0
@@ -6133,8 +6166,8 @@ class SimulatorDiscovery:
     def reset_network():
         with SimulatorDiscovery._cache_lock:
             SimulatorDiscovery._network_generation += 1
-            # Preserve known cards while validating the new network. They must
-            # not disappear or accept driver assignments using old status.
+            # Retain addresses for reconnection, but hide their old status from
+            # tablet cards until they answer on the new network.
             SimulatorDiscovery._cache = {
                 ip: dict(sim, reachable=False, connection_state='reconnecting')
                 for ip, sim in SimulatorDiscovery._cache.items()
@@ -6167,7 +6200,7 @@ class SimulatorDiscovery:
 
     @staticmethod
     def cached():
-        """Immediate web snapshot; network work never occupies an iPad request."""
+        """Immediate connected-peer snapshot; network work stays off iPad requests."""
         SimulatorDiscovery.ensure_scan()
         with SimulatorDiscovery._cache_lock:
             if not SimulatorDiscovery._refresh_in_progress and time.time() - SimulatorDiscovery._last_refresh > 3:
@@ -6180,7 +6213,10 @@ class SimulatorDiscovery:
                             SimulatorDiscovery._refresh_in_progress = False
                             SimulatorDiscovery._last_refresh = time.time()
                 threading.Thread(target=refresh, name='sim-status-refresh', daemon=True).start()
-            return SimulatorDiscovery._snapshot()
+            now = time.time()
+            return [sim for sim in SimulatorDiscovery._snapshot()
+                    if sim.get('reachable') is True
+                    and now - sim.get('last_status_success', now) < SimulatorDiscovery.STATUS_MAX_AGE]
 
     @staticmethod
     def _port_open(ip, port, timeout):
@@ -7551,6 +7587,57 @@ class iRacingMonitor(QThread):
         self.state = State()  # Use the exact State class
         self.running = True
         self.last_sent_lap_time = None  # Track the last lap time we sent
+        self._return_state_lock = threading.Lock()
+        self._return_state = None
+        self._return_session_time = None
+        self._return_generation = 0
+
+    def return_to_pits_snapshot(self):
+        """Copy only; the Qt controller never reads the SDK's mutable buffer."""
+        with self._return_state_lock:
+            return dict(self._return_state) if self._return_state is not None else None
+
+    def _clear_return_state(self):
+        with self._return_state_lock:
+            if self._return_state is not None or self._return_session_time is not None:
+                self._return_generation += 1
+            self._return_state = None
+            self._return_session_time = None
+
+    def _capture_return_state(self):
+        def read(key):
+            try:
+                return self.ir[key]
+            except (KeyError, TypeError):
+                return None
+        session_time = read('SessionTime')
+        if isinstance(session_time, bool) or not isinstance(session_time, (int, float)) or not math.isfinite(session_time):
+            self._clear_return_state()
+            return
+        # A connected shared-memory buffer can stop advancing. Never refresh
+        # the sample's age just because Sender read the same frame again.
+        with self._return_state_lock:
+            if session_time == self._return_session_time:
+                return
+            if self._return_session_time is not None and session_time < self._return_session_time:
+                self._return_generation += 1
+                self._return_state = None
+                self._return_session_time = session_time
+                return
+            self._return_session_time = session_time
+            on_track, replay = read('IsOnTrack'), read('IsReplayPlaying')
+            in_car = None
+            if isinstance(on_track, bool) and isinstance(replay, bool):
+                # Replay while still seated is not proof that reset exited the
+                # car. Keep unknown flags unknown so no exit is inferred.
+                in_car = None if on_track and replay else on_track
+            self._return_state = dict(
+                connected=bool(self.state.ir_connected),
+                in_car=in_car,
+                speed_mps=read('Speed'), brake=read('Brake'), sampled_at=time.monotonic(),
+                in_pit_stall=read('PlayerCarInPitStall'),
+                tow_time=read('PlayerCarTowTime'), session_num=read('SessionNum'),
+                telemetry_generation=self._return_generation)
     
     def get_current_driver(self):
         """Get the current driver name from main window"""
@@ -7567,6 +7654,7 @@ class iRacingMonitor(QThread):
 
     def check_iracing(self):
         if self.state.ir_connected and not (self.ir.is_initialized and self.ir.is_connected):
+            self._clear_return_state()
             self.state.ir_connected = False
             self.ir.shutdown()
             self.connection_status.emit('iRacing disconnected', 'orange')
@@ -7577,6 +7665,7 @@ class iRacingMonitor(QThread):
     def display_telemetry(self):
         # Freeze the data buffer
         self.ir.freeze_var_buffer_latest()
+        self._capture_return_state()
         
         # Get telemetry data
         speed = self.ir['Speed']  # m/s
@@ -7620,6 +7709,7 @@ class iRacingMonitor(QThread):
                 
         except Exception as e:
             print(f"iRacing monitor error: {str(e)}")
+            self._clear_return_state()
             self.connection_status.emit(f"Error monitoring iRacing: {str(e)}", "red")
             # Clean up connection on major error
             if self.state.ir_connected:
@@ -7633,6 +7723,7 @@ class iRacingMonitor(QThread):
     def stop(self):
         print(f"\n=== Stopping {self.game_name} Monitor ===")
         self.running = False
+        self._clear_return_state()
         try:
             if self.state.ir_connected:
                 print("Shutting down iRacing SDK connection...")
@@ -9212,6 +9303,7 @@ class LapTimeSenderWindow(QMainWindow):
     network_simulators_updated = pyqtSignal(object)
     network_status_updated = pyqtSignal(object)
     mdns_refresh_finished = pyqtSignal(object)
+    receiver_test_finished = pyqtSignal(object)
 
     def __init__(self):
         super().__init__()
@@ -9220,6 +9312,15 @@ class LapTimeSenderWindow(QMainWindow):
         self.network_simulators_updated.connect(self._on_network_simulators_updated)
         self.network_status_updated.connect(self._apply_network_status)
         self.mdns_refresh_finished.connect(self._on_mdns_refresh_finished)
+        self.receiver_test_finished.connect(self._on_receiver_test_finished)
+        self._receiver_test_url = None
+        self._receiver_test_pending = False
+        self._receiver_test_generation = 0
+        self._iracing_return = None
+        self._iracing_return_session = None
+        self.iracing_return_timer = QTimer(self)
+        self.iracing_return_timer.setInterval(50)
+        self.iracing_return_timer.timeout.connect(self._tick_iracing_return)
         self._network_status_in_progress = False
         self._mdns_refresh_in_progress = False
         self._network_signature = None
@@ -9282,6 +9383,7 @@ class LapTimeSenderWindow(QMainWindow):
         main_window = self
         ui_bridge = UIBridge()
         ui_bridge.driver_registered.connect(self.update_driver_name)
+        ui_bridge.driver_registration_requested.connect(self.apply_driver_registration)
         ui_bridge.manual_lap_submitted.connect(self.on_manual_lap_submitted)
         ui_bridge.force_end_session.connect(self.end_session)
         ui_bridge.extend_session.connect(self.extend_current_session)
@@ -9326,6 +9428,8 @@ class LapTimeSenderWindow(QMainWindow):
         settings = load_app_settings()
         self.session_end_shortcut = str(settings.get('session_end_shortcut', 'Ctrl+R'))
         self.session_end_hotkey_enabled = bool(settings.get('session_end_hotkey_enabled', False))
+        delay = settings.get('session_end_delay_ms', 1500)
+        self.session_end_delay_ms = delay if delay in (1000, 1500, 2000) else 1500
         try:
             parse_shortcut(self.session_end_shortcut)
         except ValueError:
@@ -9333,6 +9437,40 @@ class LapTimeSenderWindow(QMainWindow):
             self.session_end_shortcut = 'Ctrl+R'
         self.session_end_hotkey_checkbox.setChecked(self.session_end_hotkey_enabled)
         self.session_end_shortcut_input.setText(self.session_end_shortcut)
+        self.session_end_delay_selector.setCurrentIndex(
+            self.session_end_delay_selector.findData(self.session_end_delay_ms))
+
+        # A modifier reset can release iRacing's keyboard brake. Existing rigs
+        # must bind a single reset key before re-enabling.
+        needs_setup = 'iracing_brake_shortcut' not in settings
+        self.iracing_auto_pit_enabled = bool(settings.get('iracing_auto_pit_enabled', False))
+        self.iracing_reset_shortcut = str(settings.get('iracing_reset_shortcut', 'F9'))
+        self.iracing_brake_shortcut = str(settings.get('iracing_brake_shortcut', 'F8'))
+        try:
+            if len(parse_shortcut(self.iracing_reset_shortcut)) != 1:
+                self.iracing_reset_shortcut = 'F9'
+                needs_setup = True
+            validate_return_shortcuts(self.iracing_brake_shortcut, self.iracing_reset_shortcut)
+            self.iracing_reset_hold = float(settings.get('iracing_reset_hold', 3.5))
+            self.iracing_end_delay_ms = settings.get('iracing_end_delay_ms', self.session_end_delay_ms)
+            if not (math.isfinite(self.iracing_reset_hold) and 1 <= self.iracing_reset_hold <= 10
+                    and type(self.iracing_end_delay_ms) is int and 1000 <= self.iracing_end_delay_ms <= 2000):
+                raise ValueError('Invalid iRacing return settings')
+        except (TypeError, ValueError):
+            needs_setup = True
+            self.iracing_reset_shortcut = 'F9'
+            self.iracing_brake_shortcut, self.iracing_reset_hold, self.iracing_end_delay_ms = 'F8', 3.5, 1500
+        if needs_setup:
+            self.iracing_auto_pit_enabled = False
+        self.iracing_auto_pit_checkbox.setChecked(self.iracing_auto_pit_enabled)
+        self.iracing_reset_input.setText(self.iracing_reset_shortcut)
+        self.iracing_brake_shortcut_input.setText(self.iracing_brake_shortcut)
+        self.iracing_hold_input.setText(f'{self.iracing_reset_hold:g}')
+        self.iracing_end_delay_input.setValue(self.iracing_end_delay_ms / 1000)
+        if needs_setup:
+            self.iracing_return_status.setText(
+                'Setup required: bind Second Brake and a single Enter/Exit/Tow key in iRacing. '
+                'Use the keys shown above, then enable and save. Shift/Ctrl/Alt reset shortcuts are no longer used.')
 
         # Restore the simulator ID first: mDNS, the discovery broadcast and
         # every leaderboard submission key off it.
@@ -10111,13 +10249,17 @@ class LapTimeSenderWindow(QMainWindow):
         end_tab = QWidget()
         end_layout = QVBoxLayout(end_tab)
         end_help = QLabel(
-            "Send a keyboard shortcut when the timer, lap limit, sector challenge or admin End button ends a session.\n"
-            "Assign the same shortcut to Return to pits (or your chosen action) in the game first.\n"
-            "Applies to the game selected in Sender on this PC. Settings are saved on this PC.")
+            'Choose what happens when a timer, lap limit, sector challenge or End button ends a session. '
+            'Each game has its own saved controls and delay. Actions run only for the game selected in Sender.')
         end_help.setWordWrap(True)
         end_layout.addWidget(end_help)
-        self.session_end_hotkey_checkbox = QCheckBox("Send shortcut when a session ends")
-        end_layout.addWidget(self.session_end_hotkey_checkbox)
+        self.session_end_game_tabs = QTabWidget()
+        self.session_end_game_tabs.setObjectName('sessionEndGameTabs')
+        end_layout.addWidget(self.session_end_game_tabs)
+        assetto_tab = QWidget()
+        assetto_layout = QVBoxLayout(assetto_tab)
+        self.session_end_hotkey_checkbox = QCheckBox('Send shortcut when an Assetto Corsa session ends')
+        assetto_layout.addWidget(self.session_end_hotkey_checkbox)
         shortcut_row = QHBoxLayout()
         shortcut_row.addWidget(QLabel("Shortcut:"))
         self.session_end_shortcut_input = QLineEdit('Ctrl+R')
@@ -10128,19 +10270,88 @@ class LapTimeSenderWindow(QMainWindow):
         save_hotkey.clicked.connect(self._save_session_end_hotkey)
         shortcut_row.addWidget(save_hotkey)
         test_hotkey = QPushButton('Test saved shortcut')
-        test_hotkey.setToolTip('Switches to the selected game and sends the saved shortcut. Use between sessions.')
+        test_hotkey.setToolTip('Tests the saved Assetto Corsa shortcut and delay. Select Assetto Corsa and use between driver sessions.')
         test_hotkey.clicked.connect(self._test_session_end_hotkey)
         shortcut_row.addWidget(test_hotkey)
-        end_layout.addLayout(shortcut_row)
+        assetto_layout.addLayout(shortcut_row)
+        delay_row = QHBoxLayout()
+        delay_row.addWidget(QLabel('Delay after session ends:'))
+        self.session_end_delay_selector = QComboBox()
+        for label, milliseconds in (('1 second', 1000), ('1.5 seconds', 1500), ('2 seconds', 2000)):
+            self.session_end_delay_selector.addItem(label, milliseconds)
+        self.session_end_delay_selector.setCurrentIndex(1)
+        delay_row.addWidget(self.session_end_delay_selector)
+        delay_row.addStretch(1)
+        assetto_layout.addLayout(delay_row)
         note = QLabel('Off by default. When enabled, this replaces the sector challenge’s built-in car reset.\n'
-                      'Test between sessions to confirm the game binding works before using it for drivers.')
+                      'The test uses the saved delay. Starting another driver cancels a pending shortcut.\n'
+                      'Assetto Corsa: Ctrl+R must be remapped to Return to pits; its default action is Replay.')
         note.setWordWrap(True)
-        end_layout.addWidget(note)
+        assetto_layout.addWidget(note)
         self.session_end_hotkey_status = QLabel('No shortcut sent yet.')
         self.session_end_hotkey_status.setWordWrap(True)
-        end_layout.addWidget(self.session_end_hotkey_status)
-        end_layout.addStretch(1)
+        assetto_layout.addWidget(self.session_end_hotkey_status)
+        assetto_layout.addStretch(1)
+        self.session_end_game_tabs.addTab(assetto_tab, 'Assetto Corsa')
         self.settings_tabs.addTab(end_tab, 'Session End')
+
+        iracing_tab = QWidget()
+        iracing_layout = QVBoxLayout(iracing_tab)
+        iracing_help = QLabel(
+            'Braking starts immediately when the session ends. After a confirmed stop and the reset delay, '
+            'Sender holds Enter/Exit/Tow Car while keeping the brake applied.')
+        iracing_help.setWordWrap(True)
+        iracing_layout.addWidget(iracing_help)
+        self.iracing_auto_pit_checkbox = QCheckBox('Automatically stop and reset at the end of iRacing sessions')
+        iracing_layout.addWidget(self.iracing_auto_pit_checkbox)
+        brake_row = QHBoxLayout()
+        brake_row.addWidget(QLabel('Second Brake key:'))
+        self.iracing_brake_shortcut_input = QLineEdit('F8')
+        self.iracing_brake_shortcut_input.setPlaceholderText('F8')
+        self.iracing_brake_shortcut_input.setToolTip('One key without Ctrl, Alt or Shift. Bind it to Second Brake in iRacing and remove any other assignment for that key.')
+        brake_row.addWidget(self.iracing_brake_shortcut_input)
+        brake_row.addWidget(QLabel('Minimum reset delay (seconds):'))
+        self.iracing_end_delay_input = QDoubleSpinBox()
+        self.iracing_end_delay_input.setRange(1, 2)
+        self.iracing_end_delay_input.setDecimals(1)
+        self.iracing_end_delay_input.setSingleStep(0.5)
+        self.iracing_end_delay_input.setValue(1.5)
+        brake_row.addWidget(self.iracing_end_delay_input)
+        iracing_layout.addLayout(brake_row)
+        reset_row = QHBoxLayout()
+        reset_row.addWidget(QLabel('Enter/Exit/Tow key:'))
+        self.iracing_reset_input = QLineEdit('F9')
+        self.iracing_reset_input.setToolTip('Use one key without Shift, Ctrl or Alt. Modifiers can cancel iRacing keyboard braking.')
+        reset_row.addWidget(self.iracing_reset_input)
+        reset_row.addWidget(QLabel('Hold (seconds):'))
+        self.iracing_hold_input = QLineEdit('3.5')
+        self.iracing_hold_input.setMaximumWidth(65)
+        reset_row.addWidget(self.iracing_hold_input)
+        iracing_layout.addLayout(reset_row)
+        iracing_buttons = QHBoxLayout()
+        for label, callback in (
+                ('Save iRacing settings', self._save_iracing_return_settings),
+                ('Test stop and reset', self._test_iracing_return),
+                ('Cancel / release controls', self._cancel_iracing_return_clicked)):
+            button = QPushButton(label)
+            button.clicked.connect(callback)
+            iracing_buttons.addWidget(button)
+        iracing_layout.addLayout(iracing_buttons)
+        iracing_setup = QLabel(
+            '<b>One-time setup in iRacing</b><br>'
+            '1. Load a test session, then open Settings → Keybinds → In Car → Cockpit.<br>'
+            '2. Bind Second Brake to F8 and Enter/Exit/Tow Car to F9 (or the keys you choose above).<br>'
+            '3. Use two different keys with no Shift/Ctrl/Alt. Remove their other bindings. Keep your regular pedals assigned.<br>'
+            '4. Check the brake input in the car, then save here and test in private practice.<br>'
+            'Braking starts immediately; the delay only holds off Reset until the car is stopped.<br>'
+            'Sender sends the keys directly. No additional app or controller driver is required.')
+        iracing_setup.setWordWrap(True)
+        iracing_layout.addWidget(iracing_setup)
+        self.iracing_return_status = QLabel('Automatic iRacing stop and reset is off until configured and saved.')
+        self.iracing_return_status.setWordWrap(True)
+        iracing_layout.addWidget(self.iracing_return_status)
+        iracing_layout.addStretch(1)
+        self.session_end_game_tabs.addTab(iracing_tab, 'iRacing')
         page_layout.addWidget(self.settings_tabs)
 
         # Everything used to sit behind a "Show Advanced" toggle; the tabs
@@ -10374,7 +10585,10 @@ class LapTimeSenderWindow(QMainWindow):
             self.game_status.setStyleSheet("color: red")
     
     def on_game_changed(self, game_name):
-        """Handle game selection changes"""
+        """Handle game selection changes."""
+        self._cancel_iracing_return('Cancelled because the selected game changed.')
+        if hasattr(self, 'session_end_game_tabs') and game_name in ('Assetto Corsa', 'iRacing'):
+            self.session_end_game_tabs.setCurrentIndex(1 if game_name == 'iRacing' else 0)
         print(f"\nSwitching to {game_name}")
         if game_name == "BeamNG.drive":
             self.install_beamng_mod()
@@ -11156,6 +11370,7 @@ class LapTimeSenderWindow(QMainWindow):
         self._update_sim_id_conflict_ui()
 
     def closeEvent(self, event):
+        self._cancel_iracing_return('Sender is closing; controls released.')
         if self.current_monitor:
             self.current_monitor.stop()
         if self.retry_timer:
@@ -11194,7 +11409,36 @@ class LapTimeSenderWindow(QMainWindow):
             
             print("=== Pending laps flushed ===\n")
     
+    @pyqtSlot(object)
+    def apply_driver_registration(self, registration):
+        with registration.lock:
+            if registration.state != 'queued':
+                return
+            registration.state = 'applying'
+        try:
+            data = registration.payload
+            name = data['driver_name']
+            already_active = _current_driver_already_active(name)
+            if not already_active:
+                # Keep the driver and their contact/queue data together on the
+                # UI thread, including when two tablets submit concurrently.
+                self.last_driver_email = data['driver_email']
+                self.last_driver_phone = data['driver_phone']
+                self.last_survey_answers = data['survey_answers']
+                self.assigned_queue_id = data['queue_id']
+                self.update_driver_name(name)
+            result = ({'success': True, 'applied': True, 'driver_name': self.driver_name.text(),
+                       'already_active': already_active, 'session_id': self.current_session_id,
+                       'applied_at': time.time()}, 200)
+        except Exception as exc:
+            result = ({'success': False, 'error': f'Could not apply driver: {exc}'}, 500)
+        with registration.lock:
+            registration.result = result
+            registration.state = 'done'
+            registration.done.set()
+
     def update_driver_name(self, name):
+        self._cancel_iracing_return('Cancelled because a new driver is starting.')
         # Flush any pending laps from BeamNG before changing driver
         # This ensures laps are sent with the correct driver name
         old_driver = self.driver_name.text() if hasattr(self.driver_name, 'text') else ""
@@ -11541,6 +11785,134 @@ class LapTimeSenderWindow(QMainWindow):
         if hasattr(self, 'toggle_waiting_screen_btn'):
             self.toggle_waiting_screen_btn.setText("Show Waiting Screen")
         
+    def _save_iracing_return_settings(self):
+        try:
+            shortcut = self.iracing_reset_input.text().strip()
+            brake_shortcut = self.iracing_brake_shortcut_input.text().strip()
+            validate_return_shortcuts(brake_shortcut, shortcut)
+            hold = float(self.iracing_hold_input.text())
+            if not math.isfinite(hold) or not 1 <= hold <= 10:
+                raise ValueError('Reset hold must be between 1 and 10 seconds.')
+            delay_ms = round(self.iracing_end_delay_input.value() * 1000)
+        except (TypeError, ValueError) as exc:
+            self.iracing_return_status.setText(f'Not saved: {exc}')
+            return
+        enabled = self.iracing_auto_pit_checkbox.isChecked()
+        settings = load_app_settings()
+        settings.update(iracing_auto_pit_enabled=enabled, iracing_reset_shortcut=shortcut,
+                        iracing_brake_shortcut=brake_shortcut, iracing_reset_hold=hold,
+                        iracing_end_delay_ms=delay_ms)
+        settings.pop('iracing_brake_device', None)
+        settings.pop('iracing_brake_axis', None)
+        settings.pop('iracing_clutch_enabled', None)
+        settings.pop('iracing_clutch_shortcut', None)
+        if not save_app_settings(settings):
+            self.iracing_return_status.setText('Could not save. Previous iRacing settings remain in use.')
+            return
+        self._cancel_iracing_return('Cancelled because iRacing settings changed.')
+        self.iracing_auto_pit_enabled = enabled
+        self.iracing_reset_shortcut, self.iracing_reset_hold = shortcut, hold
+        self.iracing_brake_shortcut, self.iracing_end_delay_ms = brake_shortcut, delay_ms
+        self.iracing_return_status.setText(
+            f'Saved: apply brake {brake_shortcut} immediately; once stopped and at least {delay_ms / 1000:g}s has elapsed, '
+            f'hold {shortcut} for {hold:g}s. '
+            + ('Automatic stop and reset is on for iRacing.' if enabled else 'Automatic stop and reset is off.')
+            + self._iracing_cleanup_warning())
+
+    def _iracing_snapshot(self):
+        monitor = self.current_monitor
+        if isinstance(monitor, iRacingMonitor):
+            return monitor.return_to_pits_snapshot()
+        return None
+
+    def _test_iracing_return(self):
+        if self.game_selector.currentText() != 'iRacing':
+            self.iracing_return_status.setText('Select iRacing in Sender before testing.')
+            return
+        if self.session_active or self.driver_name.text().strip():
+            self.iracing_return_status.setText('End the registered driver session before testing.')
+            return
+        self._schedule_game_end_shortcut(self.current_session_id, iracing_return=True)
+
+    def _start_iracing_return(self, session_id):
+        snapshot = self._iracing_snapshot()
+        if not snapshot or snapshot.get('connected') is not True or snapshot.get('in_car') is not True:
+            self.iracing_return_status.setText('No live iRacing driving telemetry. Enter the car before testing.')
+            return
+        numeric_fields = ('sampled_at', 'speed_mps', 'brake', 'tow_time')
+        if (any(isinstance(snapshot.get(field), bool)
+                or not isinstance(snapshot.get(field), (int, float))
+                or not math.isfinite(snapshot[field]) for field in numeric_fields)
+                or not isinstance(snapshot.get('in_pit_stall'), bool)
+                or not 0 <= time.monotonic() - snapshot['sampled_at'] <= 1
+                or not 0 <= snapshot['brake'] <= 1 or snapshot['tow_time'] < 0):
+            self.iracing_return_status.setText('iRacing driving telemetry is stale or invalid; no controls were applied.')
+            return
+        brake = None
+        try:
+            validate_return_shortcuts(self.iracing_brake_shortcut, self.iracing_reset_shortcut)
+            brake = KeyboardBrake(self.iracing_brake_shortcut)
+            self._iracing_return = IracingReturnSequence(
+                brake, self.iracing_reset_shortcut, self.iracing_reset_hold,
+                reset_delay_seconds=self.iracing_end_delay_ms / 1000)
+            self._iracing_return_session = session_id
+            self.iracing_return_timer.start()
+            self._tick_iracing_return()
+        except Exception as exc:
+            if brake is not None:
+                try:
+                    brake.close()
+                except Exception as cleanup:
+                    exc = RuntimeError(f'{exc}; could not release brake: {cleanup}')
+            self.iracing_return_timer.stop()
+            self._iracing_return = None
+            self.iracing_return_status.setText(f'iRacing stop and reset could not start: {exc}')
+
+    def _tick_iracing_return(self):
+        sequence = self._iracing_return
+        if sequence is None:
+            self.iracing_return_timer.stop()
+            return
+        if (self.current_session_id != self._iracing_return_session or self.session_active
+                or self.driver_name.text().strip() or self.game_selector.currentText() != 'iRacing'):
+            self._cancel_iracing_return('Cancelled because the driver or selected game changed.')
+            return
+        try:
+            sequence.tick(self._iracing_snapshot())
+        except Exception as exc:
+            sequence.cancel(f'iRacing return failed: {exc}')
+        self.iracing_return_status.setText(sequence.message)
+        if sequence.done:
+            self.iracing_return_timer.stop()
+            if not sequence.cleanup_pending:
+                self._iracing_return = None
+            print(f'[iRacing return] {sequence.message}')
+
+    def _cancel_iracing_return_clicked(self):
+        self._cancel_iracing_return('Cancelled by operator; controls released.')
+
+    def _cancel_iracing_return(self, reason):
+        pending = getattr(self, '_pending_session_shortcut', None) is not None
+        pending_game = getattr(self, '_pending_session_shortcut_game', None)
+        self._pending_session_shortcut = None
+        self._pending_session_shortcut_game = None
+        if getattr(self, '_iracing_return', None) is not None:
+            self._iracing_return.cancel(reason)
+            self.iracing_return_status.setText(self._iracing_return.message)
+            if not self._iracing_return.cleanup_pending:
+                self._iracing_return = None
+        elif pending:
+            if pending_game == 'iRacing':
+                self.iracing_return_status.setText(reason)
+            else:
+                self.session_end_hotkey_status.setText(reason)
+        if hasattr(self, 'iracing_return_timer'):
+            self.iracing_return_timer.stop()
+
+    def _iracing_cleanup_warning(self):
+        sequence = self._iracing_return
+        return '\n' + sequence.message if sequence is not None and sequence.cleanup_pending else ''
+
     def _save_session_end_hotkey(self):
         shortcut = self.session_end_shortcut_input.text().strip()
         try:
@@ -11550,28 +11922,82 @@ class LapTimeSenderWindow(QMainWindow):
             return
         settings = load_app_settings()
         enabled = self.session_end_hotkey_checkbox.isChecked()
-        settings.update(session_end_hotkey_enabled=enabled, session_end_shortcut=shortcut)
+        delay_ms = self.session_end_delay_selector.currentData()
+        settings.update(session_end_hotkey_enabled=enabled, session_end_shortcut=shortcut,
+                        session_end_delay_ms=delay_ms)
         if not save_app_settings(settings):
             self.session_end_hotkey_status.setText('Could not save settings. Previous shortcut settings are still in use.')
             return
         self.session_end_hotkey_enabled = enabled
         self.session_end_shortcut = shortcut
-        self.session_end_hotkey_status.setText(
-            f'Saved: {shortcut} at session end.' if enabled else 'Saved: automatic shortcut is off.')
+        self.session_end_delay_ms = delay_ms
+        self._cancel_iracing_return('Cancelled because session end settings changed.')
+        message = (
+            f'Saved: {shortcut}, {delay_ms / 1000:g} seconds after session end.'
+            if enabled else 'Saved: automatic shortcut is off.')
+        self.session_end_hotkey_status.setText(message + self._iracing_cleanup_warning())
 
-    def _send_game_end_shortcut(self):
-        sent, message = send_game_shortcut(self.game_selector.currentText(), self.session_end_shortcut)
+    def _send_game_end_shortcut(self, game=None, shortcut=None):
+        sent, message = send_game_shortcut(game or self.game_selector.currentText(),
+                                           shortcut or self.session_end_shortcut)
         self.session_end_hotkey_status.setText(message)
         if not sent:
             self.status_label.setText(f'Session end shortcut: {message}')
         print(f'[Session shortcut] {message}')
         return sent
 
+    def _schedule_game_end_shortcut(self, session_id, iracing_return=False):
+        game = self.game_selector.currentText()
+        iracing_return = game == 'iRacing' and (iracing_return or self.iracing_auto_pit_enabled)
+        if not iracing_return and game != 'Assetto Corsa':
+            return
+        status = self.iracing_return_status if iracing_return else self.session_end_hotkey_status
+        if self._iracing_return is not None:
+            self.iracing_return_status.setText(
+                'iRacing controls still need to be released. Click Cancel / release controls to retry.'
+                + self._iracing_cleanup_warning() if self._iracing_return.cleanup_pending
+                else 'iRacing stop and reset is already running.')
+            return
+        if getattr(self, '_pending_session_shortcut', None) is not None:
+            status.setText('An end action is already scheduled; wait for the result.')
+            return
+        token = object()
+        self._pending_session_shortcut = token
+        self._pending_session_shortcut_game = game
+        shortcut = self.session_end_shortcut
+        # Apply iRacing brake on the next event-loop turn, after the
+        # driver is cleared. Its reset delay runs alongside deceleration.
+        delay_ms = 0 if iracing_return else self.session_end_delay_ms
+        if iracing_return:
+            status.setText('iRacing braking starts immediately; Reset waits for a full stop '
+                           f'and at least {self.iracing_end_delay_ms / 1000:g} seconds.')
+        else:
+            status.setText(f'{shortcut} scheduled in {delay_ms / 1000:g} seconds for {game}.')
+
+        def deliver():
+            if self._pending_session_shortcut is not token:
+                return
+            self._pending_session_shortcut = None
+            self._pending_session_shortcut_game = None
+            if (self.current_session_id != session_id or self.session_active or
+                    self.driver_name.text().strip() or self.game_selector.currentText() != game):
+                status.setText('Pending shortcut cancelled because the driver or game changed.')
+                return
+            if iracing_return:
+                self._start_iracing_return(session_id)
+            else:
+                self._send_game_end_shortcut(game, shortcut)
+
+        QTimer.singleShot(delay_ms, deliver)
+
     def _test_session_end_hotkey(self):
+        if self.game_selector.currentText() != 'Assetto Corsa':
+            self.session_end_hotkey_status.setText('Select Assetto Corsa in Sender before testing this shortcut.')
+            return
         if self.session_active or self.driver_name.text().strip():
             self.session_end_hotkey_status.setText('End the current driver session before testing the shortcut.')
             return
-        self._send_game_end_shortcut()
+        self._schedule_game_end_shortcut(self.current_session_id)
 
     def end_session(self, headline=None, detail=None, accent=None, hold_ms=4000, expected_session_id=None):
         """End the current session and return to waiting screen.
@@ -11599,15 +12025,18 @@ class LapTimeSenderWindow(QMainWindow):
         self.timer_end_timestamp = 0  # Prevent stale timestamp race condition
         self.session_start_timestamp = 0  # Reset session start timestamp
 
-        # Send before the waiting overlay takes keyboard focus. Mark the attempt
-        # first: duplicate End requests must never repeat a game action.
+        # Cover the track and schedule the selected game's end action. Capture
+        # the session so a late callback cannot reset the next driver's car.
         if (was_active and ended_session_id and
                 getattr(self, '_hotkey_ended_session', None) != ended_session_id):
             self._hotkey_ended_session = ended_session_id
             self._custom_reset_session = (ended_session_id
-                if getattr(self, 'session_end_hotkey_enabled', False) else None)
+                if ((self.game_selector.currentText() == 'Assetto Corsa' and self.session_end_hotkey_enabled)
+                    or (self.game_selector.currentText() == 'iRacing' and self.iracing_auto_pit_enabled)) else None)
             if self._custom_reset_session:
-                self._send_game_end_shortcut()
+                # An old pending callback is superseded by this session's end.
+                self._pending_session_shortcut = None
+                self._schedule_game_end_shortcut(ended_session_id)
 
         # Clear driver name so network tabs show "No driver"
         self.driver_name.clear()
@@ -12672,8 +13101,17 @@ class LapTimeSenderWindow(QMainWindow):
         self.set_advanced_visible(checked)
 
     def test_and_save_connection(self):
-        """Test connection and save URL if successful (supports multiple comma-separated URLs)"""
+        """Probe receivers without blocking tablet registration or session timers."""
         url_str = self.server_url.text().strip()
+        if self._receiver_test_url is not None:
+            # Discovery may change the list while a probe is running. Coalesce
+            # those updates instead of starting overlapping connection tests.
+            self._receiver_test_pending = url_str != self._receiver_test_url
+            return
+        self._receiver_test_url = url_str
+        self._receiver_test_pending = False
+        self._receiver_test_generation += 1
+        generation = self._receiver_test_generation
         test_button = self.findChild(QPushButton, "test-connection")
 
         # Support multiple comma-separated URLs
@@ -12693,35 +13131,60 @@ class LapTimeSenderWindow(QMainWindow):
                 font-size: 13px;
             }
         """)
-        QApplication.processEvents()  # Update the UI immediately
-
-        # Test each URL
-        success_count = 0
-        failed_urls = []
-
-        for url in urls:
+        def probe(url):
             try:
-                # Test connection with a 5-second timeout
                 response = requests.get(url, timeout=5)
                 # Accept any response as valid - the server is responding
                 print(f"Server {url} responded with status code: {response.status_code}")
-                success_count += 1
+                return None
             except requests.exceptions.Timeout:
-                failed_urls.append((url, "timeout"))
                 print(f"Timeout connecting to {url}")
+                return url, "timeout"
             except requests.exceptions.ConnectionError as e:
-                failed_urls.append((url, "connection error"))
                 print(f"Connection error to {url}: {str(e)}")
+                return url, "connection error"
             except Exception as e:
-                failed_urls.append((url, str(e)))
                 print(f"Error testing {url}: {str(e)}")
+                return url, str(e)
+
+        def worker():
+            failed_urls = []
+            if urls:
+                with ThreadPoolExecutor(max_workers=min(8, len(urls))) as executor:
+                    failed_urls = [failure for failure in executor.map(probe, urls) if failure]
+            result = dict(url_str=url_str, total=len(urls), failed_urls=failed_urls,
+                          generation=generation)
+            try:
+                self.receiver_test_finished.emit(result)
+            except RuntimeError:
+                pass  # The window may have closed while the network timed out.
+
+        threading.Thread(target=worker, name='receiver-connection-test', daemon=True).start()
+
+    @pyqtSlot(object)
+    def _on_receiver_test_finished(self, result):
+        """Apply a receiver probe only to the URL list it actually tested."""
+        if result['generation'] != self._receiver_test_generation:
+            return
+        self._receiver_test_url = None
+        pending = self._receiver_test_pending
+        self._receiver_test_pending = False
+        test_button = self.findChild(QPushButton, "test-connection")
+        url_str = result['url_str']
+        if self.server_url.text().strip() != url_str:
+            self._reset_button_state(test_button)
+            test_button.setToolTip("")
+            if pending:
+                self.test_and_save_connection()
+            return
 
         # Always save the URL(s) - user may want to use them anyway
         self.current_server_url = url_str
+        total_urls = result['total']
+        failed_urls = result['failed_urls']
+        success_count = total_urls - len(failed_urls)
 
-        total_urls = len(urls)
-
-        if success_count == total_urls:
+        if total_urls and success_count == total_urls:
             # All URLs connected successfully
             if total_urls == 1:
                 test_button.setText("Connected!")
@@ -12770,11 +13233,17 @@ class LapTimeSenderWindow(QMainWindow):
                 }
             """)
             failed_info = "\n".join([f"• {url}: {reason}" for url, reason in failed_urls])
-            test_button.setToolTip(f"All connections failed:\n{failed_info}")
+            test_button.setToolTip(f"All connections failed:\n{failed_info}" if total_urls
+                                  else "Enter a leaderboard receiver URL to test.")
 
         print(f"URL(s) saved for future attempts: {url_str}")
         # After 2 seconds, revert button state
-        QTimer.singleShot(2000, lambda: self._reset_button_state(test_button))
+        QTimer.singleShot(2000, lambda: self._reset_receiver_test_button(result['generation']))
+
+    def _reset_receiver_test_button(self, generation):
+        # A prior result's timer must not re-enable a newer test in progress.
+        if generation == self._receiver_test_generation and self._receiver_test_url is None:
+            self._reset_button_state(self.findChild(QPushButton, "test-connection"))
 
     def _reset_button_state(self, button):
         """Reset the button to its default state"""

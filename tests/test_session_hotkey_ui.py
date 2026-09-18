@@ -40,11 +40,27 @@ with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
     window.waiting_overlay = Mock()
     assert not window.session_end_hotkey_enabled
     assert window.session_end_shortcut == 'Ctrl+R'
+    assert window.session_end_delay_ms == 1500
+    assert window.settings_tabs.count() == 4
     assert window.settings_tabs.tabText(3) == 'Session End'
+    assert window.session_end_game_tabs.tabText(0) == 'Assetto Corsa'
+    assert window.session_end_game_tabs.tabText(1) == 'iRacing'
 
     def driver(name):
         window.update_driver_name(name)
         assert window.session_active
+
+    def shortcut_callback():
+        return [call.args[1] for call in timers.call_args_list
+                if call.args[0] == window.session_end_delay_ms][-1]
+
+    def deliver_shortcut():
+        callback = shortcut_callback()
+        before = send.call_count
+        callback()
+        assert send.call_count == before + 1
+        callback()
+        assert send.call_count == before + 1  # Even a repeated callback cannot resend.
 
     # Default off, ordinary end behavior preserved.
     driver('Disabled')
@@ -59,6 +75,7 @@ with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
     assert window.session_end_hotkey_enabled
     settings = s.load_app_settings()
     assert settings['session_end_hotkey_enabled'] and settings['session_end_shortcut'] == 'Ctrl+R'
+    assert settings['session_end_delay_ms'] == 1500
     assert settings['simulator_id'] == 2
     # Restore settings using the real Qt controls.
     window.session_end_hotkey_enabled = False
@@ -76,17 +93,20 @@ with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
     assert window.session_end_shortcut == 'Ctrl+R'
     window.session_end_shortcut_input.setText('Ctrl+R')
 
-    # Real admin signal, duplicate request, and overlay ordering.
+    # Real admin signal, duplicate request, delay, and overlay ordering.
     driver('Admin')
     window.waiting_overlay.reset_mock()
     def check_order(*args):
-        window.waiting_overlay.show_session_complete.assert_not_called()
+        window.waiting_overlay.show_session_complete.assert_called()
+        assert not window.session_active and not window.driver_name.text()
         return True, 'Sent Ctrl+R'
     send.side_effect = check_order
     s.ui_bridge.force_end_session.emit()
+    send.assert_not_called()
+    s.ui_bridge.force_end_session.emit()
+    deliver_shortcut()
     send.assert_called_once_with('Assetto Corsa', 'Ctrl+R')
     send.side_effect = None
-    s.ui_bridge.force_end_session.emit()
     assert send.call_count == 1
     assert not window.session_active and not window.driver_name.text()
 
@@ -97,6 +117,8 @@ with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
     window.timer_end_timestamp = 1
     window.check_session_timeout()
     window.check_session_timeout()
+    assert send.call_count == 1
+    deliver_shortcut()
     assert send.call_count == 2
 
     # Lap-limit path.
@@ -106,6 +128,8 @@ with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
     window.lap_rotation_count = 0
     window.lap_rotation_target = 1
     window.on_lap_completed(65.3, 'Laps')
+    assert send.call_count == 2
+    deliver_shortcut()
     assert send.call_count == 3 and not window.session_active
     window.lap_rotation_active = False
 
@@ -119,6 +143,7 @@ with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
             window.on_challenge_completed(65)
         callbacks = {call.args[0]: call.args[1] for call in timers.call_args_list}
         callbacks[400]()
+        deliver_shortcut()
         with patch.object(s, 'ac_app_alive') as alive, patch.object(window, 'restart_ac_session') as restart:
             callbacks[1400]()
             alive.assert_not_called()
@@ -129,6 +154,7 @@ with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
     driver('Blocked')
     send.return_value = (False, 'Windows blocked input')
     window.end_session()
+    deliver_shortcut()
     assert not window.session_active and not window.driver_name.text()
     assert 'blocked' in window.status_label.text()
     assert send.call_count == 6
@@ -153,14 +179,48 @@ with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
     timers.reset_mock()
     window.end_session()
     waiting_callback = [c.args[1] for c in timers.call_args_list if c.args[0] == 4000][-1]
+    old_shortcut_callback = shortcut_callback()
     driver('After interstitial')
     window.waiting_overlay.reset_mock()
     waiting_callback()
+    old_shortcut_callback()
     window.waiting_overlay.show.assert_not_called()
+    assert send.call_count == 6
     window.end_session()
+    deliver_shortcut()
     before_test = send.call_count
     window._test_session_end_hotkey()
+    window._test_session_end_hotkey()
+    assert send.call_count == before_test
+    deliver_shortcut()
     assert send.call_count == before_test + 1
+
+    # Consecutive Test button presses each use the same saved chord and timing.
+    for _ in range(10):
+        window._test_session_end_hotkey()
+        deliver_shortcut()
+    assert send.call_count == before_test + 11
+
+    # Changed games and saved settings invalidate a queued shortcut.
+    window._test_session_end_hotkey()
+    old_callback = shortcut_callback()
+    window.game_selector.blockSignals(True)  # No game-install dialogs in this lifecycle test.
+    window.game_selector.setCurrentText('BeamNG.drive')
+    old_callback()
+    assert send.call_count == before_test + 11
+    window.game_selector.setCurrentText('Assetto Corsa')
+    window.game_selector.blockSignals(False)
+    window._test_session_end_hotkey()
+    old_callback = shortcut_callback()
+    window.session_end_delay_selector.setCurrentIndex(window.session_end_delay_selector.findData(2000))
+    window._save_session_end_hotkey()
+    old_callback()
+    assert send.call_count == before_test + 11
+    window._load_saved_settings()
+    assert window.session_end_delay_ms == 2000
+    window._test_session_end_hotkey()
+    assert timers.call_args.args[0] == 2000
+    deliver_shortcut()
 
     # Disabled sector behavior still invokes the original reset.
     window.session_end_hotkey_checkbox.setChecked(False)

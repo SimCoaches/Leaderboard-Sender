@@ -16,6 +16,15 @@ import lap_time_sender as s
 from werkzeug.serving import make_server
 
 
+class FixtureShutdown(s.QObject):
+    requested = s.pyqtSignal()
+
+    @s.pyqtSlot()
+    def stop(self):
+        # Let the loopback HTTP response finish before exiting the Qt loop.
+        s.QTimer.singleShot(100, s.QApplication.instance().quit)
+
+
 def main():
     number = int(sys.argv[1])
     directory = Path(sys.argv[2])
@@ -24,6 +33,8 @@ def main():
     peers = json.loads(sys.argv[4])
     mutations, laps = [], []
     app = s.QApplication([])
+    shutdown = FixtureShutdown()
+    shutdown.requested.connect(shutdown.stop)
     with ExitStack() as stack:
         stack.enter_context(patch.object(s, 'get_settings_path', return_value=directory / f'settings-{number}.json'))
         stack.enter_context(patch.object(s, 'get_config_path', return_value=directory / f'peers-{number}.json'))
@@ -61,13 +72,25 @@ def main():
                                  active=window.session_active, deadline=window.timer_end_timestamp,
                                  mutations=mutations, laps=laps))
 
+        @s.app.post('/fixture/shutdown')
+        def stop():
+            shutdown.requested.emit()
+            return s.jsonify(success=True)
+
         server = make_server(address, port, s.app, threaded=True)
         window.web_port = server.server_port
-        threading.Thread(target=server.serve_forever, daemon=True).start()
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
         ready = directory / f'ready-{number}.json'
         ready.write_text(json.dumps(dict(ip=address, port=server.server_port,
                                         url=f'http://{address}:{server.server_port}')), encoding='utf-8')
-        app.exec()
+        try:
+            app.exec()
+        finally:
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=5)
+            window.close()
 
 
 if __name__ == '__main__':

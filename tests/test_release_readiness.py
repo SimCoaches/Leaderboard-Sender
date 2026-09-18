@@ -70,6 +70,7 @@ class RegistrationWindow:
 
     def update_driver_name(self, name):
         self.driver_name.setText(name)
+        self.current_session_id = 'test-session'
 
 
 class SignalCapture:
@@ -233,7 +234,8 @@ class SenderReleaseReadinessTests(unittest.TestCase):
     def test_registration_contract_validates_and_preserves_guest_fields(self):
         window = RegistrationWindow()
         sender.main_window = window
-        sender.ui_bridge = None
+        sender.ui_bridge = types.SimpleNamespace(driver_registration_requested=types.SimpleNamespace(
+            emit=lambda registration: sender.LapTimeSenderWindow.apply_driver_registration(window, registration)))
         saved_leads = []
 
         with mock.patch.object(

@@ -4,6 +4,7 @@ dist/
 dist_new/
 dist_updated/
 __pycache__/
+.venv/
 *.pyc
 *.pyo
 

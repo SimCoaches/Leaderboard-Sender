@@ -57,6 +57,22 @@ Position are linked (`Finishing Position = 40 - Cars Passed`), so the iPad
 calculates either value from the other. For example, 12 cars passed is a 28th-
 place finish. Lap Time remains an independent value.
 
+## iRacing automatic stop and reset
+
+Open **Session End > iRacing** to configure **Second Brake** and **Enter/Exit/Tow
+Car** keys. Sender brakes, waits for a confirmed stop, then holds the reset key.
+Sender sends the keys
+directly; no extra application or virtual controller driver is required.
+Defaults are F8 for braking, F9 for reset, a 3.5-second reset hold,
+and a 1.5-second minimum reset delay. Braking starts immediately; the
+delay runs alongside deceleration. Both bindings must be different single
+keys without Shift/Ctrl/Alt, since modifiers can release iRacing's keyboard
+brake. Assign the same keys inside iRacing, remove their other bindings, and
+verify brake and reset operation before enabling automatic operation.
+Assetto Corsa has its own section and delay under
+**Session End > Assetto Corsa**. Follow
+[the per-PC setup and rig test](support/IRACING_RETURN_SETUP.md).
+
 ## Building the Executable
 
 To rebuild the executable:

@@ -90,6 +90,50 @@ each checked monitor.
    total time, each sector's time vs. target, and the questionnaire
    answers. `leads.csv` holds the registrations.
 
+## Tablet registration and session-end shortcut regression
+
+1. Run the patched Sender on the tablet's host PC and each simulator. Open
+   `/admin`, register distinct names on each connected simulator, and confirm
+   the selected PC changes its driver before the tablet reports success. The
+   card should show the confirmed name immediately. Repeat while a receiver
+   address is unreachable; its connection check must not freeze registration.
+2. Close Sender on one peer. Within the next discovery checks its card and
+   registration option should disappear. Reopen it and confirm it returns.
+   Previously saved addresses may remain in Settings, but must not appear as
+   disconnected cards or targets.
+3. In **Session End > Assetto Corsa**, keep the rig's remapped **Ctrl+R** shortcut, choose the
+   **1.5 seconds** delay (or 1/2 seconds), and save. With no driver registered,
+   drive away from the pits and press **Test saved shortcut**. Expect the delay,
+   then a pit reset. Repeat at least 10 times, driving away between attempts.
+   Each test must work; alternating success is a failure. Check the status
+   message for focus or key-delivery errors if an attempt fails.
+4. Repeat with manual End, time expiry, and lap expiry. Expect the completion
+   screen immediately and one shortcut after the saved delay. Duplicate End
+   requests must not send another shortcut. Registering a new driver during
+   the delay must cancel the previous driver's pending shortcut.
+
+Automated tests use real Qt and local HTTP servers but mock game keyboard
+delivery. They cannot confirm that the rig's Assetto Corsa binding actually
+returns the car to the pits; steps 3–4 are required before event use.
+
+## iRacing keyboard stop and reset
+
+Follow [the iRacing setup and rig test](support/IRACING_RETURN_SETUP.md).
+The settings and setup instructions are in **Session End > iRacing**; no
+virtual-controller application is required. Bind different single keys to
+Second Brake (F8) and Enter/Exit/Tow Car (F9). Verify the
+physical pedals still work. End a driving session: braking
+should start immediately, the car must stop before Reset, and all keys
+must release afterward. Repeat with keyboard driving and the rig's pedals.
+Test both the manual test button and actual
+session expiry. Check that switching games or registering the next driver
+cancels any pending action. The two games have independent controls and delays.
+
+Automated tests simulate keyboard delivery and telemetry. They validate
+cancellation, key cleanup, settings migration, and game-specific routing;
+the physical rig check verifies the brake/reset bindings and stopping behavior
+for the selected car. Modifier reset shortcuts such as Shift+R must be rejected.
+
 ## Notes / known one-time adjustments
 
 - **Monitor index**: Windows numbering varies; the projector may need the

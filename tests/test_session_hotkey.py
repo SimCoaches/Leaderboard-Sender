@@ -46,9 +46,33 @@ class ShortcutTests(unittest.TestCase):
         ok, _ = send_game_shortcut('Assetto Corsa', 'Ctrl+R', keyboard, sleep)
         self.assertTrue(ok)
         keyboard.find_game.assert_called_once_with('Assetto Corsa')
-        self.assertEqual([[(0x11, False), (0x52, False)], [(0x52, True), (0x11, True)]],
+        self.assertEqual([[(0x11, False)], [(0x52, False)], [(0x52, True)], [(0x11, True)]],
                          [call.args[0] for call in keyboard.send.call_args_list])
-        sleep.assert_called_once_with(0.10)
+        self.assertEqual([0.10, 0.08, 0.15, 0.08], [call.args[0] for call in sleep.call_args_list])
+
+    def test_repeated_chords_expose_modifier_and_key_release_to_polling_games(self):
+        keyboard = self.backend()
+        down, frames = set(), []
+        def send(events):
+            for key, released in events:
+                if released:
+                    down.discard(key)
+                else:
+                    down.add(key)
+            return len(events)
+        keyboard.send.side_effect = send
+        for _ in range(20):
+            frames.clear()
+            self.assertTrue(send_game_shortcut('Assetto Corsa', 'Ctrl+R', keyboard,
+                                              lambda duration: frames.append(frozenset(down)))[0])
+            self.assertEqual([set(), {0x11}, {0x11, 0x52}, {0x11}], frames)
+            self.assertEqual(set(), down)  # Every attempt leaves a clean keyboard.
+
+    def test_single_key_is_held_and_released_once(self):
+        keyboard = self.backend()
+        self.assertTrue(send_game_shortcut('Assetto Corsa', 'F7', keyboard, Mock())[0])
+        self.assertEqual([[(0x76, False)], [(0x76, True)]],
+                         [call.args[0] for call in keyboard.send.call_args_list])
 
     def test_game_detection_uses_executable_not_browser_title(self):
         keyboard = WindowsKeyboard()
@@ -76,9 +100,10 @@ class ShortcutTests(unittest.TestCase):
 
     def test_focus_game_before_sending(self):
         keyboard = self.backend()
-        keyboard.foreground.side_effect = [999, 123, 123]
+        keyboard.foreground.side_effect = [999, 999, 123, 123, 123, 123]
         self.assertTrue(send_game_shortcut('Assetto Corsa', 'Ctrl+R', keyboard, Mock())[0])
-        keyboard.focus.assert_called_once_with(123)
+        self.assertEqual(2, keyboard.focus.call_count)
+        keyboard.focus.assert_called_with(123)
 
     def test_no_input_without_game_focus_or_with_held_keys(self):
         for reason in ('missing', 'focus', 'focus_lost', 'held'):
@@ -98,7 +123,7 @@ class ShortcutTests(unittest.TestCase):
     def test_partial_press_releases_only_inserted_keys_without_retrying_action(self):
         keyboard = self.backend()
         keyboard.send.side_effect = [1, 1]
-        self.assertFalse(send_game_shortcut('Assetto Corsa', 'Ctrl+R', keyboard, Mock())[0])
+        self.assertFalse(send_game_shortcut('Assetto Corsa', 'Ctrl+Shift+R', keyboard, Mock())[0])
         self.assertEqual([(0x11, True)], keyboard.send.call_args_list[-1].args[0])
         self.assertEqual(2, keyboard.send.call_count)
 
@@ -113,16 +138,36 @@ class ShortcutTests(unittest.TestCase):
     def test_release_even_if_hold_fails(self):
         keyboard = self.backend()
         self.assertFalse(send_game_shortcut('Assetto Corsa', 'Ctrl+R', keyboard,
-                                           Mock(side_effect=RuntimeError('hold failed')))[0])
+                                           Mock(side_effect=[None, None, RuntimeError('hold failed')]))[0])
         self.assertEqual([(0x52, True), (0x11, True)], keyboard.send.call_args_list[-1].args[0])
+
+    def test_action_blocked_releases_modifiers_without_action_retry(self):
+        keyboard = self.backend()
+        keyboard.send.side_effect = [1, 0, 1]
+        self.assertFalse(send_game_shortcut('Assetto Corsa', 'Ctrl+R', keyboard, Mock())[0])
+        self.assertEqual([[(0x11, False)], [(0x52, False)], [(0x11, True)]],
+                         [call.args[0] for call in keyboard.send.call_args_list])
+
+    def test_focus_lost_after_modifier_releases_it_without_sending_action(self):
+        keyboard = self.backend()
+        keyboard.foreground.side_effect = [123, 123, 123, 999]
+        self.assertFalse(send_game_shortcut('Assetto Corsa', 'Ctrl+R', keyboard, Mock())[0])
+        self.assertEqual([[(0x11, False)], [(0x11, True)]],
+                         [call.args[0] for call in keyboard.send.call_args_list])
+
+    def test_successful_release_retry_never_repeats_action(self):
+        keyboard = self.backend()
+        keyboard.send.side_effect = [1, 1, 0, 1, 1]
+        self.assertTrue(send_game_shortcut('Assetto Corsa', 'Ctrl+R', keyboard, Mock())[0])
+        self.assertEqual(keyboard.send.call_args_list[2], keyboard.send.call_args_list[3])
 
     def test_retry_releases_only_and_report_unreleased_keys(self):
         keyboard = self.backend()
-        keyboard.send.side_effect = [2, 0, 0]
+        keyboard.send.side_effect = [1, 1, 1, 0, 0]
         ok, message = send_game_shortcut('Assetto Corsa', 'Ctrl+R', keyboard, Mock())
         self.assertFalse(ok)
         self.assertIn('Release the shortcut keys manually', message)
-        self.assertEqual(keyboard.send.call_args_list[1], keyboard.send.call_args_list[2])
+        self.assertEqual(keyboard.send.call_args_list[3], keyboard.send.call_args_list[4])
 
 
 if __name__ == '__main__':

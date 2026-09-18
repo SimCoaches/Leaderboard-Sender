@@ -54,6 +54,27 @@ class OneIPadControlTests(unittest.TestCase):
             def state(number):
                 return session.get(nodes[number]['url'] + '/fixture/state', timeout=3).json()
 
+            def stop(number):
+                process = processes[number]
+                if process.poll() is None:
+                    # Windows venv Python can use a launcher process. Killing
+                    # only that launcher leaves its child holding the log file.
+                    # Ask the real Qt process to exit and close its web server.
+                    if number in nodes:
+                        try:
+                            session.post(nodes[number]['url'] + '/fixture/shutdown', timeout=2)
+                        except requests.RequestException:
+                            pass
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        if os.name == 'nt':
+                            subprocess.run(['taskkill', '/PID', str(process.pid), '/T', '/F'],
+                                           capture_output=True, timeout=5)
+                        else:
+                            process.terminate()
+                        process.wait(timeout=5)
+
             def action(number, path, payload):
                 # Every action enters through PC 1, exactly as one iPad does.
                 if number == 1:
@@ -64,6 +85,15 @@ class OneIPadControlTests(unittest.TestCase):
                                                       path=path, payload=payload))
                 self.assertEqual(200, response.status_code, response.text)
                 self.assertTrue(response.json()['success'], response.text)
+                if path in ('/set_driver', '/api/session/start_remote'):
+                    result = response.json()
+                    self.assertTrue(result['applied'], response.text)
+                    self.assertTrue(result['session_id'], response.text)
+                    self.assertGreater(result['applied_at'], 0)
+                    self.assertEqual(payload['driver_name'], result['driver_name'])
+                    # Success is returned after the target Qt window applies
+                    # the driver, including when PC 1 proxies to a remote PC.
+                    self.assertEqual(result['driver_name'], state(number)['driver'])
 
             def cards():
                 response = session.get(nodes[1]['url'] + '/api/discover_simulators', timeout=3)
@@ -112,12 +142,11 @@ class OneIPadControlTests(unittest.TestCase):
                     action(number, '/api/session/force_end', {})
                     wait_state(number, lambda row: not row['active'], 'Remote session ended')
 
-                # One lost PC must stay visible without disabling control of another.
+                # A lost PC disappears; the other connected PCs remain usable.
                 peer_port = nodes[2]['port']
-                processes[2].terminate()
-                processes[2].wait(timeout=5)
-                lost = wait_for(cards, lambda rows: set(rows) == {1, 2, 3} and rows[2].get('reachable') is False,
-                                'Disconnected PC retained')
+                stop(2)
+                lost = wait_for(cards, lambda rows: set(rows) == {1, 3},
+                                'Disconnected PC hidden')
                 self.assertTrue(lost[3]['reachable'])
                 action(3, '/set_driver', {'driver_name': 'Still controllable'})
                 wait_state(3, lambda row: row['driver'] == 'Still controllable', 'Healthy PC remained controllable')
@@ -128,10 +157,8 @@ class OneIPadControlTests(unittest.TestCase):
                 self.assertEqual('Still controllable', state(3)['driver'])
                 self.assertFalse(state(1)['active'])
             finally:
-                for process in processes.values():
-                    if process.poll() is None:
-                        process.terminate()
-                    process.wait(timeout=5)
+                for number in processes:
+                    stop(number)
                 for log in logs:
                     log.close()
                 session.close()

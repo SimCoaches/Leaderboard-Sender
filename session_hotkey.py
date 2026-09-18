@@ -140,37 +140,64 @@ class WindowsKeyboard:
 
 
 def send_game_shortcut(game, shortcut, backend=None, sleep=time.sleep):
-    """Return (sent, message). A failed attempt never retries the action blindly."""
+    """Return (sent, message). Retry focus/releases, never the game action.
+
+    Polling games need to observe the modifier before the action key and its
+    release before the modifier is released. Sending both edges in the same
+    batch makes those intermediate states invisible to some input handlers.
+    """
     try:
         keys = parse_shortcut(shortcut)
         keyboard = backend if backend is not None else WindowsKeyboard()
         hwnd = keyboard.find_game(game)
         if not hwnd:
             return False, f'{game} game window not found. Start the game and check the selected game in Sender.'
-        if keyboard.foreground() != hwnd:
+        # Restoring a fullscreen game can take more than one frame. Only retry
+        # acquiring focus: repeating an action key could toggle the action off.
+        for _ in range(4):
+            if keyboard.foreground() == hwnd:
+                break
             keyboard.focus(hwnd)
             sleep(0.15)
         if keyboard.foreground() != hwnd:
             return False, 'Windows did not let Sender focus the game; no shortcut was sent.'
+        sleep(0.10)  # Let the game resume input polling after gaining focus.
         if keyboard.held(set(keys) | {0x10, 0x11, 0x12, 0x5B, 0x5C}):
             return False, 'A shortcut key or modifier is already held; release the keyboard keys and test again.'
         pressed = []
+        def press(batch):
+            count = keyboard.send([(key, False) for key in batch])
+            pressed.extend(batch[:count])
+            if count != len(batch):
+                raise RuntimeError('Windows blocked keyboard input. Check that Sender and the game have the same administrator permissions.')
+
+        def release(batch):
+            events = [(key, True) for key in batch]
+            if keyboard.send(events) != len(events):
+                # A duplicate key-up is harmless. Never repeat a key-down.
+                if keyboard.send(events) != len(events):
+                    raise RuntimeError('Windows blocked key release. Release the shortcut keys manually.')
+            for key in batch:
+                pressed.remove(key)
+
         try:
             # Recheck just before input. Never fall back to typing in Sender/browser.
             if keyboard.foreground() != hwnd:
                 return False, 'The game lost focus; no shortcut was sent.'
-            count = keyboard.send([(key, False) for key in keys])
-            pressed = list(keys[:count])
-            if count != len(keys):
-                return False, 'Windows blocked keyboard input. Check that Sender and the game have the same administrator permissions.'
-            sleep(0.10)  # Hold across game frames so polling games see the chord.
+            modifiers, action_key = keys[:-1], keys[-1]
+            if modifiers:
+                press(modifiers)
+                sleep(0.08)
+                if keyboard.foreground() != hwnd:
+                    return False, 'The game lost focus; the action key was not sent.'
+            press((action_key,))
+            sleep(0.15)  # Hold across game frames so polling games see the chord.
+            release((action_key,))
+            if modifiers:
+                sleep(0.08)  # Let the game see key-up while Ctrl/Alt/Shift remain held.
         finally:
             if pressed:
-                releases = [(key, True) for key in reversed(pressed)]
-                if keyboard.send(releases) != len(releases):
-                    # Only retry releases, never the game action.
-                    if keyboard.send(releases) != len(releases):
-                        raise RuntimeError('Windows blocked key release. Release the shortcut keys manually.')
+                release(tuple(reversed(pressed)))
         return True, f'Sent {shortcut} to {game}. Confirm the assigned action happened in the game.'
     except Exception as exc:
         return False, f'Shortcut could not be sent: {exc}'

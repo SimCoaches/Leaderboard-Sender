@@ -245,7 +245,7 @@ class DiscoveryTests(unittest.TestCase):
             self.assertIsNone(peers[0]['current_driver'])
             self.assertEqual(0, peers[0]['missed_status_checks'])
 
-    def test_repeated_missing_replies_keep_card_disable_actions_and_recover(self):
+    def test_repeated_missing_replies_hide_tablet_card_and_recover(self):
         discovery = sender.SimulatorDiscovery
         peer = dict(ip='192.168.0.22', port=5001, device_id='peer', simulator_id=3,
                     simulator_name='Sim 3', reachable=True, current_driver='Josh')
@@ -266,8 +266,7 @@ class DiscoveryTests(unittest.TestCase):
                 self.assertEqual(state, peers[0]['connection_state'])
                 self.assertEqual(missed, peers[0]['missed_status_checks'])
                 cards = self.render_cards(peers)
-                self.assertEqual(1, cards.count('class="sim-card '))
-                self.assertIn('disabled', cards)
+                self.assertEqual(0, cards.count('class="sim-card '))
                 self.assertNotIn('>REGISTER<', cards)
                 self.assertNotIn('>AVAILABLE<', cards)
             probe.return_value = dict(peer, current_driver=None)
@@ -343,7 +342,7 @@ class DiscoveryTests(unittest.TestCase):
             self.assertFalse(sender.SimulatorDiscovery.start_full_scan())
             thread.assert_called_once()
 
-    def test_unprobed_saved_addresses_have_no_reported_id(self):
+    def test_unprobed_saved_addresses_do_not_create_tablet_cards(self):
         html = sender.ADMIN_HTML_CONTENT
         code = html[html.index('function allSimulatorsForDisplay()'):html.index('function renderHostBanner()')]
         script = """
@@ -354,8 +353,49 @@ process.stdout.write(JSON.stringify(allSimulatorsForDisplay()));
 """.replace('CODE', code)
         result = subprocess.run(['node', '-'], input=script, encoding='utf-8', capture_output=True, check=True)
         peers = json.loads(result.stdout)
-        self.assertEqual(2, len(peers))
-        self.assertTrue(all(peer['simulator_id'] is None and peer['reachable'] is False for peer in peers))
+        self.assertEqual([], peers)
+
+    def test_connected_snapshot_hides_offline_unconfirmed_and_stale_peers(self):
+        discovery = sender.SimulatorDiscovery
+        peers = {
+            '192.168.0.21': dict(ip='192.168.0.21', reachable=True, last_status_success=499),
+            '192.168.0.22': dict(ip='192.168.0.22', reachable=False, last_status_success=499),
+            '192.168.0.23': dict(ip='192.168.0.23', name='Old saved PC'),
+            '192.168.0.24': dict(ip='192.168.0.24', reachable=True, last_status_success=480),
+        }
+        with mock.patch.object(sender, 'main_window', None), \
+                mock.patch.object(sender.time, 'time', return_value=500), \
+                mock.patch.object(discovery, '_cache', peers), \
+                mock.patch.object(discovery, '_last_refresh', 500), \
+                mock.patch.object(discovery, 'ensure_scan'):
+            self.assertEqual(['192.168.0.21'], [peer['ip'] for peer in discovery.cached()])
+            # Keep all candidates internally, so returning PCs can be found again.
+            self.assertEqual(set(peers), {peer['ip'] for peer in discovery._snapshot()})
+
+    def test_disconnected_peer_is_not_in_tablet_picker(self):
+        html = sender.ADMIN_HTML_CONTENT
+        display_code = html[html.index('function allSimulatorsForDisplay()'):html.index('function renderHostBanner()')]
+        picker_code = html[html.index('function populateSimSelect('):html.index('// SIMULATOR CARDS')]
+        script = """
+const select = {innerHTML: '', options: [], value: '', appendChild(o) {this.options.push(o);}};
+const document = {getElementById: () => select, createElement: () => ({})};
+const discoveredSimulators = [
+    {ip: '192.168.0.20', simulator_name: 'Sim 1', is_current: true},
+    {ip: '192.168.0.21', simulator_name: 'Sim 2', reachable: true},
+    {ip: '192.168.0.22', simulator_name: 'Sim 3', reachable: false}
+];
+const getManualSimulators = () => [{ip: '192.168.0.23', name: 'Old venue PC'}];
+const hostSim = discoveredSimulators[0], lastTargetIp = '192.168.0.22';
+const simName = sim => sim.simulator_name;
+DISPLAY_CODE
+PICKER_CODE
+populateSimSelect('registerTargetSim', null);
+process.stdout.write(JSON.stringify({options: select.options, value: select.value}));
+""".replace('DISPLAY_CODE', display_code).replace('PICKER_CODE', picker_code)
+        result = subprocess.run(['node', '-'], input=script, encoding='utf-8', capture_output=True, check=True)
+        picker = json.loads(result.stdout)
+        self.assertEqual(['192.168.0.20', '192.168.0.21'], [option['value'] for option in picker['options']])
+        self.assertEqual('192.168.0.20', picker['value'])
 
     def test_desktop_does_not_overlap_discovery_jobs(self):
         view = DiscoveryView()
@@ -379,7 +419,8 @@ process.stdout.write(JSON.stringify(allSimulatorsForDisplay()));
 
     def render_cards(self, peers):
         html = sender.ADMIN_HTML_CONTENT
-        code = html[html.index('function renderSimulatorCards()'):html.index('function onSimCardClick(')]
+        code = html[html.index('function allSimulatorsForDisplay()'):html.index('function renderHostBanner()')]
+        code += html[html.index('function renderSimulatorCards()'):html.index('function onSimCardClick(')]
         script = """
 const grid = {innerHTML: ''};
 const document = {getElementById: () => grid};
@@ -387,7 +428,7 @@ const queueData = {queue: []};
 const isCurrentSim = () => false;
 const simName = s => s.simulator_name || 'Saved simulator';
 const escapeHtml = s => String(s);
-const allSimulatorsForDisplay = () => PEERS;
+const discoveredSimulators = PEERS;
 CODE
 renderSimulatorCards();
 process.stdout.write(grid.innerHTML);
@@ -403,7 +444,7 @@ process.stdout.write(grid.innerHTML);
         ]
         cards = self.render_cards(peers)
         self.assertNotIn('Duplicate ID', cards)
-        self.assertEqual(3, cards.count('class="sim-card '))
+        self.assertEqual(1, cards.count('class="sim-card '))
 
     def test_real_duplicate_ids_are_still_reported(self):
         peers = [dict(ip=ip, simulator_id=99, reachable=True)
@@ -494,7 +535,7 @@ process.stdout.write(grid.innerHTML);
                 server.shutdown()
                 server.server_close()
 
-    def test_real_http_peer_loss_and_recovery_preserve_three_ipad_cards(self):
+    def test_real_http_peer_loss_and_recovery_hide_and_restore_ipad_card(self):
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, *args):
                 pass
@@ -532,11 +573,11 @@ process.stdout.write(grid.innerHTML);
                     discovery.discover()
                     response = sender.app.test_client().get('/api/discover_simulators')
                     cards = response.json['simulators']
-                    self.assertEqual([1, 2, 3], [card['simulator_id'] for card in cards])
-                    self.assertEqual(not unavailable, cards[1]['reachable'])
-                    self.assertTrue(cards[2]['reachable'])
+                    self.assertEqual([1, 3] if unavailable else [1, 2, 3],
+                                     [card['simulator_id'] for card in cards])
+                    self.assertTrue(all(card['reachable'] for card in cards))
                     rendered = self.render_cards(cards)
-                    self.assertEqual(3, rendered.count('class="sim-card '))
+                    self.assertEqual(2 if unavailable else 3, rendered.count('class="sim-card '))
                     self.assertEqual(2 if unavailable else 3, rendered.count('>REGISTER<'))
         finally:
             for server in servers:
@@ -571,6 +612,133 @@ CODE
         self.assertEqual(1, len(calls))
         self.assertEqual('/api/sim_proxy', calls[0]['url'])
         self.assertEqual('192.168.0.22', calls[0]['body']['ip'])
+
+    def run_registration_script(self, scenario):
+        html = sender.ADMIN_HTML_CONTENT
+        code = html[html.index('async function postToSim('):html.index('function showToast(')]
+        code += html[html.index('function rememberRegistration('):html.index('function allSimulatorsForDisplay()')]
+        code += html[html.index('async function discoverSimulators()'):html.index('async function refreshSimulators()')]
+        script = r'''
+const assert = require('node:assert/strict');
+let now = 1000;
+Date.now = () => now;
+const confirmedRegistrations = new Map();
+const peers = [
+    {ip: '192.168.0.20', is_current: true, reachable: true, current_driver: null, state_timestamp: 1000},
+    {ip: '192.168.0.21', reachable: true, current_driver: 'Previous driver', state_timestamp: 10},
+    {ip: '192.168.0.22', reachable: true, current_driver: null, state_timestamp: 10000}
+];
+let discoveredSimulators = peers.map(sim => ({...sim}));
+let currentSimulatorIp = peers[0].ip, scanInProgress = false, udpDiscoveryOk = true;
+let idConflicts = [], hostSim = peers[0];
+let renderCount = 0;
+const isCurrentSim = sim => sim.is_current;
+const renderSimulatorCards = () => {renderCount++;};
+const renderHostBanner = () => {};
+let fetchWithTimeout;
+const driverOn = (list, ip) => list.find(sim => sim.ip === ip)?.current_driver;
+CODE
+(async () => {
+SCENARIO
+})().catch(error => {console.error(error); process.exitCode = 1;});
+'''.replace('CODE', code).replace('SCENARIO', scenario)
+        result = subprocess.run(['node', '-'], input=script, encoding='utf-8', capture_output=True, timeout=10)
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+
+    def test_registration_ack_survives_an_older_inflight_discovery_response(self):
+        self.run_registration_script(r'''
+let releaseSnapshot;
+const pendingSnapshot = new Promise(resolve => releaseSnapshot = resolve);
+const calls = [];
+fetchWithTimeout = async (url, options) => {
+    calls.push(url);
+    if (url === '/api/discover_simulators') return pendingSnapshot;
+    assert.equal(url, '/api/sim_proxy');
+    assert.equal(JSON.parse(options.body).ip, peers[1].ip);
+    return {json: async () => ({success: true, applied: true, driver_name: 'New driver', applied_at: 20})};
+};
+const refresh = discoverSimulators();
+const result = await postToSim(peers[1], '/set_driver', {driver_name: 'New driver'});
+assert.equal(result.applied, true);
+assert.equal(driverOn(discoveredSimulators, peers[1].ip), 'New driver');
+assert.equal(renderCount, 1, 'Acknowledgement must update the card immediately');
+releaseSnapshot({json: async () => ({simulators: peers, current_ip: peers[0].ip})});
+await refresh;
+assert.equal(driverOn(discoveredSimulators, peers[1].ip), 'New driver', 'Stale response rolled back the name');
+assert.equal(driverOn(discoveredSimulators, peers[2].ip), null);
+assert.deepEqual(calls, ['/api/discover_simulators', '/api/sim_proxy']);
+''')
+
+    def test_newer_target_snapshot_supersedes_registration_confirmation(self):
+        self.run_registration_script(r'''
+for (const state_timestamp of [20, 21]) {
+    rememberRegistration(peers[1], {driver_name: 'New driver', applied_at: 20});
+    const result = mergeConfirmedRegistrations([
+        {...peers[1], state_timestamp, current_driver: null}, peers[2]
+    ]);
+    assert.equal(driverOn(result, peers[1].ip), null, 'A confirmed later session end must win');
+    assert.equal(confirmedRegistrations.has(peers[1].ip), false);
+}
+''')
+
+    def test_registration_confirmation_does_not_restore_an_absent_offline_peer(self):
+        self.run_registration_script(r'''
+rememberRegistration(peers[1], {driver_name: 'New driver', applied_at: 20});
+const result = mergeConfirmedRegistrations([peers[0], peers[2]]);
+assert.deepEqual(result.map(sim => sim.ip), [peers[0].ip, peers[2].ip]);
+assert.deepEqual(mergeConfirmedRegistrations([]), []);
+''')
+
+    def test_registration_confirmation_expires_without_a_fresh_snapshot(self):
+        self.run_registration_script(r'''
+rememberRegistration(peers[1], {driver_name: 'New driver', applied_at: 20});
+now += 9999;
+assert.equal(driverOn(mergeConfirmedRegistrations(peers), peers[1].ip), 'New driver');
+now += 1;
+assert.equal(driverOn(mergeConfirmedRegistrations(peers), peers[1].ip), 'Previous driver');
+assert.equal(confirmedRegistrations.has(peers[1].ip), false);
+''')
+
+    def test_registration_confirmations_are_independent_between_simulators(self):
+        self.run_registration_script(r'''
+rememberRegistration(peers[1], {driver_name: 'Driver two', applied_at: 20});
+rememberRegistration(peers[2], {driver_name: 'Driver three', applied_at: 20000});
+let result = mergeConfirmedRegistrations(peers);
+assert.equal(driverOn(result, peers[1].ip), 'Driver two');
+assert.equal(driverOn(result, peers[2].ip), 'Driver three');
+result = mergeConfirmedRegistrations([
+    peers[0], {...peers[1], state_timestamp: 21, current_driver: 'Changed on another tablet'}, peers[2]
+]);
+assert.equal(driverOn(result, peers[1].ip), 'Changed on another tablet');
+assert.equal(driverOn(result, peers[2].ip), 'Driver three');
+assert.equal(confirmedRegistrations.has(peers[1].ip), false);
+assert.equal(confirmedRegistrations.has(peers[2].ip), true);
+''')
+
+    def test_local_registration_applied_ack_and_end_update_only_the_target(self):
+        self.run_registration_script(r'''
+const calls = [];
+let reply = {success: true, applied: true, driver_name: 'Host driver', applied_at: 1001};
+fetchWithTimeout = async (url, options) => {
+    calls.push({url, body: JSON.parse(options.body)});
+    return {json: async () => reply};
+};
+await postToSim(peers[0], '/set_driver', {driver_name: 'Host driver'});
+assert.equal(driverOn(discoveredSimulators, peers[0].ip), 'Host driver');
+assert.equal(renderCount, 1);
+assert.deepEqual(calls, [{url: '/set_driver', body: {driver_name: 'Host driver'}}]);
+rememberRegistration(peers[1], {driver_name: 'Remote driver', applied_at: 20});
+reply = {success: false, applied: true, driver_name: 'Rejected driver', applied_at: 1002};
+await postToSim(peers[0], '/set_driver', {driver_name: 'Rejected driver'});
+assert.equal(driverOn(discoveredSimulators, peers[0].ip), 'Host driver');
+reply = {success: false};
+await postToSim(peers[0], '/api/session/force_end', {});
+assert.equal(confirmedRegistrations.has(peers[0].ip), true);
+reply = {success: true};
+await postToSim(peers[0], '/api/session/force_end', {});
+assert.equal(confirmedRegistrations.has(peers[0].ip), false);
+assert.equal(confirmedRegistrations.has(peers[1].ip), true);
+''')
 
     def test_ipad_overlapping_refreshes_share_one_request(self):
         html = sender.ADMIN_HTML_CONTENT

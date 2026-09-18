@@ -1,5 +1,5 @@
 #define MyAppName "Lap Time Sender"
-#define MyAppVersion "1.4.9"
+#define MyAppVersion "1.5.0"
 #define MyAppPublisher "Sim Coaches LLC"
 #define MyAppURL "https://simcoaches.com/"
 #define MyAppExeName "Lap Time Sender.exe"
@@ -40,6 +40,7 @@ Name: "broadcast\autostart"; Description: "Start the broadcast screen automatica
 
 [Files]
 Source: "support\configure_sender_network.ps1"; DestDir: "{app}\support"; Flags: ignoreversion
+Source: "support\IRACING_RETURN_SETUP.md"; DestDir: "{app}\support"; Flags: ignoreversion
 ; Main executable and all files in the dist folder
 Source: "dist\Lap Time Sender\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 ; CSP companion app for Assetto Corsa (user copies it into AC's apps\lua folder)
@@ -50,6 +51,7 @@ Source: "broadcast\*"; DestDir: "{app}\broadcast"; Flags: ignoreversion recurses
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
 Name: "{group}\Rig Health Check"; Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\broadcast\check_rig.ps1"""; IconFilename: "{app}\{#MyAppExeName}"
+Name: "{group}\iRacing Stop and Reset Setup"; Filename: "notepad.exe"; Parameters: """{app}\support\IRACING_RETURN_SETUP.md"""
 Name: "{group}\{cm:UninstallProgram,{#MyAppName}}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
