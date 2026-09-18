@@ -4,6 +4,7 @@ import requests
 import time
 import threading
 import socket
+import ipaddress
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import ctypes
 import mmap
@@ -22,8 +23,12 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                             QCheckBox, QTableWidget, QTableWidgetItem, QDialog,
                             QAbstractItemView, QHeaderView, QScrollArea,
                             QTabWidget, QSizePolicy)
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QObject, QUrl
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, pyqtSlot, QTimer, QObject, QUrl
 from PyQt6.QtGui import QImage, QPixmap, QIcon, QFont, QColor
+from PyQt6.QtNetwork import QNetworkInterface, QAbstractSocket
+from simulator_identity import device_identity, automatic_simulator_id
+from network_status import active_interfaces, current_lan_ip, network_snapshot, network_signature, network_changed
+from session_hotkey import parse_shortcut, send_game_shortcut
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PyQt6.QtMultimediaWidgets import QVideoWidget
 import qrcode
@@ -31,7 +36,28 @@ from io import BytesIO
 import os
 import csv
 
-APP_VERSION = "1.4.5"
+APP_VERSION = "1.4.9"
+
+
+def local_network_interfaces():
+    """Active private/shared-address LANs, refreshed on every call."""
+    # ipaddress.is_private excludes the entire shared address range. A LAN
+    # assigned one of these addresses must still announce and scan locally.
+    shared_addresses = ipaddress.ip_network('100.64.0.0/10')
+    return [i for i in active_interfaces()
+            if i.get('broadcast') and (ipaddress.ip_address(i['ip']).is_private
+                                      or ipaddress.ip_address(i['ip']) in shared_addresses)]
+
+
+def simulator_identity_fields():
+    window = main_window
+    return {
+        'device_id': getattr(window, 'device_id', None),
+        'hostname': socket.gethostname(),
+        'app_version': APP_VERSION,
+        'id_automatic': getattr(window, 'automatic_id_enabled', False),
+        'id_assigned': getattr(window, 'simulator_id_assigned', False),
+    }
 
 def get_runtime_base_path():
     """Return the bundled app base path when frozen, otherwise the source folder."""
@@ -224,41 +250,8 @@ def is_valid_racing_context(graphics_data, physics_data=None, context=""):
         return True  # Default to accepting if we can't validate
 
 def get_local_ip():
-    """Get local IP address with improved fallback handling for offline networks"""
-    try:
-        # Method 1: Create UDP socket to determine routing
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.settimeout(0.1)
-        s.connect(('8.8.8.8', 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
-    except Exception:
-        pass
-    
-    try:
-        # Method 2: Try common gateway
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.settimeout(0.1)
-        s.connect(('192.168.1.1', 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
-    except Exception:
-        pass
-    
-    # Method 3: Enumerate network interfaces (offline-safe)
-    try:
-        hostname = socket.gethostname()
-        addresses = socket.getaddrinfo(hostname, None, socket.AF_INET)
-        for addr in addresses:
-            ip = addr[4][0]
-            if ip and not ip.startswith('127.'):
-                return ip
-    except Exception:
-        pass
-    
-    return '127.0.0.1'  # Final fallback
+    """Current physical LAN address; disconnected adapters and VPNs do not win."""
+    return current_lan_ip()
 
 PREFERRED_WEB_INTERFACE_PORT = 5001
 WEB_INTERFACE_FALLBACK_PORTS = [5101, 5102, 5103, 5104, 5105]
@@ -313,6 +306,8 @@ def configure_firewall(web_port=None):
     rules = [
         (web_rule_name, "TCP", str(web_port)),
         ("Lap Time Sender - Discovery", "UDP", "5003"),
+        ("Lap Time Sender - Discovery Fallback 1", "UDP", "15003"),
+        ("Lap Time Sender - Discovery Fallback 2", "UDP", "25003"),
         ("Lap Time Sender - F1 Telemetry", "UDP", "20777"),
     ]
     
@@ -328,7 +323,8 @@ def configure_firewall(web_port=None):
                 result = subprocess.run([
                     'netsh', 'advfirewall', 'firewall', 'add', 'rule',
                     f'name={rule_name}', 'dir=in', 'action=allow',
-                    f'protocol={protocol}', f'localport={port}'
+                    f'protocol={protocol}', f'localport={port}',
+                    f'program={sys.executable}', 'remoteip=LocalSubnet'
                 ], capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW)
                 if result.returncode == 0:
                     print(f"[OK] Firewall rule added for port {port} ({protocol})")
@@ -364,29 +360,36 @@ def get_config_path():
         base_path = Path(__file__).parent
     return base_path / 'simulators.json'
 
+_known_simulators_lock = threading.RLock()
+
+
 def load_known_simulators():
     """Load known simulators from config file."""
-    config_path = get_config_path()
-    try:
-        if config_path.exists():
-            with open(config_path, 'r') as f:
-                data = json.load(f)
-                return data.get('known_simulators', [])
-    except Exception as e:
-        print(f"WARNING: Could not load simulators config: {e}")
-    return []
+    with _known_simulators_lock:
+        config_path = get_config_path()
+        try:
+            if config_path.exists():
+                with open(config_path, 'r') as f:
+                    data = json.load(f)
+                    return data.get('known_simulators', [])
+        except Exception as e:
+            print(f"WARNING: Could not load simulators config: {e}")
+        return []
 
 def save_known_simulators(simulators):
     """Save known simulators to config file."""
-    config_path = get_config_path()
-    try:
-        with open(config_path, 'w') as f:
-            json.dump({'known_simulators': simulators}, f, indent=2)
-        print(f"[OK] Saved {len(simulators)} known simulators to config")
-        return True
-    except Exception as e:
-        print(f"WARNING: Could not save simulators config: {e}")
-        return False
+    with _known_simulators_lock:
+        config_path = get_config_path()
+        try:
+            temporary = config_path.with_suffix('.json.tmp')
+            with open(temporary, 'w') as f:
+                json.dump({'known_simulators': simulators}, f, indent=2)
+            temporary.replace(config_path)
+            print(f"[OK] Saved {len(simulators)} known simulators to config")
+            return True
+        except Exception as e:
+            print(f"WARNING: Could not save simulators config: {e}")
+            return False
 
 def get_settings_path():
     """Get the path to the application settings file."""
@@ -677,27 +680,29 @@ def append_lead_to_csv(driver_name, email, phone, answers_by_prompt):
 
 def add_known_simulator(ip, name=None, port=None):
     """Add a simulator to the known list."""
-    simulators = load_known_simulators()
-    # Check if already exists
-    for sim in simulators:
-        if sim.get('ip') == ip:
-            return False  # Already exists
-    try:
-        port = int(port) if port else PREFERRED_WEB_INTERFACE_PORT
-    except (TypeError, ValueError):
-        port = PREFERRED_WEB_INTERFACE_PORT
-    simulators.append({
-        'ip': ip,
-        'name': name or f'Sim ({ip})',
-        'port': port
-    })
-    return save_known_simulators(simulators)
+    with _known_simulators_lock:
+        simulators = load_known_simulators()
+        # Check if already exists
+        for sim in simulators:
+            if sim.get('ip') == ip:
+                return False  # Already exists
+        try:
+            port = int(port) if port else PREFERRED_WEB_INTERFACE_PORT
+        except (TypeError, ValueError):
+            port = PREFERRED_WEB_INTERFACE_PORT
+        simulators.append({
+            'ip': ip,
+            'name': name or f'Sim ({ip})',
+            'port': port
+        })
+        return save_known_simulators(simulators)
 
 def remove_known_simulator(ip):
     """Remove a simulator from the known list."""
-    simulators = load_known_simulators()
-    simulators = [s for s in simulators if s.get('ip') != ip]
-    return save_known_simulators(simulators)
+    with _known_simulators_lock:
+        simulators = load_known_simulators()
+        simulators = [s for s in simulators if s.get('ip') != ip]
+        return save_known_simulators(simulators)
 
 # ============================================
 # SMS NOTIFICATION FUNCTIONS
@@ -2668,6 +2673,7 @@ ADMIN_HTML_CONTENT = r"""
 <body>
     <!-- Which sim this iPad is talking to -->
     <div class="host-banner" id="hostBanner">Connecting to this simulator...</div>
+    <div id="networkStatus" role="status" style="padding: 6px 20px; color: #aaa; font-size: 13px;">Searching for simulators...</div>
 
     <!-- Stats Bar -->
     <div class="stats-bar">
@@ -2906,9 +2912,8 @@ ADMIN_HTML_CONTENT = r"""
             return sim ? (sim.simulator_name || sim.name || `Sim (${sim.ip})`) : 'Unknown sim';
         }
 
-        // POST to a sim. Direct cross-origin call first; if Safari refuses it
-        // or it times out, relay through the host sim so it still lands on
-        // the sim that was picked.
+        // The iPad talks only to its host. Relay remote actions exactly once;
+        // a timed-out direct request could otherwise register the driver twice.
         async function postToSim(sim, path, payload, timeoutMs = 8000) {
             const port = sim.port || 5001;
             const headers = { 'Content-Type': 'application/json' };
@@ -2917,18 +2922,11 @@ ADMIN_HTML_CONTENT = r"""
                 const r = await fetchWithTimeout(path, { method: 'POST', headers, body }, timeoutMs);
                 return r.json();
             }
-            try {
-                const r = await fetchWithTimeout(`http://${sim.ip}:${port}${path}`,
-                    { method: 'POST', headers, body, mode: 'cors' }, timeoutMs);
-                return await r.json();
-            } catch (directErr) {
-                console.warn(`Direct call to ${sim.ip} failed (${directErr.message}); relaying via host sim`);
-                const r = await fetchWithTimeout('/api/sim_proxy', {
+            const r = await fetchWithTimeout('/api/sim_proxy', {
                     method: 'POST', headers,
                     body: JSON.stringify({ ip: sim.ip, port, path, payload: payload || {} })
-                }, timeoutMs + 2000);
-                return r.json();
-            }
+            }, timeoutMs + 2000);
+            return r.json();
         }
 
         function showToast(message, ms = 2500) {
@@ -2945,11 +2943,12 @@ ADMIN_HTML_CONTENT = r"""
             getManualSimulators().forEach(manual => {
                 if (!all.some(s => s.ip === manual.ip)) {
                     all.push({
-                        simulator_id: manual.simulator_id || 99,
+                        simulator_id: null,
                         simulator_name: manual.name || `Sim (${manual.ip})`,
                         ip: manual.ip,
                         port: manual.port || 5001,
                         current_driver: null,
+                        reachable: false,
                         is_manual: true
                     });
                 }
@@ -3036,57 +3035,8 @@ ADMIN_HTML_CONTENT = r"""
             }
         }
 
-        async function refreshSimulatorInfo(ip, port = 5001) {
-            const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller.abort(), 2500);
-            try {
-                const response = await fetch(`http://${ip}:${port}/api/simulator_info`, {
-                    mode: 'cors', signal: controller.signal
-                });
-                clearTimeout(timeoutId);
-                if (response.ok) {
-                    const data = await response.json();
-                    data.ip = ip;
-                    data.port = port;
-                    data.reachable = true;
-                    return data;
-                }
-            } catch (e) { clearTimeout(timeoutId); }
-            return null;
-        }
-
         async function refreshSimulators() {
-            if (discoveredSimulators.length === 0) {
-                await initializeSimulators();
-                return;
-            }
-
-            const refreshPromises = discoveredSimulators.map(async (sim) => {
-                if (isCurrentSim(sim)) {
-                    try {
-                        const response = await fetchWithTimeout('/api/simulator_info', {}, 4000);
-                        if (response.ok) {
-                            const data = await response.json();
-                            const merged = { ...sim, ...data, is_current: true, reachable: true };
-                            hostSim = merged;
-                            idConflicts = data.id_conflicts || [];
-                            return merged;
-                        }
-                    } catch (e) {}
-                    return sim;
-                } else {
-                    const freshData = await refreshSimulatorInfo(sim.ip, sim.port || 5001);
-                    if (freshData) {
-                        return { ...sim, ...freshData, reachable: true };
-                    }
-                    return { ...sim, reachable: false };
-                }
-            });
-
-            discoveredSimulators = await Promise.all(refreshPromises);
-            renderHostBanner();
-            renderSimulatorCards();
-            updateStats();
+            return initializeSimulators();
         }
 
         function renderSimulatorCards() {
@@ -3100,14 +3050,20 @@ ADMIN_HTML_CONTENT = r"""
                 return;
             }
 
-            // Two cards with the same Simulator ID can't be told apart; flag them
+            // Only live, reported IDs can establish a conflict. Offline saved
+            // addresses use placeholder IDs and must not trigger this warning.
             const idCounts = {};
-            allSimulators.forEach(s => { idCounts[s.simulator_id] = (idCounts[s.simulator_id] || 0) + 1; });
+            allSimulators.forEach(s => {
+                if (s.reachable !== false && s.simulator_id != null) {
+                    idCounts[s.simulator_id] = (idCounts[s.simulator_id] || 0) + 1;
+                }
+            });
 
             grid.innerHTML = allSimulators.map(sim => {
                 const hasDriver = !!(sim.current_driver && sim.current_driver.trim());
                 const isReachable = sim.reachable !== false;
-                const duplicateId = idCounts[sim.simulator_id] > 1;
+                const isReconnecting = !isReachable && sim.connection_state === 'reconnecting';
+                const duplicateId = isReachable && idCounts[sim.simulator_id] > 1;
 
                 // Determine card state
                 let cardClass = 'available';
@@ -3146,7 +3102,7 @@ ADMIN_HTML_CONTENT = r"""
 
                 let actions;
                 if (!isReachable) {
-                    actions = '<button class="sim-card-action" disabled style="background:#3e3e42;color:#6e6e6e;">OFFLINE</button>';
+                    actions = `<button class="sim-card-action" disabled style="background:#3e3e42;color:#6e6e6e;">${isReconnecting ? 'RECONNECTING' : 'OFFLINE'}</button>`;
                 } else if (hasDriver) {
                     actions = `<button class="sim-card-action extend" onclick="event.stopPropagation(); extendSessionOnSim('${sim.ip}')">${extendLabel}</button>`
                             + `<button class="sim-card-action end-session" onclick="event.stopPropagation(); endSessionOnSim('${sim.ip}')">END</button>`;
@@ -3161,9 +3117,10 @@ ADMIN_HTML_CONTENT = r"""
                             <span class="sim-card-name">${escapeHtml(simName(sim))}${isCurrentSim(sim) ? ' <span style="color:#6e6e6e;font-weight:400;font-size:11px;">(this iPad)</span>' : ''}</span>
                             <span class="sim-card-status ${isReachable ? '' : 'offline'}"></span>
                         </div>
+                        <div style="font-size:11px;color:#999;margin-bottom:6px;">${escapeHtml(sim.hostname || '')} ${escapeHtml(sim.ip)}</div>
                         ${duplicateId ? `<div class="sim-card-dup">⚠️ Duplicate ID — ${escapeHtml(sim.ip)}</div>` : ''}
                         <div class="sim-card-driver ${hasDriver ? '' : 'available-text'}">
-                            ${hasDriver ? escapeHtml(sim.current_driver) : 'AVAILABLE'}
+                            ${!isReachable ? (isReconnecting ? 'RECONNECTING' : 'UNREACHABLE') : hasDriver ? escapeHtml(sim.current_driver) : 'AVAILABLE'}
                         </div>
                         ${timerDisplay ? `<div class="sim-card-timer">${timerDisplay}</div>` : ''}
                         ${lapsDisplay ? `<div class="sim-card-laps">${lapsDisplay}</div>` : ''}
@@ -3876,13 +3833,15 @@ ADMIN_HTML_CONTENT = r"""
             }
 
             try {
-                await fetchWithTimeout('/api/known_simulators', {
+                const response = await fetchWithTimeout('/api/known_simulators', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ ip, name })
                 }, 4000);
+                const result = await response.json();
+                if (!result.success) throw new Error(result.error || 'Save failed');
             } catch (e) {
-                alert('Could not save the simulator');
+                alert('Could not save the simulator: ' + e.message);
                 return;
             }
 
@@ -3975,7 +3934,17 @@ ADMIN_HTML_CONTENT = r"""
         // INITIALIZATION
         // ============================================
 
-        async function initializeSimulators() {
+        let simulatorRefreshPromise = null;
+        function initializeSimulators() {
+            if (!simulatorRefreshPromise) {
+                simulatorRefreshPromise = updateSimulatorSnapshot().finally(() => {
+                    simulatorRefreshPromise = null;
+                });
+            }
+            return simulatorRefreshPromise;
+        }
+
+        async function updateSimulatorSnapshot() {
             const statusEl = document.getElementById('discoveryStatus');
             if (statusEl && discoveredSimulators.length === 0) statusEl.textContent = 'Searching for simulators...';
 
@@ -3987,13 +3956,14 @@ ADMIN_HTML_CONTENT = r"""
                 const online = simulators.filter(s => s.reachable !== false).length;
                 let text;
                 if (total <= 1) {
-                    text = 'Only this simulator found. Other sims appear within a few seconds of starting; add one by IP or scan below.';
+                    text = 'Only this simulator found. Searching automatically for other PCs; Sender must be running on each PC.';
                 } else {
                     text = `Found ${total} simulators (${online} online)`;
                 }
-                if (udpDiscoveryOk === false) text += ' Automatic discovery is off on this PC (UDP port 5003 busy), so sims come from the saved list and network scans.';
+                if (udpDiscoveryOk === false) text += ' Discovery ports are unavailable on this PC. Retrying automatically; use Add Simulator with the other PC\'s IP to connect directly.';
                 if (scanInProgress) text += ' — scanning the network...';
                 statusEl.textContent = text;
+                document.getElementById('networkStatus').textContent = text;
             }
 
             renderManualSimulatorList();
@@ -4001,7 +3971,7 @@ ADMIN_HTML_CONTENT = r"""
             updateStats();
         }
 
-        // Full subnet sweep, on request only. Runs in the background on the
+        // Start an extra background sweep immediately. Runs on the
         // host sim; this just polls until it reports done.
         async function scanNetwork() {
             const btn = document.getElementById('scanBtn');
@@ -4031,15 +4001,15 @@ ADMIN_HTML_CONTENT = r"""
             initializeSimulators();
             refreshQueue();
 
-            // Refresh simulator cards every 5 seconds (each one is a call to
-            // every other sim, so 2 s across several iPads was real load)
+            // One same-origin snapshot includes all PCs; no direct Safari-to-peer calls.
             setInterval(refreshSimulators, 5000);
 
             // Refresh queue every 5 seconds
             setInterval(refreshQueue, 5000);
 
-            // Re-discover every 15 seconds (cheap now: no subnet scan)
-            setInterval(initializeSimulators, 15000);
+            document.addEventListener('visibilitychange', () => {
+                if (!document.hidden) initializeSimulators();
+            });
         });
 
         // Close modals on overlay click
@@ -4870,7 +4840,7 @@ def index():
 
 @app.route('/admin')
 def admin():
-    return ADMIN_HTML_CONTENT
+    return ADMIN_HTML_CONTENT, 200, {'Cache-Control': 'no-store'}
 
 @app.route('/queue')
 def queue_page():
@@ -4885,6 +4855,7 @@ def health_check():
     """Fast health check endpoint - no blocking operations"""
     return jsonify({
         'status': 'ok',
+        **simulator_identity_fields(),
         'timestamp': int(time.time()),
         'simulator_id': main_window.simulator_id.currentText() if main_window else None,
         'server_ready': main_window is not None and ui_bridge is not None
@@ -5602,9 +5573,9 @@ SIM_PROXY_ALLOWED_PATHS = {
 def sim_proxy():
     """Relay a Host Stand action to another simulator.
 
-    The iPad talks to every sim from one page. It tries the other sim
-    directly first; if Safari refuses the cross-origin call, or it times
-    out, it comes through here so the action still lands on the right sim.
+    The iPad uses this same-origin endpoint for every remote action. The
+    host makes one request to the selected simulator, without a direct
+    Safari attempt or an automatic retry of a possibly completed mutation.
     """
     data = request.get_json() or {}
     ip = str(data.get('ip') or '').strip()
@@ -5679,6 +5650,7 @@ def simulator_info():
         }
         
         return jsonify({
+            **simulator_identity_fields(),
             'simulator_id': int(main_window.simulator_id.currentText()),
             'simulator_name': f"Sim {main_window.simulator_id.currentText()}",
             'game': main_window.game_selector.currentText(),
@@ -5711,6 +5683,7 @@ def discover_simulators():
     # Get current simulator info
     current_ip = get_local_ip()
     current_sim = {
+        **simulator_identity_fields(),
         'simulator_id': 1,
         'simulator_name': 'Sim 1',
         'game': 'Unknown',
@@ -5739,6 +5712,7 @@ def discover_simulators():
         }
         
         current_sim = {
+            **simulator_identity_fields(),
             'simulator_id': int(main_window.simulator_id.currentText()),
             'simulator_name': f"Sim {main_window.simulator_id.currentText()}",
             'game': main_window.game_selector.currentText(),
@@ -5754,16 +5728,11 @@ def discover_simulators():
             'id_conflicts': main_window.get_sim_id_conflicts(),
         }
 
-    # Other simulators: UDP announcements + known list (no subnet scan here)
-    discovered = SimulatorDiscovery.discover()
+    # Return a snapshot immediately; all network probes run in background workers.
+    discovered = SimulatorDiscovery.cached()
 
-    # If this PC can't listen for UDP announcements (port reserved/in use),
-    # the only way to find the others is a sweep: run one in the background,
-    # at most once per SCAN_RESULT_TTL, so the cards still fill in by themselves.
     listener = getattr(main_window, 'discovery_listener', None) if main_window else None
     udp_ok = getattr(listener, 'bind_ok', None) if listener else None
-    if udp_ok is False and not SimulatorDiscovery.scan_in_progress()             and time.time() - SimulatorDiscovery._scan_time > SimulatorDiscovery.SCAN_RESULT_TTL:
-        SimulatorDiscovery.start_full_scan()
 
     # Mark which is current and filter out self
     simulators = [current_sim]
@@ -5773,14 +5742,20 @@ def discover_simulators():
             simulators.append(sim)
 
     # Sort by simulator_id, then IP so identical IDs keep a stable order
-    simulators.sort(key=lambda x: (x.get('simulator_id', 0), x.get('ip', '')))
+    simulators.sort(key=lambda x: (x.get('simulator_id') or 100, x.get('ip', '')))
 
     return jsonify({
         'simulators': simulators,
         'current_ip': current_ip,
         'scan_in_progress': SimulatorDiscovery.scan_in_progress(),
         'udp_discovery_ok': udp_ok,
+        'udp_discovery_error': getattr(listener, 'bind_error', None),
+        'udp_discovery_port': getattr(listener, 'bound_port', None),
         'id_conflicts': current_sim.get('id_conflicts', []),
+        'app_version': APP_VERSION,
+        'refresh_in_progress': SimulatorDiscovery._refresh_in_progress,
+        'network_change_count': getattr(main_window, '_network_change_count', 0),
+        'last_network_change': getattr(main_window, '_last_network_change', None),
     })
 
 @app.route('/api/known_simulators', methods=['GET'])
@@ -6135,25 +6110,77 @@ class UIBridge(QObject):
     extend_session = pyqtSignal(int, int)  # minutes, laps to add to the running session
 
 class SimulatorDiscovery:
-    """Finds the other simulators on the LAN.
+    """Merge announcements, saved peers and periodic background LAN scans.
 
-    The fast path (`discover`) never scans the subnet: it merges the UDP
-    presence broadcasts every Sender emits every 3 s with the saved known
-    list, probing only those specific addresses. A full /24 sweep is still
-    available (`start_full_scan`) but runs in its own background thread on
-    explicit request, never inside a web request. The old in-request sweep
-    took ~30 s, pinned a web worker for all of it, and ran on every Host
-    Stand page load, which is why other sims "didn't show up".
+    Web requests return cached snapshots immediately. HTTP probes validate
+    peer status and identity even when broadcasts are missing or stale.
     """
-    PROBE_TIMEOUT = 1.0     # per port during a full sweep
-    KNOWN_TIMEOUT = 1.5     # per port for a saved simulator
-    MAX_WORKERS = 50        # parallel connections during a sweep
-    SCAN_RESULT_TTL = 120   # seconds a sweep result stays merged into discover()
+    MAX_WORKERS = 50
 
     _scan_results = {}      # ip -> simulator_info from the last sweep
     _scan_time = 0
+    _scan_attempt_time = 0  # Failed scans also back off, without extending stale results.
     _scan_in_progress = False
     _scan_lock = threading.Lock()
+    _cache_lock = threading.RLock()
+    _probe_lock = threading.Lock()
+    _cache = {}
+    _refresh_in_progress = False
+    _last_refresh = 0
+    _network_generation = 0
+
+    @staticmethod
+    def reset_network():
+        with SimulatorDiscovery._cache_lock:
+            SimulatorDiscovery._network_generation += 1
+            # Preserve known cards while validating the new network. They must
+            # not disappear or accept driver assignments using old status.
+            SimulatorDiscovery._cache = {
+                ip: dict(sim, reachable=False, connection_state='reconnecting')
+                for ip, sim in SimulatorDiscovery._cache.items()
+            }
+            SimulatorDiscovery._scan_results = {}
+            SimulatorDiscovery._scan_time = 0
+            SimulatorDiscovery._scan_attempt_time = 0
+            SimulatorDiscovery._last_refresh = 0
+
+    @staticmethod
+    def _snapshot():
+        """Deduplicate network interfaces by device, never by display ID."""
+        unique = {}
+        own_id = getattr(main_window, 'device_id', None)
+        with SimulatorDiscovery._cache_lock:
+            for ip, sim in SimulatorDiscovery._cache.items():
+                key = sim.get('device_id') or ip
+                if own_id and key == own_id:
+                    continue
+                if key not in unique or (sim.get('reachable') and not unique[key].get('reachable')):
+                    unique[key] = dict(sim)
+        return list(unique.values())
+
+    @staticmethod
+    def ensure_scan():
+        # Even a partially populated list needs a periodic sweep: receipt of
+        # one peer's broadcasts says nothing about the remaining PCs.
+        if time.time() - max(SimulatorDiscovery._scan_time, SimulatorDiscovery._scan_attempt_time) > 60:
+            SimulatorDiscovery.start_full_scan()
+
+    @staticmethod
+    def cached():
+        """Immediate web snapshot; network work never occupies an iPad request."""
+        SimulatorDiscovery.ensure_scan()
+        with SimulatorDiscovery._cache_lock:
+            if not SimulatorDiscovery._refresh_in_progress and time.time() - SimulatorDiscovery._last_refresh > 3:
+                SimulatorDiscovery._refresh_in_progress = True
+                def refresh():
+                    try:
+                        SimulatorDiscovery.discover()
+                    finally:
+                        with SimulatorDiscovery._cache_lock:
+                            SimulatorDiscovery._refresh_in_progress = False
+                            SimulatorDiscovery._last_refresh = time.time()
+                threading.Thread(target=refresh, name='sim-status-refresh', daemon=True).start()
+            return SimulatorDiscovery._snapshot()
 
     @staticmethod
     def _port_open(ip, port, timeout):
@@ -6180,7 +6207,7 @@ class SimulatorDiscovery:
             try:
                 response = requests.get(
                     f'http://{ip}:{port}/api/simulator_info',
-                    timeout=timeout
+                    timeout=(timeout, 1.5)
                 )
                 if response.ok:
                     data = response.json()
@@ -6189,8 +6216,11 @@ class SimulatorDiscovery:
                     if not isinstance(data, dict) or 'simulator_id' not in data or 'simulator_name' not in data:
                         continue
                     data['ip'] = ip
-                    data['port'] = data.get('port', port)
+                    data['port'] = port  # Use the endpoint that actually answered.
                     data['reachable'] = True
+                    data['connection_state'] = 'online'
+                    data['last_status_success'] = time.time()
+                    data['missed_status_checks'] = 0
                     return data
             except Exception:
                 pass
@@ -6223,53 +6253,78 @@ class SimulatorDiscovery:
 
     @staticmethod
     def discover():
-        """Fast, non-scanning discovery: UDP-announced sims + known list."""
-        from concurrent.futures import ThreadPoolExecutor
-
-        local_ip = get_local_ip()
-        discovered = {}
-        for sim in SimulatorDiscovery._udp_simulators(local_ip):
-            discovered[sim['ip']] = sim
-
-        # Saved simulators not currently heard on UDP: probe just those.
-        known_sims = [k for k in load_known_simulators()
-                      if k.get('ip') and k['ip'] != local_ip and k['ip'] not in discovered]
-        if known_sims:
-            def probe_known(known):
-                ports = [known.get('port') or PREFERRED_WEB_INTERFACE_PORT] + WEB_INTERFACE_FALLBACK_PORTS
-                return known, SimulatorDiscovery.probe_host(known['ip'], SimulatorDiscovery.KNOWN_TIMEOUT, ports)
-
-            try:
-                with ThreadPoolExecutor(max_workers=min(8, len(known_sims))) as executor:
-                    for known, result in executor.map(probe_known, known_sims):
-                        ip = known['ip']
-                        if result:
-                            result['is_known'] = True
-                            result['source'] = 'known'
-                            discovered[ip] = result
-                        else:
-                            discovered[ip] = {
-                                'ip': ip,
-                                'port': known.get('port', PREFERRED_WEB_INTERFACE_PORT),
-                                'simulator_name': known.get('name', f'Sim ({ip})'),
-                                'simulator_id': 99,
-                                'current_driver': None,
-                                'reachable': False,
-                                'is_known': True,
-                                'source': 'known',
-                            }
-            except Exception as e:
-                print(f"[Discovery] Known-simulator probe error: {e}")
-
-        # Anything a recent sweep found that isn't announcing itself
-        if time.time() - SimulatorDiscovery._scan_time < SimulatorDiscovery.SCAN_RESULT_TTL:
-            for ip, sim in list(SimulatorDiscovery._scan_results.items()):
-                if ip != local_ip and ip not in discovered:
-                    entry = dict(sim)
-                    entry['source'] = 'scan'
-                    discovered[ip] = entry
-
-        return list(discovered.values())
+        """Refresh peers in a background worker, including peers missing UDP."""
+        if not SimulatorDiscovery._probe_lock.acquire(blocking=False):
+            return SimulatorDiscovery._snapshot()
+        try:
+            generation = SimulatorDiscovery._network_generation
+            SimulatorDiscovery.ensure_scan()
+            local_ips = {entry['ip'] for entry in local_network_interfaces()}
+            local_ips.add(get_local_ip())
+            with SimulatorDiscovery._cache_lock:
+                candidates = {ip: dict(sim) for ip, sim in SimulatorDiscovery._cache.items()}
+                for ip, sim in SimulatorDiscovery._scan_results.items():
+                    candidates.setdefault(ip, dict(sim))  # A previous sweep must not replace newer status.
+            for sim in load_known_simulators():
+                candidates.setdefault(sim['ip'], dict(sim))
+            for sim in SimulatorDiscovery._udp_simulators(get_local_ip()):
+                candidates[sim['ip']] = {**candidates.get(sim['ip'], {}), **sim}
+            candidates = {ip: sim for ip, sim in candidates.items() if ip not in local_ips}
+            def probe(item):
+                ip, previous = item
+                ports = list(dict.fromkeys([previous.get('port') or PREFERRED_WEB_INTERFACE_PORT]
+                                            + get_simulator_probe_ports()))
+                result = SimulatorDiscovery.probe_host(ip, 1.5, ports)
+                if not result:
+                    # One missed answer on a busy PC/hotspot isn't enough.
+                    # Retry the known endpoint once; remote actions are never retried here.
+                    result = SimulatorDiscovery.probe_host(ip, 1.0, [ports[0]])
+                if result:
+                    result['source'] = 'http'
+                    result['connection_state'] = 'online'
+                    result['last_status_success'] = time.time()
+                    result['missed_status_checks'] = 0
+                    return ip, result
+                missed = int(previous.get('missed_status_checks') or 0) + 1
+                return ip, dict(previous, ip=ip, reachable=False,
+                                connection_state='reconnecting' if missed < 3 else 'offline',
+                                missed_status_checks=missed,
+                                simulator_name=previous.get('simulator_name') or previous.get('name') or f'Sim ({ip})',
+                                simulator_id=previous.get('simulator_id'))
+            results = {}
+            if candidates:
+                with ThreadPoolExecutor(max_workers=min(16, len(candidates))) as executor:
+                    futures = [executor.submit(probe, item) for item in candidates.items()]
+                    for future in as_completed(futures):
+                        ip, result = future.result()
+                        results[ip] = result
+                        # Publish each answered peer immediately. A stale saved
+                        # address must not hide a healthy PC or its freed seat
+                        # until every other connection attempt has timed out.
+                        with SimulatorDiscovery._cache_lock:
+                            if generation == SimulatorDiscovery._network_generation:
+                                SimulatorDiscovery._cache[ip] = dict(result)
+            # One device may be reachable over Wi-Fi and Ethernet. Keep one
+            # working endpoint; identical display numbers never merge devices.
+            unique = {}
+            for ip, sim in results.items():
+                key = sim.get('device_id') or ip
+                if key == getattr(main_window, 'device_id', None):
+                    continue
+                if key not in unique or (sim.get('reachable') and not unique[key].get('reachable')):
+                    unique[key] = sim
+            with SimulatorDiscovery._cache_lock:
+                # Preserve scan hits that arrived while these probes ran.
+                if generation != SimulatorDiscovery._network_generation:
+                    return SimulatorDiscovery._snapshot()
+                for ip, sim in SimulatorDiscovery._cache.items():
+                    if ip not in candidates and ip not in local_ips:
+                        unique.setdefault(sim.get('device_id') or ip, dict(sim))
+                SimulatorDiscovery._cache = {sim['ip']: sim for sim in unique.values()}
+                SimulatorDiscovery._last_refresh = time.time()
+                return SimulatorDiscovery._snapshot()
+        finally:
+            SimulatorDiscovery._probe_lock.release()
 
     @staticmethod
     def scan_in_progress():
@@ -6285,6 +6340,7 @@ class SimulatorDiscovery:
             if SimulatorDiscovery._scan_in_progress:
                 return False
             SimulatorDiscovery._scan_in_progress = True
+            SimulatorDiscovery._scan_attempt_time = time.time()
         threading.Thread(target=SimulatorDiscovery._run_full_scan,
                          name="sim-full-scan", daemon=True).start()
         return True
@@ -6294,21 +6350,28 @@ class SimulatorDiscovery:
         from concurrent.futures import ThreadPoolExecutor
 
         started = time.time()
+        generation = SimulatorDiscovery._network_generation
         try:
-            local_ip = get_local_ip()
-            subnet_prefix = '.'.join(local_ip.split('.')[:-1])
-            ips_to_scan = [f"{subnet_prefix}.{i}" for i in range(1, 255)]
-            ips_to_scan = [ip for ip in ips_to_scan if ip != local_ip]
+            interfaces = local_network_interfaces()
+            local_ips = {item['ip'] for item in interfaces}
+            prefixes = {'.'.join(ip.split('.')[:-1]) for ip in local_ips}
+            ips_to_scan = sorted({f'{prefix}.{i}' for prefix in prefixes for i in range(1, 255)} - local_ips)
 
             found = {}
             with ThreadPoolExecutor(max_workers=SimulatorDiscovery.MAX_WORKERS) as executor:
-                for result in executor.map(
-                        lambda ip: SimulatorDiscovery.probe_host(ip, SimulatorDiscovery.PROBE_TIMEOUT),
-                        ips_to_scan):
+                futures = [executor.submit(SimulatorDiscovery.probe_host, ip, 0.35) for ip in ips_to_scan]
+                for future in as_completed(futures):
+                    result = future.result()
                     if result and result.get('ip'):
                         found[result['ip']] = result
+                        with SimulatorDiscovery._cache_lock:
+                            if generation == SimulatorDiscovery._network_generation:
+                                SimulatorDiscovery._cache[result['ip']] = dict(result)
 
-            SimulatorDiscovery._scan_results = found
+            with SimulatorDiscovery._cache_lock:
+                if generation != SimulatorDiscovery._network_generation:
+                    return
+                SimulatorDiscovery._scan_results = found
             SimulatorDiscovery._scan_time = time.time()
             print(f"[Discovery] Full scan found {len(found)} simulator(s) in {time.time() - started:.1f}s")
 
@@ -6322,6 +6385,8 @@ class SimulatorDiscovery:
             print(f"[Discovery] Full scan error: {e}")
         finally:
             SimulatorDiscovery._scan_in_progress = False
+            if generation != SimulatorDiscovery._network_generation:
+                SimulatorDiscovery.start_full_scan()
 
 
 # ============================================================================
@@ -6539,6 +6604,7 @@ mdns_service = MDNSService()
 # UDP Broadcast Discovery - Real-time simulator discovery
 # ============================================================================
 DISCOVERY_PORT = 5003
+DISCOVERY_PORTS = (DISCOVERY_PORT, 15003, 25003)
 DISCOVERY_MAGIC = b'LBSIM01'  # Leaderboard Simulator Discovery v1
 
 # Receiver discovery constants (matches Receiver's DiscoveryResponder protocol)
@@ -6718,25 +6784,51 @@ class SimulatorBroadcastListener(QThread):
         self._known_simulators = {}  # ip -> last_seen_time
         self.local_ip = get_local_ip()
         self.bind_ok = None  # None until run() has tried; False = automatic discovery is off
+        self.bind_error = None
+        self.bound_port = None
     
     def stop(self):
         self._running = False
         
     def run(self):
         """Listen for UDP broadcast announcements"""
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.settimeout(1.0)  # Allow checking _running flag periodically
-        
-        try:
-            sock.bind(('0.0.0.0', DISCOVERY_PORT))
-            self.bind_ok = True
-            print(f"[Discovery] UDP listener started on port {DISCOVERY_PORT}")
-        except Exception as e:
+        sock = None
+        while self._running:
+            errors = []
+            for port in DISCOVERY_PORTS:
+                if not self._running:
+                    break
+                try:
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    sock.settimeout(1.0)
+                    sock.bind(('0.0.0.0', port))
+                    self.bind_ok = True
+                    self.bind_error = None
+                    self.bound_port = port
+                    print(f"[Discovery] UDP listener started on port {port}")
+                    break
+                except OSError as e:
+                    errors.append(f'{port}: {e}')
+                    if sock is not None:
+                        sock.close()
+                        sock = None
+            if sock is not None:
+                break
             self.bind_ok = False
-            print(f"[Discovery] Failed to bind UDP port {DISCOVERY_PORT}: {e}")
-            print("[Discovery] Automatic simulator discovery is OFF on this PC "
-                  "(port in use or reserved). Other sims are found from the saved list or a network scan.")
+            self.bound_port = None
+            error = '; '.join(errors)
+            if self.bind_error != error:
+                print(f"[Discovery] Cannot open discovery ports: {error}. "
+                      "Retrying every 5 seconds; saved peers and HTTP scans remain active.")
+            self.bind_error = error
+            # A startup conflict must not disable discovery until restart.
+            # Short waits let application shutdown interrupt the backoff.
+            for _ in range(20):
+                if not self._running:
+                    break
+                self.msleep(250)
+        if sock is None:
             return
         
         while self._running:
@@ -6745,7 +6837,7 @@ class SimulatorBroadcastListener(QThread):
                 sender_ip = addr[0]
                 
                 # Ignore our own broadcasts
-                if sender_ip == self.local_ip:
+                if sender_ip in {item['ip'] for item in local_network_interfaces()}:
                     continue
                 
                 # Validate magic header
@@ -6793,7 +6885,7 @@ class SimulatorBroadcastListener(QThread):
             if now - sim.get('last_seen', 0) < 15:  # 15 second timeout
                 active.append(sim)
             else:
-                del self._known_simulators[ip]  # Remove stale entries
+                self._known_simulators.pop(ip, None)  # A network change may already have cleared it.
         return active
 
 
@@ -6822,21 +6914,27 @@ def broadcast_simulator_presence():
             except:
                 pass
         
+        payload.update(simulator_identity_fields())
+        payload['session_active'] = bool(getattr(main_window, 'session_active', False))
         # Create the broadcast packet
         message = DISCOVERY_MAGIC + json.dumps(payload).encode('utf-8')
         
-        # Send UDP broadcast
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        sock.settimeout(0.5)
-        
-        # Broadcast to subnet
-        subnet_prefix = '.'.join(local_ip.split('.')[:-1])
-        broadcast_addr = f"{subnet_prefix}.255"
-        
-        sock.sendto(message, (broadcast_addr, DISCOVERY_PORT))
-        sock.close()
-        
+        # Send from every LAN interface, including Ethernet when a VPN owns
+        # the default route. Use each interface's actual broadcast address.
+        for interface in local_network_interfaces():
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                    sock.settimeout(0.5)
+                    sock.bind((interface['ip'], 0))
+                    for port in DISCOVERY_PORTS:
+                        try:
+                            sock.sendto(message, (interface['broadcast'], port))
+                        except OSError as error:
+                            print(f"[Discovery] Broadcast on {interface['ip']}:{port} failed: {error}")
+            except OSError as error:
+                print(f"[Discovery] Broadcast on {interface['ip']} failed: {error}")
+
     except Exception as e:
         print(f"[Discovery] Broadcast error: {e}")
 
@@ -9111,11 +9209,28 @@ class LapTimeSenderWindow(QMainWindow):
     # Result of a background lap POST, delivered back on the GUI thread
     lap_send_finished = pyqtSignal(object)
     retry_delivery_finished = pyqtSignal(object)
+    network_simulators_updated = pyqtSignal(object)
+    network_status_updated = pyqtSignal(object)
+    mdns_refresh_finished = pyqtSignal(object)
 
     def __init__(self):
         super().__init__()
         self.lap_send_finished.connect(self._on_lap_send_finished)
         self.retry_delivery_finished.connect(self._on_retry_delivery_finished)
+        self.network_simulators_updated.connect(self._on_network_simulators_updated)
+        self.network_status_updated.connect(self._apply_network_status)
+        self.mdns_refresh_finished.connect(self._on_mdns_refresh_finished)
+        self._network_status_in_progress = False
+        self._mdns_refresh_in_progress = False
+        self._network_signature = None
+        self._auto_receiver_urls = set()
+        self._network_discovery_in_progress = False
+        self.device_id = device_identity()
+        startup_settings = load_app_settings()
+        self.automatic_id_enabled = startup_settings.get('automatic_simulator_id', True)
+        self.simulator_id_assigned = bool(startup_settings.get('simulator_id'))
+        self._startup_simulator_id = str(startup_settings.get('simulator_id', 1))
+        self._discovered_peers = []
         self.pending_extension_minutes = 0
         self.current_monitor = None
         self.local_ip = get_local_ip()
@@ -9159,7 +9274,8 @@ class LapTimeSenderWindow(QMainWindow):
         # Start network monitor to detect IP changes
         self.network_monitor_timer = QTimer()
         self.network_monitor_timer.timeout.connect(self._check_network_change)
-        self.network_monitor_timer.start(5000)  # Check every 5 seconds
+        self.network_monitor_timer.start(3000)
+        QTimer.singleShot(0, self._check_network_change)
 
         # Start the Flask server in a separate thread
         global main_window, ui_bridge
@@ -9197,11 +9313,10 @@ class LapTimeSenderWindow(QMainWindow):
         self.session_timer.timeout.connect(self.check_session_timeout)
         self.session_timer.start(1000)  # Check every second
         
+        self._load_saved_settings()
+
         # Start monitoring the initially selected game
         self.start_monitor(self.game_selector.currentText())
-
-        # Load saved settings (video paths, background, etc.)
-        self._load_saved_settings()
 
         # Show waiting overlay on startup
         self.show_waiting_screen()
@@ -9209,6 +9324,15 @@ class LapTimeSenderWindow(QMainWindow):
     def _load_saved_settings(self):
         """Load and apply saved application settings"""
         settings = load_app_settings()
+        self.session_end_shortcut = str(settings.get('session_end_shortcut', 'Ctrl+R'))
+        self.session_end_hotkey_enabled = bool(settings.get('session_end_hotkey_enabled', False))
+        try:
+            parse_shortcut(self.session_end_shortcut)
+        except ValueError:
+            self.session_end_hotkey_enabled = False
+            self.session_end_shortcut = 'Ctrl+R'
+        self.session_end_hotkey_checkbox.setChecked(self.session_end_hotkey_enabled)
+        self.session_end_shortcut_input.setText(self.session_end_shortcut)
 
         # Restore the simulator ID first: mDNS, the discovery broadcast and
         # every leaderboard submission key off it.
@@ -9439,6 +9563,7 @@ class LapTimeSenderWindow(QMainWindow):
         simulator_id_label.setToolTip("Unique number for this racing simulator (1-99). Every sim at the event needs its own.")
         self.simulator_id = QComboBox()
         self.simulator_id.addItems([str(i) for i in range(1, 100)])
+        self.simulator_id.setCurrentText(self._startup_simulator_id)
         self.simulator_id.setFixedWidth(64)
         self.simulator_id.setToolTip("Select a unique ID number for this racing simulator")
         self.simulator_id.currentTextChanged.connect(self._on_simulator_id_changed)
@@ -9459,6 +9584,12 @@ class LapTimeSenderWindow(QMainWindow):
         simulator_row.addWidget(game_label)
         simulator_row.addWidget(self.game_selector)
         sim_col.addLayout(simulator_row)
+        self.automatic_id_checkbox = QCheckBox('Assign simulator ID automatically')
+        self.automatic_id_checkbox.setChecked(self.automatic_id_enabled)
+        self.automatic_id_checkbox.setToolTip('Keeps a unique number and resolves conflicts with other simulators automatically.')
+        self.simulator_id.setEnabled(not self.automatic_id_enabled)
+        self.automatic_id_checkbox.toggled.connect(self._on_automatic_id_changed)
+        sim_col.addWidget(self.automatic_id_checkbox)
 
         # Game connection state, right under the game it refers to
         self.game_status = QLabel("Initializing...")
@@ -9763,7 +9894,15 @@ class LapTimeSenderWindow(QMainWindow):
         self.url_info_label.setObjectName("urlInfo")
         self.url_info_label.setWordWrap(True)
         self.url_info_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.network_info_label = QLabel('Checking current Wi-Fi / network...')
+        self.network_info_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.network_info_label.setWordWrap(True)
+        self.network_info_label.setStyleSheet('color: #4fc1ff; font-size: 13px;')
+        mobile_text.addWidget(self.network_info_label)
         mobile_text.addWidget(self.url_info_label)
+        refresh_network_btn = QPushButton('Refresh network and iPad link')
+        refresh_network_btn.clicked.connect(self._refresh_network_now)
+        mobile_text.addWidget(refresh_network_btn)
         pages_info = QLabel(
             "<b style='color:#4fc1ff;'>/</b> &nbsp;Driver sign-up for this sim only<br>"
             "<b style='color:#4fc1ff;'>/admin</b> &nbsp;Host Stand: control every sim from one iPad<br>"
@@ -9968,6 +10107,40 @@ class LapTimeSenderWindow(QMainWindow):
         screens_layout.addLayout(apply_row)
         screens_layout.addStretch(1)
         self.settings_tabs.addTab(screens_tab, "Screens && Media")
+
+        end_tab = QWidget()
+        end_layout = QVBoxLayout(end_tab)
+        end_help = QLabel(
+            "Send a keyboard shortcut when the timer, lap limit, sector challenge or admin End button ends a session.\n"
+            "Assign the same shortcut to Return to pits (or your chosen action) in the game first.\n"
+            "Applies to the game selected in Sender on this PC. Settings are saved on this PC.")
+        end_help.setWordWrap(True)
+        end_layout.addWidget(end_help)
+        self.session_end_hotkey_checkbox = QCheckBox("Send shortcut when a session ends")
+        end_layout.addWidget(self.session_end_hotkey_checkbox)
+        shortcut_row = QHBoxLayout()
+        shortcut_row.addWidget(QLabel("Shortcut:"))
+        self.session_end_shortcut_input = QLineEdit('Ctrl+R')
+        self.session_end_shortcut_input.setPlaceholderText('Ctrl+R')
+        self.session_end_shortcut_input.setToolTip('One key with optional Ctrl, Alt or Shift; for example Ctrl+R or F7')
+        shortcut_row.addWidget(self.session_end_shortcut_input)
+        save_hotkey = QPushButton('Save shortcut')
+        save_hotkey.clicked.connect(self._save_session_end_hotkey)
+        shortcut_row.addWidget(save_hotkey)
+        test_hotkey = QPushButton('Test saved shortcut')
+        test_hotkey.setToolTip('Switches to the selected game and sends the saved shortcut. Use between sessions.')
+        test_hotkey.clicked.connect(self._test_session_end_hotkey)
+        shortcut_row.addWidget(test_hotkey)
+        end_layout.addLayout(shortcut_row)
+        note = QLabel('Off by default. When enabled, this replaces the sector challenge’s built-in car reset.\n'
+                      'Test between sessions to confirm the game binding works before using it for drivers.')
+        note.setWordWrap(True)
+        end_layout.addWidget(note)
+        self.session_end_hotkey_status = QLabel('No shortcut sent yet.')
+        self.session_end_hotkey_status.setWordWrap(True)
+        end_layout.addWidget(self.session_end_hotkey_status)
+        end_layout.addStretch(1)
+        self.settings_tabs.addTab(end_tab, 'Session End')
         page_layout.addWidget(self.settings_tabs)
 
         # Everything used to sit behind a "Show Advanced" toggle; the tabs
@@ -10800,25 +10973,116 @@ class LapTimeSenderWindow(QMainWindow):
         except Exception as e:
             print(f"[mDNS] Error starting service: {e}")
 
+    def _refresh_network_now(self):
+        self._check_network_change()
+        SimulatorDiscovery.start_full_scan()
+        self.refresh_network_simulators_ui()
+
     def _check_network_change(self):
-        """Check if the network IP has changed and update accordingly."""
-        new_ip = get_local_ip()
-        if new_ip != self.local_ip:
-            print(f"[Network] IP changed from {self.local_ip} to {new_ip}")
-            self.local_ip = new_ip
+        """Read SSID/interfaces off the GUI thread; never block on netsh or mDNS."""
+        if self._network_status_in_progress:
+            return
+        self._network_status_in_progress = True
+        def read_status():
+            snapshot = None
+            try:
+                snapshot = network_snapshot()
+            except Exception as error:
+                print(f'[Network] Status check failed: {error}')
+            finally:
+                self.network_status_updated.emit(snapshot)
+        threading.Thread(target=read_status, name='network-status', daemon=True).start()
 
-            # Restart mDNS with new IP
-            self._start_mdns_service()
+    @pyqtSlot(object)
+    def _apply_network_status(self, snapshot):
+        self._network_status_in_progress = False
+        if snapshot is None:
+            self.network_info_label.setText('Could not check the network. Click Refresh network to retry.')
+            return
+        selected = snapshot.get('selected')
+        previous_signature = self._network_signature
+        signature = network_signature(snapshot, previous_signature)
+        changed = network_changed(previous_signature, signature)
+        self._network_signature = signature
+        old_ip = self.local_ip
+        self.local_ip = snapshot['ip']
+        if selected:
+            if selected['kind'] == 'Wi-Fi':
+                name = selected.get('ssid') or 'Network name unavailable from Windows'
+                label = f"Wi-Fi: {name} ({selected['name']})"
+            else:
+                label = f"{selected['kind']}: {selected['name']}"
+            alternatives = [f"{i['name']}: {i['ip']}" for i in snapshot['interfaces']
+                            if i['ip'] != self.local_ip]
+            label += f'\nThe iPad link uses {self.local_ip}. Connect the iPad to this LAN.'
+            if alternatives:
+                label += '\nOther active adapters: ' + ', '.join(alternatives)
+        else:
+            label = 'No connected IPv4 network. Connect to the venue Wi-Fi or Ethernet; the link will update automatically.'
+        self.network_info_label.setText(label)
+        if not changed:
+            return
+        self._network_change_count = getattr(self, '_network_change_count', 0) + 1
+        self._last_network_change = dict(timestamp=time.time(), previous=previous_signature, current=signature)
+        print(f'[Network] Confirmed adapter/address/name change: {previous_signature} -> {signature}')
+        # Update visible addresses first. mDNS unregister/register can take seconds.
+        self.mdns_hostname = None
+        self._update_mobile_url_display()
+        self._update_qr_code()
+        if hasattr(self, 'discovery_listener'):
+            self.discovery_listener.local_ip = self.local_ip
+            self.discovery_listener._known_simulators = {}
+        if hasattr(self, 'receiver_discovery'):
+            self.receiver_discovery.local_ip = self.local_ip
+            with self.receiver_discovery._lock:
+                self.receiver_discovery._known_receivers.clear()
+        current_urls = {u.strip() for u in self.server_url.text().split(',') if u.strip()}
+        if current_urls == {f'http://{old_ip}:5000'} or (self._auto_receiver_urls and current_urls == self._auto_receiver_urls):
+            self.server_url.clear()
+        self._auto_receiver_urls = set()
+        SimulatorDiscovery.reset_network()
+        peers = SimulatorDiscovery._snapshot()
+        self._discovered_peers = peers
+        self._update_network_simulators_ui([
+            dict(sim, name=sim.get('simulator_name') or sim.get('name'), driver=sim.get('current_driver'))
+            for sim in peers
+        ])
+        self._request_mdns_refresh()
+        self.refresh_network_simulators_ui()
+        threading.Thread(target=broadcast_simulator_presence, daemon=True).start()
 
-            # Update the URL display
-            self._update_mobile_url_display()
+    def _request_mdns_refresh(self):
+        if self._mdns_refresh_in_progress:
+            return
+        self._mdns_refresh_in_progress = True
+        identity = (self._network_signature, self.local_ip, self.simulator_id.currentText())
+        def refresh():
+            hostname = None
+            try:
+                if identity[1] == '127.0.0.1':
+                    mdns_service.stop()
+                else:
+                    hostname = mdns_service.start(int(identity[2]), self.web_port)
+            finally:
+                self.mdns_refresh_finished.emit((identity, hostname))
+        threading.Thread(target=refresh, name='network-mdns-refresh', daemon=True).start()
 
-            # Update QR code
-            self._update_qr_code()
+    @pyqtSlot(object)
+    def _on_mdns_refresh_finished(self, result):
+        self._mdns_refresh_in_progress = False
+        identity, hostname = result
+        if identity != (self._network_signature, self.local_ip, self.simulator_id.currentText()):
+            self._request_mdns_refresh()
+            return
+        self.mdns_hostname = hostname
+        self._update_mobile_url_display()
 
     def _update_mobile_url_display(self):
         """Update the mobile interface URL display with current IP and mDNS name."""
         if hasattr(self, 'url_info_label'):
+            if self.local_ip == '127.0.0.1':
+                self.url_info_label.setText('iPad link unavailable until a network is connected.')
+                return
             ip_url = f"http://{self.local_ip}:{self.web_port}"
             if self.mdns_hostname:
                 # Show both mDNS and IP address
@@ -10833,6 +11097,9 @@ class LapTimeSenderWindow(QMainWindow):
     def _update_qr_code(self):
         """Update the QR code with current IP."""
         if hasattr(self, 'qr_label'):
+            if self.local_ip == '127.0.0.1':
+                self.qr_label.clear()
+                return
             qr_code = self.generate_qr_code(f"http://{self.local_ip}:{self.web_port}")
             if qr_code:
                 self.qr_label.setPixmap(qr_code)
@@ -10850,14 +11117,42 @@ class LapTimeSenderWindow(QMainWindow):
             settings = load_app_settings()
             settings['simulator_id'] = sim_id
             save_app_settings(settings)
+            self.simulator_id_assigned = True
         except Exception as e:
             print(f"[Settings] Could not save simulator ID: {e}")
         try:
             # Update mDNS service with new simulator ID
-            self.mdns_hostname = mdns_service.update_simulator_id(sim_id, self.web_port)
+            self.mdns_hostname = None
             self._update_mobile_url_display()
+            self._request_mdns_refresh()
         except Exception as e:
             print(f"[mDNS] Error updating simulator ID: {e}")
+        self._update_sim_id_conflict_ui()
+
+    def _on_automatic_id_changed(self, enabled):
+        self.automatic_id_enabled = bool(enabled)
+        self.simulator_id.setEnabled(not enabled)
+        settings = load_app_settings()
+        settings['automatic_simulator_id'] = bool(enabled)
+        save_app_settings(settings)
+        self._resolve_automatic_id()
+
+    def _resolve_automatic_id(self):
+        local = dict(simulator_identity_fields(), device_id=self.device_id,
+                     simulator_id=int(self.simulator_id.currentText()),
+                     id_automatic=self.automatic_id_enabled,
+                     id_assigned=self.simulator_id_assigned,
+                     session_active=bool(getattr(self, 'session_active', False)))
+        peers = list(self._discovered_peers)
+        new_id = automatic_simulator_id(local, peers)
+        if new_id is None:
+            self.sim_id_conflict_label.setText('All 99 simulator IDs are in use. Check for extra running Sender copies.')
+            self.sim_id_conflict_label.show()
+            return
+        elif new_id != local['simulator_id']:
+            self.simulator_id.setCurrentText(str(new_id))
+            print(f'[Discovery] Automatically assigned Sim {new_id}')
+            threading.Thread(target=broadcast_simulator_presence, daemon=True).start()
         self._update_sim_id_conflict_ui()
 
     def closeEvent(self, event):
@@ -10984,9 +11279,10 @@ class LapTimeSenderWindow(QMainWindow):
         # Also auto-fill if current URLs are a subset of discovered (user hasn't added custom ones)
         is_auto_managed = current_urls.issubset(new_urls) or new_urls.issuperset(current_urls - {default_url})
 
-        if is_default_only or is_auto_managed:
+        if is_default_only or is_auto_managed or current_urls == self._auto_receiver_urls:
             self.server_url.setText(new_urls_str)
             self.current_server_url = new_urls_str
+            self._auto_receiver_urls = new_urls
 
             # Show appropriate message
             if len(receiver_urls) == 1:
@@ -11002,14 +11298,13 @@ class LapTimeSenderWindow(QMainWindow):
 
     def on_simulator_discovered(self, simulator_info):
         """Called immediately when UDP broadcast discovers a new/updated simulator"""
-        # Immediately refresh the UI with all known simulators from UDP listener
-        self._refresh_from_udp_discovery()
+        # Keep HTTP-discovered peers when a UDP-only peer changes driver/game.
+        self.refresh_network_simulators_ui()
         self._update_sim_id_conflict_ui()
 
     def get_sim_id_conflicts(self):
         """IPs of other simulators announcing the same Simulator ID as this one."""
-        listener = getattr(self, 'discovery_listener', None)
-        if not listener or not hasattr(self, 'simulator_id'):
+        if not hasattr(self, 'simulator_id'):
             return []
         try:
             my_id = int(self.simulator_id.currentText())
@@ -11017,9 +11312,11 @@ class LapTimeSenderWindow(QMainWindow):
             return []
         conflicts = []
         try:
-            for sim in listener.get_known_simulators():
+            for sim in self._discovered_peers:
                 try:
-                    if int(sim.get('simulator_id', -1)) == my_id and sim.get('ip') != self.local_ip:
+                    if (sim.get('reachable') is not False and
+                            int(sim.get('simulator_id', -1)) == my_id and
+                            sim.get('device_id') != self.device_id):
                         conflicts.append(sim.get('ip'))
                 except (TypeError, ValueError):
                     continue
@@ -11035,7 +11332,8 @@ class LapTimeSenderWindow(QMainWindow):
         if conflicts:
             self.sim_id_conflict_label.setText(
                 f"⚠️ Simulator ID {self.simulator_id.currentText()} is also used by {', '.join(conflicts)}. "
-                f"Give each sim its own ID or the Host Stand cannot tell them apart.")
+                + ('Automatic numbering will resolve this when the conflicting simulators are idle.'
+                 if self.automatic_id_enabled else 'Enable automatic numbering or select a unique ID.'))
             self.sim_id_conflict_label.show()
             self.simulator_id.setStyleSheet("QComboBox { border: 2px solid #f48771; }")
         else:
@@ -11101,30 +11399,25 @@ class LapTimeSenderWindow(QMainWindow):
         Uses both UDP broadcast discovery (instant) and HTTP probe (fallback).
         UDP-discovered simulators take priority as they're faster and more reliable.
         """
+        # Timer and UDP announcements can both request a refresh. Keep at most
+        # one network job active; its result is delivered on the Qt GUI thread.
+        if self._network_discovery_in_progress:
+            return
+        self._network_discovery_in_progress = True
+
         def discover_and_update():
+            other_simulators = None
             try:
                 local_ip = get_local_ip()
                 simulators_by_ip = {}
-                
-                # First, add UDP-discovered simulators (instant, high priority)
-                if hasattr(self, 'discovery_listener'):
-                    for sim in self.discovery_listener.get_known_simulators():
-                        ip = sim.get('ip')
-                        if ip and ip != local_ip:
-                            simulators_by_ip[ip] = {
-                                'name': sim.get('simulator_name', f'Sim ({ip})'),
-                                'ip': ip,
-                                'game': sim.get('game'),
-                                'driver': sim.get('current_driver'),
-                            }
-                
-                # Then, add HTTP-probed simulators (slower, fallback for non-UDP apps)
+
+                # discover() merges UDP peers, saved HTTP addresses and scan hits.
                 discovered = SimulatorDiscovery.discover()
                 for sim in discovered:
                     ip = sim.get('ip')
-                    if ip and ip != local_ip and sim.get('reachable'):
+                    if ip and ip != local_ip:
                         if ip not in simulators_by_ip:  # Don't override UDP discoveries
-                            simulators_by_ip[ip] = {
+                            simulators_by_ip[ip] = {**sim,
                                 'name': sim.get('simulator_name', f'Sim ({ip})'),
                                 'ip': ip,
                                 'game': sim.get('game'),
@@ -11133,12 +11426,26 @@ class LapTimeSenderWindow(QMainWindow):
                 
                 other_simulators = list(simulators_by_ip.values())
                 
-                # Update UI on main thread
-                QTimer.singleShot(0, lambda: self._update_network_simulators_ui(other_simulators))
             except Exception as e:
                 print(f"Error discovering simulators: {e}")
-        
-        threading.Thread(target=discover_and_update, daemon=True).start()
+            finally:
+                # A singleShot created in a Python worker has no Qt event loop
+                # to dispatch it. A signal queues the result on this window.
+                self.network_simulators_updated.emit(other_simulators)
+
+        try:
+            threading.Thread(target=discover_and_update, daemon=True).start()
+        except Exception:
+            self._network_discovery_in_progress = False
+            raise
+
+    @pyqtSlot(object)
+    def _on_network_simulators_updated(self, simulators):
+        self._network_discovery_in_progress = False
+        if simulators is not None:
+            self._discovered_peers = simulators
+            self._resolve_automatic_id()
+            self._update_network_simulators_ui(simulators)
     
     def _update_network_simulators_ui(self, simulators):
         """Update the network simulator list UI with discovered simulators"""
@@ -11149,7 +11456,14 @@ class LapTimeSenderWindow(QMainWindow):
                 item.widget().deleteLater()
         
         if not simulators:
-            no_sims_label = QLabel("No other simulators found on network")
+            listener = getattr(self, 'discovery_listener', None)
+            if getattr(listener, 'bind_ok', None) is False:
+                message = ('Automatic discovery ports are unavailable. Retrying and scanning. '
+                           'On the iPad, use + / Add Simulator with the other PC\'s IP.')
+            else:
+                message = 'No other simulators found yet. Searching automatically; check that Sender is open on each PC.'
+            no_sims_label = QLabel(message)
+            no_sims_label.setWordWrap(True)
             no_sims_label.setStyleSheet("color: #9d9d9d; font-size: 11px; padding: 4px 0;")
             self.simulators_list.addWidget(no_sims_label)
             return
@@ -11160,14 +11474,17 @@ class LapTimeSenderWindow(QMainWindow):
             row_layout.setContentsMargins(0, 2, 0, 2)
             row_layout.setSpacing(8)
             
-            # Status indicator (online)
-            status_label = QLabel("🟢")
+            online = sim.get('reachable') is not False
+            reconnecting = sim.get('connection_state') == 'reconnecting'
+            status_label = QLabel("🟢" if online else "🟠" if reconnecting else "⚪")
             status_label.setFixedWidth(20)
             status_label.setStyleSheet("font-size: 10px;")
             row_layout.addWidget(status_label)
             
             # Simulator name
-            name = sim.get('name', 'Unknown')
+            name = sim.get('name') or sim.get('simulator_name') or 'Unknown'
+            if not online:
+                name += ' — Reconnecting' if reconnecting else ' — Offline'
             name_label = QLabel(name)
             name_label.setStyleSheet("color: #ffffff; font-size: 12px; font-weight: 500;")
             row_layout.addWidget(name_label)
@@ -11181,7 +11498,7 @@ class LapTimeSenderWindow(QMainWindow):
             
             # Driver info if available
             driver = sim.get('driver')
-            if driver:
+            if driver and online:
                 driver_label = QLabel(f"[{driver}]")
                 driver_label.setStyleSheet("color: #4fc3f7; font-size: 11px;")
                 row_layout.addWidget(driver_label)
@@ -11224,13 +11541,49 @@ class LapTimeSenderWindow(QMainWindow):
         if hasattr(self, 'toggle_waiting_screen_btn'):
             self.toggle_waiting_screen_btn.setText("Show Waiting Screen")
         
-    def end_session(self, headline=None, detail=None, accent=None, hold_ms=4000):
+    def _save_session_end_hotkey(self):
+        shortcut = self.session_end_shortcut_input.text().strip()
+        try:
+            parse_shortcut(shortcut)
+        except ValueError as exc:
+            self.session_end_hotkey_status.setText(f'Not saved: {exc}')
+            return
+        settings = load_app_settings()
+        enabled = self.session_end_hotkey_checkbox.isChecked()
+        settings.update(session_end_hotkey_enabled=enabled, session_end_shortcut=shortcut)
+        if not save_app_settings(settings):
+            self.session_end_hotkey_status.setText('Could not save settings. Previous shortcut settings are still in use.')
+            return
+        self.session_end_hotkey_enabled = enabled
+        self.session_end_shortcut = shortcut
+        self.session_end_hotkey_status.setText(
+            f'Saved: {shortcut} at session end.' if enabled else 'Saved: automatic shortcut is off.')
+
+    def _send_game_end_shortcut(self):
+        sent, message = send_game_shortcut(self.game_selector.currentText(), self.session_end_shortcut)
+        self.session_end_hotkey_status.setText(message)
+        if not sent:
+            self.status_label.setText(f'Session end shortcut: {message}')
+        print(f'[Session shortcut] {message}')
+        return sent
+
+    def _test_session_end_hotkey(self):
+        if self.session_active or self.driver_name.text().strip():
+            self.session_end_hotkey_status.setText('End the current driver session before testing the shortcut.')
+            return
+        self._send_game_end_shortcut()
+
+    def end_session(self, headline=None, detail=None, accent=None, hold_ms=4000, expected_session_id=None):
         """End the current session and return to waiting screen.
 
         The interstitial wording and how long it stays up are configurable so
         a driver who ran out of time in a sector is told why, and has long
         enough to read it and climb out of the rig.
         """
+        if expected_session_id is not None and expected_session_id != self.current_session_id:
+            return  # A delayed sector result belongs to the previous driver.
+        ended_session_id = self.current_session_id
+        was_active = self.session_active
         print("[END SESSION] end_session() called - showing session complete screen")
 
         # 4th screen: waiting scene, or save + loop the run's replay.
@@ -11245,6 +11598,16 @@ class LapTimeSenderWindow(QMainWindow):
         self.timer_started = False  # Reset timer state
         self.timer_end_timestamp = 0  # Prevent stale timestamp race condition
         self.session_start_timestamp = 0  # Reset session start timestamp
+
+        # Send before the waiting overlay takes keyboard focus. Mark the attempt
+        # first: duplicate End requests must never repeat a game action.
+        if (was_active and ended_session_id and
+                getattr(self, '_hotkey_ended_session', None) != ended_session_id):
+            self._hotkey_ended_session = ended_session_id
+            self._custom_reset_session = (ended_session_id
+                if getattr(self, 'session_end_hotkey_enabled', False) else None)
+            if self._custom_reset_session:
+                self._send_game_end_shortcut()
 
         # Clear driver name so network tabs show "No driver"
         self.driver_name.clear()
@@ -11263,6 +11626,8 @@ class LapTimeSenderWindow(QMainWindow):
         
         # After 4 seconds, go to waiting screen (with custom media if set)
         def to_waiting():
+            if self.current_session_id != ended_session_id or self.session_active:
+                return
             if hasattr(self, 'waiting_media_path') and self.waiting_media_path.text().strip():
                 media_path = self.waiting_media_path.text().strip()
                 if os.path.exists(media_path):
@@ -11739,7 +12104,9 @@ class LapTimeSenderWindow(QMainWindow):
             distance_text = f"You reached {distance_pct:.1f}% of the lap"
 
         # Short delay so the red sector flash registers before the screen covers it
+        session_id = self.current_session_id
         QTimer.singleShot(400, lambda: self.end_session(
+            expected_session_id=session_id,
             headline="⏱ Out of Time",
             detail=(f"Sector {sector_index + 1} wasn't completed in time.\n"
                     f"{distance_text} in {format_time_ms(int(elapsed_s * 1000))}.\n\n"
@@ -11748,7 +12115,7 @@ class LapTimeSenderWindow(QMainWindow):
             hold_ms=7000))
 
         # Reset the car once the screen is up, so the move happens out of sight
-        QTimer.singleShot(1400, lambda: self._reset_car_for_next_driver())
+        QTimer.singleShot(1400, lambda: self._reset_car_for_next_driver(session_id))
 
     def on_challenge_completed(self, total_s):
         """A driver beat every sector and crossed the line: score the full run,
@@ -11763,7 +12130,9 @@ class LapTimeSenderWindow(QMainWindow):
         self._log_sector_run("COMPLETE", 100.0, total_s)
 
         time_text = format_time_ms(int(total_s * 1000))
+        session_id = self.current_session_id
         QTimer.singleShot(400, lambda: self.end_session(
+            expected_session_id=session_id,
             headline="🏆 Challenge Complete!",
             detail=(f"You made it through every sector.\n"
                     f"Total time: {time_text}\n\n"
@@ -11772,13 +12141,17 @@ class LapTimeSenderWindow(QMainWindow):
             hold_ms=7000))
 
         # Same as a failure: move the car only once the screen is covering the game
-        QTimer.singleShot(1400, lambda: self._reset_car_for_next_driver())
+        QTimer.singleShot(1400, lambda: self._reset_car_for_next_driver(session_id))
 
-    def _reset_car_for_next_driver(self):
+    def _reset_car_for_next_driver(self, expected_session_id=None):
         """Put the car back for the next driver. Called once the end-of-run
         screen is already covering the game, so nobody watches it happen."""
+        if expected_session_id is not None and (self.current_session_id != expected_session_id or self.session_active):
+            return
         if self.current_monitor and hasattr(self.current_monitor, 'request_challenge_reset'):
             self.current_monitor.request_challenge_reset()
+        if getattr(self, '_custom_reset_session', None) == self.current_session_id:
+            return  # The configured shortcut replaces the built-in reset, even if input was blocked.
         if ac_app_alive():
             spawn = self.sector_config.get('teleport_spawn', 'HOTLAP_START')
             cmd_id = ac_app_issue_teleport(spawn)
